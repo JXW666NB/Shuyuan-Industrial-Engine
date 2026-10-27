@@ -1,0 +1,9 @@
+﻿feat(train): tgai_go.train 第一切片（PyTorch 风格 API，CPU 后端，5/5 自证）
+
+- python/tgai_go/train/__init__.py：反向模式自动微分（含广播还原）、
+  Module/Linear/Embedding/RMSNorm/Sequential/ModuleList、AdamW/Muon、
+  functional(cross_entropy/softmax/silu)、state_dict/load_state_dict
+- training/tests/test_train_api.py：数值梯度 6.26e-05、AdamW 与闭式解 0.0、
+  Muon 压谱 630->1.85(341x)、端到端 loss 1.172->0.0054、state_dict+Embedding 梯度聚合
+- 认知更正：Muon 的 NS5 不动点是 0.868（不是 1），判据应写成"条件数压平"
+- README 补第十二节

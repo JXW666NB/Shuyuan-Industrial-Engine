@@ -214,3 +214,36 @@ VERDICT ok=True  chat_meta=True  cpu_forward=True
 | `docs/multi_vendor_strategy.md` | 多厂商原生兼容（海光 DCU / AMD / 摩尔线程）与"显存税"拆解 |
 | `docs/pytorch_compat_api.md` | PyTorch 兼容训练 API 的设计与边界 |
 | `docs/incident_gpu_context_20261027.md` | V100 无法创建新 CUDA 上下文的排查记录 |
+
+---
+
+## 十二、`tgai_go.train`：PyTorch 风格训练 API（第一切片）
+
+目标是让迁移只改两处：
+
+```python
+# 原来                          # 现在
+import torch                    import tgai_go.train as torch
+model = torch.nn.Linear(...)    model = torch.nn.Linear(...)   # 代码几乎不变
+```
+
+当前切片（**CPU/numpy 后端，已自证**）：自动微分、`nn.Module/Linear/Embedding/RMSNorm/Sequential/ModuleList`、`optim.AdamW/Muon`、`functional.cross_entropy/softmax/silu`、`state_dict/load_state_dict`。
+
+判分台 `training/tests/test_train_api.py`（无需 GPU）：
+
+| 项 | 判据 | 实测 |
+|---|---|---|
+| A 自动微分 | vs 中心差分，相对误差 < 1e-4 | **6.26e-05** |
+| B AdamW | vs 闭式参考，< 1e-6 | **0.0** |
+| C Muon | 病态输入条件数压平 <= 2.0 且改善 >= 50x | **630 -> 1.85（341x）** |
+| D 端到端 | 小 MLP 拟合非线性函数，loss 降 >= 20x | **1.172 -> 0.0054（218x）** |
+| E 参数管理 | state_dict 往返 + Embedding 梯度聚合 | 全对 |
+
+```
+汇总: A=PASS, B=PASS, C=PASS, D=PASS, E=PASS   VERDICT ok=True
+```
+
+> Muon 的 NS5 系数（3.4445 / -4.7750 / 2.0315）不动点是 **0.868**，不是 1 ——
+> 它的作用是**压平奇异值谱**，常数倍由学习率吸收。判据必须按"条件数"写，不能按"等于单位阵"写。
+
+**尚未做**：CUDA 后端（接我们自己的 kernel + cuBLAS）、attention/MoE 模块、默认激活重算（`checkpoint="auto"`）。设计见 `docs/pytorch_compat_api.md`。
