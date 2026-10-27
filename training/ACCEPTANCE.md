@@ -262,3 +262,28 @@ Grok 修好了 tied 反传的崩溃（拆头方案：`F.linear(hn, emb.detach())
 > 说明：提速来自 `cublas_bridge.py` 的 batched GEMM，不是 .cu 的算术改动 ——
 > 用同一个新 bridge 跑旧 kernel 也是 0.95x。这条实测用来避免把功劳归错地方。
 
+
+## 十五、接受测试总表（2026-10-28，全部由 DeepSeek 独立复跑）
+
+环境：V100-PCIE-32GB / 驱动 580.88 / 产线 11450 共驻（util 0%）/ 全部走新的 grouped kernel 与 batched bridge。
+
+| 判分台 | 覆盖 | 结果 |
+|---|---|---|
+| `fwd_suite.py` | 前向逐算子 7 项（rmsnorm/silu/moe_add/emb_gather/rope/residual/moe_route） | **SUMMARY ok=True**，最差 1.10e-07 |
+| `op_suite.py` | **反向**逐算子 7 项 | **SUMMARY ok=True**，最差 3.05e-05 |
+| `attn_big_suite.py` | attention 前向+反向 vs torch + 计时 | **ok=True** worst_rel **4.25e-07**；fwd 1.84x / bwd 1.06x |
+| `mm_suite.py` | GEMM 桥（含 FP16 往返） | **ok=True** worst **1.144e-05** |
+| `ce_suite.py` | 交叉熵 | **ok=True** worst_rel **2.384e-07** |
+| `opt_suite.py` | 优化器（AdamW / Muon） | **ok=True** |
+| `layer_suite.py` | 整层反向 11 个梯度 + 输出 vs torch autograd | **ok=True** worst_rel **8.959e-07** |
+| `moe_block_suite.py` | MoE 块前向+反向 vs torch | **ok=True** worst_rel **6.907e-07** |
+| `qa_pelican.py` s1/s2/s3 | 训练稳定性 / 打包 / 引擎逐字复现 | **全 PASS**（见第十三节） |
+
+### 复跑注意（踩过的坑，避免重复）
+
+- `op_suite.py` 测的是 `*_bwd`，必须传**反向** kernel（`kernels/tgai_bwd.cu`），传前向会报 `cuModuleGetFunction 500`
+- `layer_bench.py` 三参数顺序是 **前向 / attention / 反向**
+- `fwd_suite` / `op_suite` 的结论行是 `SUMMARY ok=`，不是 `VERDICT`
+- suite 在真实规模（seq=512/d=1024/ff=4096）会自己吃掉 8 GB/专家而 OOM —— 是 suite 的构造方式，
+  数值校验用小规模（8/64/64/2），**速度**用 `bench_median.py` 在真实规模测
+
