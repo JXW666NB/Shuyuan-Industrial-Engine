@@ -24,6 +24,7 @@ import numpy as np
 __all__ = [
     "Tensor", "Parameter", "no_grad",
     "Module", "Linear", "Embedding", "RMSNorm", "Sequential", "ModuleList",
+    "CausalSelfAttention",
     "functional", "nn", "optim",
 ]
 
@@ -174,17 +175,42 @@ class Tensor:
 
     def __matmul__(self, other):
         other = _as_tensor(other)
-        if self.ndim != 2 or other.ndim != 2:
-            raise NotImplementedError("matmul 只支持 2D（第一切片）")
-        out = Tensor(self.data @ other.data,
-                     requires_grad=(self.requires_grad or other.requires_grad),
-                     _parents=(self, other))
+        rg = self.requires_grad or other.requires_grad
+        if self.ndim == 2 and other.ndim == 2:
+            out = Tensor(self.data @ other.data, requires_grad=rg, _parents=(self, other))
+            a, b = self.data, other.data
+
+            def bw(g, grads):
+                if self.requires_grad:
+                    _acc(grads, self, g @ b.T)
+                if other.requires_grad:
+                    _acc(grads, other, a.T @ g)
+            out._backward = bw
+            return out
+        if self.ndim == 3 and other.ndim == 3:
+            if self.shape[0] != other.shape[0]:
+                raise ValueError("3D matmul 需要相同 batch: %s vs %s"
+                                 % (self.shape, other.shape))
+            out = Tensor(np.matmul(self.data, other.data), requires_grad=rg, _parents=(self, other))
+            a, b = self.data, other.data
+
+            def bw(g, grads):
+                if self.requires_grad:
+                    _acc(grads, self, np.matmul(g, np.swapaxes(b, -1, -2)))
+                if other.requires_grad:
+                    _acc(grads, other, np.matmul(np.swapaxes(a, -1, -2), g))
+            out._backward = bw
+            return out
+        raise NotImplementedError("matmul 支持 2D/3D，收到 %dD x %dD"
+                                  % (self.ndim, other.ndim))
+
+    def swap_last2(self):
+        """交换最后两维（attention 里对 k 用）。"""
+        out = Tensor(np.swapaxes(self.data, -1, -2),
+                     requires_grad=self.requires_grad, _parents=(self,))
 
         def bw(g, grads):
-            if self.requires_grad:
-                _acc(grads, self, g @ other.data.T)
-            if other.requires_grad:
-                _acc(grads, other, self.data.T @ g)
+            _acc(grads, self, np.swapaxes(g, -1, -2))
         out._backward = bw
         return out
 
@@ -259,7 +285,10 @@ class Tensor:
 
         def bw(g, grads):
             full = np.zeros(shape, dtype=np.float32)
-            np.add.at(full, idx, g)
+            if _has_array_index(idx):
+                np.add.at(full, idx, g)      # 重复下标要累加（Embedding）
+            else:
+                full[idx] += g               # 纯切片
             _acc(grads, self, full)
         out._backward = bw
         return out
@@ -297,6 +326,17 @@ def _as_tensor(x):
     return x if isinstance(x, Tensor) else Tensor(x)
 
 
+def _has_array_index(idx):
+    """判断索引里是否含数组（需要 add.at 的重复累加语义）。"""
+    items = idx if isinstance(idx, tuple) else (idx,)
+    for it in items:
+        if isinstance(it, np.ndarray):
+            return True
+        if isinstance(it, (list, tuple)):
+            return True
+    return False
+
+
 # ─────────────────────────── functional ───────────────────────────
 class _Functional:
     @staticmethod
@@ -317,6 +357,19 @@ class _Functional:
         z = x - Tensor(m)
         e = z.exp()
         return z - e.sum(axis=axis, keepdims=True).log()
+
+    @staticmethod
+    def scaled_dot_product_attention(q: Tensor, k: Tensor, v: Tensor, causal=False):
+        """q,k,v: [B*H, S, Dh]（已展平 head）。causal=True 时做下三角掩码。"""
+        dh = q.shape[-1]
+        scale = 1.0 / np.sqrt(dh)
+        scores = (q @ k.swap_last2()) * scale                  # [BH,S,S]
+        if causal:
+            S = scores.shape[-1]
+            mask = np.triu(np.full((S, S), -1e30, dtype=np.float32), k=1)
+            scores = scores + Tensor(mask)                     # 常数，不回传梯度
+        p = _Functional.softmax(scores, axis=-1)
+        return p @ v
 
     @staticmethod
     def cross_entropy(logits: Tensor, target, ignore_index=-100):
@@ -429,6 +482,41 @@ class RMSNorm(Module):
         var = (x * x).mean(axis=-1, keepdims=True)
         inv = (var + Tensor(np.array([self.eps], np.float32))) ** -0.5
         return x * inv * self.weight
+
+
+class CausalSelfAttention(Module):
+    """causal 多头自注意力（对应引擎里的 attn 子层）。
+
+    权重拆成独立的 q/k/v/out 四个 Linear，命名与 .TG 里的
+    `blocks.{i}.attn.{q,k,v,out}_proj.weight` 一一对应，便于直出。
+    """
+
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        if d_model % n_heads:
+            raise ValueError("d_model 必须能被 n_heads 整除")
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.q_proj = Linear(d_model, d_model, bias=False)
+        self.k_proj = Linear(d_model, d_model, bias=False)
+        self.v_proj = Linear(d_model, d_model, bias=False)
+        self.out_proj = Linear(d_model, d_model, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, S, D = x.shape
+        H, Dh = self.n_heads, self.d_head
+
+        def split(t):
+            # [B,S,D] -> [B*H, S, Dh]
+            return t.reshape(B, S, H, Dh).reshape(B * H, S, Dh)
+
+        q = split(self.q_proj(x.reshape(B * S, D)))
+        k = split(self.k_proj(x.reshape(B * S, D)))
+        v = split(self.v_proj(x.reshape(B * S, D)))
+        o = _Functional.scaled_dot_product_attention(q, k, v, causal=True)
+        o = o.reshape(B, H, S, Dh).reshape(B, S, H * Dh)
+        return self.out_proj(o.reshape(B * S, D)).reshape(B, S, D)
 
 
 class Sequential(Module):
@@ -570,6 +658,7 @@ class _OptimModule:
 
 class _NNModule:
     Module = Module
+    CausalSelfAttention = CausalSelfAttention
     Parameter = Parameter
     Linear = Linear
     Embedding = Embedding

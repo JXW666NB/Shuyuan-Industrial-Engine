@@ -183,6 +183,113 @@ def test_state_dict():
     return ok
 
 
+
+
+def test_attention_grad():
+    """F. 注意力：自动微分 vs 数值梯度（对输入和对 q_proj 权重）"""
+    np.random.seed(11)
+    B, S, D, H = 2, 4, 8, 2
+    attn = nn.CausalSelfAttention(D, H)
+    x0 = np.random.randn(B, S, D).astype(np.float32) * 0.5
+
+    def loss_of(x_np, w_np=None):
+        if w_np is not None:
+            attn.q_proj.weight.data = w_np.reshape(attn.q_proj.weight.shape).copy()
+        y = attn(Tensor(x_np))
+        return float((y * y).mean().data)
+
+    xT = Tensor(x0, requires_grad=True)
+    y = attn(xT)
+    loss = (y * y).mean()
+    loss.backward()
+    gx_auto = xT.grad.copy()
+
+    w0 = attn.q_proj.weight.data.copy()
+    gq_auto = attn.q_proj.weight.grad.copy()
+
+    gx_num = finite_diff(lambda z: loss_of(z), x0)
+    ex = np.abs(gx_auto - gx_num).max() / (np.abs(gx_num).max() + 1e-12)
+
+    def loss_w(w_np):
+        return loss_of(x0, w_np)
+
+    # 权重梯度很小（|g|max~6e-3），float32 下中心差分对 eps 很敏感：
+    # 实测 eps=1e-2 -> 2.0e-4，eps=1e-3 -> 1.6e-3，误差随 eps 减小而增大 ⇒ 差分噪声
+    gw_num = finite_diff(loss_w, w0, eps=1e-2)
+    # 重新算一次 autograd 的 w 梯度（上面已有）
+    ew = np.abs(gq_auto - gw_num).max() / (np.abs(gw_num).max() + 1e-12)
+    attn.q_proj.weight.data = w0
+    ok = ex < 1e-3 and ew < 1e-3
+    print("[F] 注意力梯度: dx 误差=%.2e  dWq 误差=%.2e  -> %s"
+          % (ex, ew, "PASS" if ok else "FAIL"))
+    return ok
+
+
+def test_attention_causal():
+    """G. 因果性：改动未来 token 不能影响过去位置的输出"""
+    np.random.seed(12)
+    B, S, D, H = 1, 6, 8, 2
+    attn = nn.CausalSelfAttention(D, H)
+    x = np.random.randn(B, S, D).astype(np.float32)
+    y1 = attn(Tensor(x)).data.copy()
+
+    x2 = x.copy()
+    x2[0, -1, :] += 5.0                    # 只改最后一个位置
+    y2 = attn(Tensor(x2)).data
+    diff_past = np.abs(y1[0, :-1] - y2[0, :-1]).max()
+    diff_last = np.abs(y1[0, -1] - y2[0, -1]).max()
+    ok = diff_past < 1e-6 and diff_last > 1e-6
+    print("[G] 因果性: 过去位置变化=%.2e（应为0）  末位变化=%.2e（应>0）-> %s"
+          % (diff_past, diff_last, "PASS" if ok else "FAIL"))
+    return ok
+
+
+def test_attention_train():
+    """H. 端到端：mini 注意力语言模型学会预测周期序列的下一个 token"""
+    np.random.seed(13)
+    V, S, D, H = 8, 16, 32, 4
+    period = 4
+    data = np.array([[ (i % period) for i in range(S + 1)] for _ in range(32)], dtype=np.int64)
+
+    class TinyLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = nn.Embedding(V, D)
+            self.n1 = nn.RMSNorm(D)
+            self.attn = nn.CausalSelfAttention(D, H)
+            self.n2 = nn.RMSNorm(D)
+            self.head = nn.Linear(D, V, bias=False)
+
+        def forward(self, idx):
+            B, L = idx.shape
+            x = self.emb(idx)
+            x = x + self.attn(self.n1(x))
+            x = self.n2(x)
+            return self.head(x.reshape(B * L, D))
+
+    m = TinyLM()
+    opt = optim.AdamW(m.parameters(), lr=3e-3, weight_decay=0.0)
+    inp = data[:, :S]
+    tgt = data[:, 1:S + 1]
+    losses = []
+    for step in range(300):
+        logits = m(inp)
+        loss = F.cross_entropy(logits, tgt.reshape(-1))
+        m.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.data))
+    acc = 0.0
+    with tt.no_grad():
+        logits = m(inp)
+        pred = logits.data.argmax(-1).reshape(-1)
+        acc = float((pred == tgt.reshape(-1)).mean())
+    ok = losses[-1] < 0.15 and acc > 0.95
+    print("[H] 注意力 LM 训练: loss %.3f -> %.4f，teacher-forced 准确率 %.1f%%（%d 参数）-> %s"
+          % (losses[0], losses[-1], acc * 100, m.num_params(), "PASS" if ok else "FAIL"))
+    return ok
+
+
 def main():
     results = {
         "A_autograd": test_autograd(),
@@ -190,6 +297,9 @@ def main():
         "C_muon": test_muon(),
         "D_train": test_end_to_end(),
         "E_state": test_state_dict(),
+        "F_attn_grad": test_attention_grad(),
+        "G_causal": test_attention_causal(),
+        "H_attn_train": test_attention_train(),
     }
     allok = all(results.values())
     print("\n汇总:", ", ".join("%s=%s" % (k, "PASS" if v else "FAIL") for k, v in results.items()))
