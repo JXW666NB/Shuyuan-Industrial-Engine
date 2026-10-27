@@ -227,7 +227,10 @@ import torch                    import tgai_go.train as torch
 model = torch.nn.Linear(...)    model = torch.nn.Linear(...)   # 代码几乎不变
 ```
 
-当前切片（**CPU/numpy 后端，已自证**）：自动微分、`nn.Module/Linear/Embedding/RMSNorm/Sequential/ModuleList`、`optim.AdamW/Muon`、`functional.cross_entropy/softmax/silu`、`state_dict/load_state_dict`。
+当前切片（**CPU/numpy 后端，已自证**）：自动微分（含广播还原、批量 matmul、切片索引）、
+`nn.Module/Linear/Embedding/RMSNorm/CausalSelfAttention/Sequential/ModuleList`、
+`optim.AdamW/Muon`、`functional.cross_entropy/softmax/silu/scaled_dot_product_attention`、
+`state_dict/load_state_dict`。
 
 判分台 `training/tests/test_train_api.py`（无需 GPU）：
 
@@ -238,9 +241,12 @@ model = torch.nn.Linear(...)    model = torch.nn.Linear(...)   # 代码几乎不
 | C Muon | 病态输入条件数压平 <= 2.0 且改善 >= 50x | **630 -> 1.85（341x）** |
 | D 端到端 | 小 MLP 拟合非线性函数，loss 降 >= 20x | **1.172 -> 0.0054（218x）** |
 | E 参数管理 | state_dict 往返 + Embedding 梯度聚合 | 全对 |
+| F 注意力梯度 | dx / dWq 对数值梯度 < 1e-3 | **1.37e-04 / 1.99e-04** |
+| G 因果性 | 改未来 token 不影响过去位置 | 过去变化 **0.0**，末位 6.55 |
+| H 注意力 LM | 周期序列 next-token，准确率 > 95% | loss 2.970→0.0010，**100%** |
 
 ```
-汇总: A=PASS, B=PASS, C=PASS, D=PASS, E=PASS   VERDICT ok=True
+汇总: A..H = 8/8 PASS   VERDICT ok=True
 ```
 
 > Muon 的 NS5 系数（3.4445 / -4.7750 / 2.0315）不动点是 **0.868**，不是 1 ——
