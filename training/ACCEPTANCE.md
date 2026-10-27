@@ -191,3 +191,29 @@ publish_pypi.bat
 | 鹈鹕权重重训 + 引擎逐字复现 | GPU 无法创建新上下文 | 重启 V100 或授权停 11450 做 GPU reset |
 | MoE 反向 grouped GEMM | 需 GPU 实测 | GPU 恢复 |
 | `tgai_go.train` 的 CUDA 后端 | 需 GPU 实测 | GPU 恢复 |
+
+---
+
+## 十三、端到端链路状态（2026-10-28 更新）
+
+### 已实测通过
+
+| 环节 | 结果 |
+|---|---|
+| 训练 → 打包 `.TG` | 41.2 MB / 58 项权重，逐项与 checkpoint 一致 |
+| **引擎 vs torch logits** | **3.317e-07**（同一份权重、同一串 id，argmax 一致） |
+| 引擎逐字符生成 | 12k 步模型：`pelican_on_bike` **20.0%** / `bike_on_pelican` **41.3%**（欠训练，链路本身通） |
+
+> 排查过程中确认过两个坑：
+> 1. **打包后立刻读文件会读到未落盘内容**，导致误判"引擎对不上"（加 3 秒等待即正常）
+> 2. 环境变量经 `cmd /c "set X=..&&"` 传递在这台机器上**不生效**，改用 `_env_run.py` 包装器
+
+### 未完成：tied 权重训练到收敛
+
+`logits = hn @ emb.T` 的 tied 版本在随机步数崩 CUDA（`illegal memory access` / `misaligned address`；
+阻塞模式下定位到 `loss.backward()` 里的 `cublasSgemm` → `CUBLAS_STATUS_EXECUTION_FAILED`）。
+非 tied 版本 2×40,000 步完全正常。
+
+**代价**：每次崩溃会让 V100 的新 CUDA 上下文失效，需要「重装驱动 + 冷重启」恢复（已发生 2 次）。
+
+**归属**：该 bug 交 Grok 修；DeepSeek 只负责验收台 `training/qa_pelican.py`（s1 训练稳定性 / s2 打包正确性 / s3 引擎复现）与独立复核。
