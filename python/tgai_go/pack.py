@@ -72,9 +72,31 @@ class TGWriter:
             for i, v in enumerate(special_ids[:16]):
                 self.specials[i] = int(v)
 
+    # chat meta 的 type 常量（与 src/tgai_chat_meta.h 一致）
+    CM_CHAT_TEMPLATE, CM_STOP_STRINGS, CM_TURN_MARKERS = 1, 2, 3
+    CM_SPECIAL_TOKENS, CM_GEN_DEFAULTS, CM_SYSTEM_PROMPT = 4, 5, 6
+    CM_RENDER_MODE, CM_TEMPLATE_TURN = 7, 8
+
     def set_chat_meta(self, entries: dict):
-        """{type_int: bytes}"""
-        self.chat_meta = dict(entries)
+        """结构化写入 chat meta，自动按引擎格式编码：
+
+            {5: {"temperature": "0.7"}}        # GEN_DEFAULTS  → k=v 用 \\x00 分隔
+            {4: ["<pad>", "<bos>"]}            # SPECIAL_TOKENS → 列表用 \\x00 分隔
+            {1: "模板字符串"}                    # 其余 → 纯 UTF-8 字符串
+            {9: b"raw bytes"}                   # 已是 bytes 则原样写
+        """
+        out = {}
+        for t, v in entries.items():
+            if isinstance(v, bytes):
+                out[int(t)] = v
+            elif isinstance(v, dict):
+                out[int(t)] = b"\x00".join(
+                    (str(k) + "=" + str(val)).encode("utf-8") for k, val in v.items())
+            elif isinstance(v, (list, tuple)):
+                out[int(t)] = b"\x00".join(str(x).encode("utf-8") for x in v)
+            else:
+                out[int(t)] = str(v).encode("utf-8")
+        self.chat_meta = out
 
     # ---------- 序列化 ----------
     def _tokenizer_bytes(self):

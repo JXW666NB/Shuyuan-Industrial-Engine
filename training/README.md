@@ -148,3 +148,69 @@ cu.launch(mod, "layer_fwd", (1,1,1), (1,1,1), args, shared=48*1024)
 3. **MoE 反向未做 grouped GEMM**：比 torch 慢 13%。
 4. **只验了 CUDA**：HIP（海光 DCU / AMD）移植未开始，见 `docs/multi_vendor_strategy.md`。
 5. **PyPI 包未含训练流程**：`tgai_go.pack` / `read_tg` 只是打包工具，训练脚本在仓库 `training/`。
+
+---
+
+## 八、CPU 侧独立复核（不需要 GPU）
+
+GPU 被占用/异常时，`.TG` 仍可用**纯 CPU 引擎**验证：
+
+```
+[1] 打包 (含 chat meta)                     56,103 B
+[2] chat meta 解析（仓库自带 parse_tg_chat_meta）
+    gen_defaults  = {'temperature': '0.7', 'top_p': '0.9', 'max_tokens': '512'}
+    special_tokens= ['<pad>', '<bos>', '<eos>']
+    stop_strings  = ['<|end|>', '</s>']
+[3] CPU 引擎加载: L=1 d=32 nh=4 ff=64 V=40 seq=128 E=1 topk=1
+[4] CPU 引擎 logits vs NumPy 参考: 最大相对误差 = 2.655e-07
+VERDICT ok=True  chat_meta=True  cpu_forward=True
+```
+
+脚本：`training/tg_cpu_verify.py`；引擎：`cpu/build/libtgai_engine.dll`。
+
+### chat meta 的编码格式（实测确认）
+
+| type | 名称 | 编码 |
+|---|---|---|
+| 1/6/7/8 | chat_template / system_prompt / render_mode / template_turn | 纯 UTF-8 字符串 |
+| 2/3/4 | stop_strings / turn_markers / special_tokens | 多个字符串用 **`\0`** 分隔 |
+| 5 | gen_defaults | `key=value`，多条用 **`\0`** 分隔 |
+
+`tgai_go.pack.TGWriter.set_chat_meta()` 会按上表自动编码（传 dict / list / str 均可）。
+
+---
+
+## 九、⚠️ 写 merges 前必读
+
+仓库 `docs/BPE分词不一致_根因分析与修复方案_20261009.md` 记录过一次事故：
+`.TG` 里写了 merges，但训练侧分词器走的是字符级回退 ⇒ 引擎做 BPE 合并、训练没做 ⇒ **输出乱码**。
+
+**规则：写进 `.TG` 的 `merges` 必须与训练时用的分词器完全一致。**
+我们的对拍（`training/bpe_corpus.py`）就是为此设计的：训练侧编码结果与引擎 `tg_encode`
+**逐 token 比对**，不一致立刻暴露。
+
+---
+
+## 十、端到端演示（训练 → `.TG` → 引擎生成）
+
+`training/pelican_to_tg.py` 把训练好的 char-LM 直接打成 `.TG`：
+
+| 环节 | 结果 |
+|---|---|
+| 打包 10.5M 鹈鹕模型 | **41.2 MB / 58 项权重** |
+| `libtgai_engine_gpu.dll` 加载 | ✅ `L=4 d=512 nh=16 ff=1024 V=78 seq=1024 E=1 topk=1` |
+| 引擎逐字符生成 | ✅ 跑通（文本乱码，因 tied 权重训练中断 —— 见 `docs/incident_gpu_context_20261027.md`） |
+
+> 引擎的 LM head 与 `token_embedding` **共享权重**，因此训练侧必须用 tied embedding 才能对齐；
+> 非 tied 模型打成 `.TG` 后，引擎会用共享头算 logits，结果与训练侧不一致。
+
+---
+
+## 十一、相关设计文档
+
+| 文档 | 内容 |
+|---|---|
+| `docs/hetero_orchestrator.md` | 异构多卡资源调度（显存账 / 1-bit 压缩 / MCU 算例） |
+| `docs/multi_vendor_strategy.md` | 多厂商原生兼容（海光 DCU / AMD / 摩尔线程）与"显存税"拆解 |
+| `docs/pytorch_compat_api.md` | PyTorch 兼容训练 API 的设计与边界 |
+| `docs/incident_gpu_context_20261027.md` | V100 无法创建新 CUDA 上下文的排查记录 |
