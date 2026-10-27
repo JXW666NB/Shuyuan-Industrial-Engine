@@ -197,9 +197,11 @@ VERDICT ok=True  chat_meta=True  cpu_forward=True
 
 | 环节 | 结果 |
 |---|---|
-| 打包 10.5M 鹈鹕模型 | **41.2 MB / 58 项权重** |
-| `libtgai_engine_gpu.dll` 加载 | ✅ `L=4 d=512 nh=16 ff=1024 V=78 seq=1024 E=1 topk=1` |
-| 引擎逐字符生成 | ✅ 跑通（文本乱码，因 tied 权重训练中断 —— 见 `docs/incident_gpu_context_20261027.md`） |
+| 训练 | 20000 步零 CUDA 错误，loss **4.2852 → 0.0470** |
+| 打包 10.5M 鹈鹕模型 | 58 项权重，逐项与 checkpoint 一致（异常 0/38） |
+| `libtgai_engine_gpu.dll` 加载 | ✅ `L=4 d=512 nh=16 ff=1024 V=78 seq=512 E=1 topk=1` |
+| 引擎 vs torch logits | **3.908e-07**（判据 <1e-4） |
+| **引擎逐字符生成** | **两份 HTML 各 100.0%（400/400）** |
 
 > 引擎的 LM head 与 `token_embedding` **共享权重**，因此训练侧必须用 tied embedding 才能对齐；
 > 非 tied 模型打成 `.TG` 后，引擎会用共享头算 logits，结果与训练侧不一致。
