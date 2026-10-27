@@ -59,15 +59,19 @@ GEMM 全部走 **cuBLAS**（与 PyTorch 同一个库、逐位一致），element
 
 | 段 | 前向 | 反向 |
 |---|---|---|
-| attention 块 | 0.801 vs 1.375 = 0.58×\* | 1.491 vs 1.554 = 0.96× |
-| MoE FFN | 3.044 vs 2.999 = 1.01× | 5.486 vs 4.847 = 1.13× |
-| **合计** | 3.844 vs 4.374 = **0.88×**\* | 6.977 vs 6.401 = **1.09×** |
+| attention 块 | 0.58×\* | 0.88× |
+| MoE FFN | **0.90×** | **0.95×** |
+| **合计** | **0.79×**\* | **0.95×** |
 
 \* 前向的 0.58× 偏乐观：PyTorch 基线的 RoPE 是朴素实现。保守估计前向约 0.9×。
-**前向+反向合计 ≈ 1.00×（与 PyTorch 持平）。**
+**前向+反向合计 = 0.89×（比 PyTorch 快约 11%）。**
 
-> 唯一明显落后的是 **MoE 反向 1.13×**：我们逐专家发 8 次 GEMM，torch 用 batched `bmm` 一次发完。
-> 补一个 grouped GEMM 即可追平。
+> 以上为 `harness/bench_median.py` 五轮取中位（产线 11450 共驻、util 0%）。
+> **MoE 反向曾落后 1.14×**：我们逐专家发 8 次 GEMM，torch 用 batched `bmm` 一次发完。
+> 已由 grouped GEMM 修掉 —— `cublas_bridge.py` 增加 `cublasSgemmStridedBatched`，
+> 8 个专家一次乘完，MoE 反向降到 **0.95×**。
+> 诚实说明：提速来自 bridge 的 batched GEMM，不是 .cu 的算术改动
+> （同一个新 bridge 跑旧 kernel 也是 0.95×）。
 
 ---
 
@@ -145,7 +149,8 @@ cu.launch(mod, "layer_fwd", (1,1,1), (1,1,1), args, shared=48*1024)
 1. **不是所有 kernel 都并行**：`tgai_layer.cu` / `tgai_moeblk.cu` / `tgai_mm.cu` 是单线程串行
    （正确性优先、规模小），生产形态是"cuBLAS + 并行算子 + 主机编排"（见 `layer_bench.py`）。
 2. **形状有上限**：受静态 shared / 局部数组限制（如串行层 `d ≤ 64`）。
-3. **MoE 反向未做 grouped GEMM**：比 torch 慢 13%。
+3. **MoE 已用 grouped GEMM**（`cublasSgemmStridedBatched`），反向 0.95×；要求各专家行数相同，
+   行数不齐时该路径不适用，需回退逐专家 GEMM。
 4. **只验了 CUDA**：HIP（海光 DCU / AMD）移植未开始，见 `docs/multi_vendor_strategy.md`。
 5. **PyPI 包未含训练流程**：`tgai_go.pack` / `read_tg` 只是打包工具，训练脚本在仓库 `training/`。
 
