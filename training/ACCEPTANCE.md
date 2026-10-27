@@ -232,3 +232,33 @@ Grok 修好了 tied 反传的崩溃（拆头方案：`F.linear(hn, emb.detach())
 **代价**：每次崩溃会让 V100 的新 CUDA 上下文失效，需要「重装驱动 + 冷重启」恢复（已发生 2 次）。
 
 **归属**：该 bug 交 Grok 修；DeepSeek 只负责验收台 `training/qa_pelican.py`（s1 训练稳定性 / s2 打包正确性 / s3 引擎复现）与独立复核。
+
+## 十四、MoE grouped GEMM（2026-10-28）
+
+**问题**：MoE 反向对 8 个专家逐个发 GEMM（每层 48 次 `cublasSgemm` + 8 次 `silu_mul_bwd`），
+而 torch 基线是一次 `bmm`。差距不在算力，在 kernel 启动次数。
+
+**改法**（Grok 实现）：`training/harness/cublas_bridge.py` 增加 `cublasSgemmStridedBatched` 路径，
+8 个专家一次乘完；前向同样收成 batched GEMM。kernel 文件 `training/kernels/tgai_bwd.cu` 同步更新。
+
+**实测**（`training/harness/bench_median.py`，5 轮取中位；产线 11450 共驻，util 0%）：
+
+| 段 | 改前 | 改后 |
+|---|---|---|
+| attention 前向 | 0.58x | 0.58x |
+| MoE FFN 前向 | 1.00x | **0.90x** |
+| 前向合计 | 0.87x | **0.79x** |
+| attention 反向 | 0.96x | 0.88x |
+| **MoE FFN 反向** | **1.14x** | **0.95x** |
+| 反向合计 | 1.10x | **0.95x** |
+| **前向 + 反向** | **1.00x** | **0.89x** |
+
+判据（ours/torch，越小越快）：目标 ≤0.9x → **前+反 0.89x 达成**，MoE 反向已达 0.95x。
+
+**数值（独立复核，走新 bridge）**：
+- `layer_suite.py`：整层反向 11 个梯度 + 输出 vs torch autograd，**ok=True，worst_rel 8.959e-07**
+- `moe_block_suite.py`：MoE 块前向+反向 vs torch，**ok=True，worst_rel 6.907e-07**
+
+> 说明：提速来自 `cublas_bridge.py` 的 batched GEMM，不是 .cu 的算术改动 ——
+> 用同一个新 bridge 跑旧 kernel 也是 0.95x。这条实测用来避免把功劳归错地方。
+

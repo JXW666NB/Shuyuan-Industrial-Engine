@@ -1,4 +1,15 @@
-/* TGAI GO backward kernels, fp32, sm_70. Device-only (NVRTC). */
+/* TGAI grouped MoE backward, fp32, sm_70. Device-only (NVRTC).
+ *
+ * Expert GEMMs are not in this file. The eight experts share M/N/K and are
+ * already packed on the leading dimension, so the host issues one
+ * cublasSgemmStridedBatched per logical product (gemm_tn_batched /
+ * gemm_nt_batched / sgemm_batched) instead of one cublasSgemm per expert.
+ * This file is the elementwise half of that path:
+ *   silu_mul_bwd  - one launch over every expert row
+ *   rmsnorm_bwd   - one launch over the grouped rows
+ * Launch both on the cuBLAS stream. The second NT product uses beta=1 so
+ * dh = dg @ Wg^T + du @ Wu^T needs no extra add kernel.
+ */
 
 __device__ __forceinline__ float blk_sum(float v, float* smem)
 {

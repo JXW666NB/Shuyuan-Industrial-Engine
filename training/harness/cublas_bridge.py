@@ -119,6 +119,81 @@ class Cublas:
             raise RuntimeError("cublasSgemm(NT) failed: %d" % st)
         return out
 
+    def _strided_batched(self, transa, transb, m, n, k, A, lda, stride_a, B, ldb, stride_b,
+                         C, ldc, stride_c, batch, beta):
+        """cublasSgemmStridedBatched. A/B/C are device pointers (ints)."""
+        fn = getattr(self, "_strided_fn", None)
+        if fn is None:
+            fn = self.dll.cublasSgemmStridedBatched
+            fn.restype = ctypes.c_int
+            fn.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+                ctypes.c_int,
+            ]
+            self._strided_fn = fn
+        alpha = ctypes.c_float(1.0)
+        b = ctypes.c_float(beta)
+        st = fn(
+            self.handle, transa, transb,
+            ctypes.c_int(m), ctypes.c_int(n), ctypes.c_int(k),
+            ctypes.byref(alpha),
+            ctypes.c_void_p(A), ctypes.c_int(lda), ctypes.c_longlong(stride_a),
+            ctypes.c_void_p(B), ctypes.c_int(ldb), ctypes.c_longlong(stride_b),
+            ctypes.byref(b),
+            ctypes.c_void_p(C), ctypes.c_int(ldc), ctypes.c_longlong(stride_c),
+            ctypes.c_int(batch))
+        if st != 0:
+            raise RuntimeError("cublasSgemmStridedBatched failed: %d" % st)
+
+    def gemm_tn_batched(self, A, B, out, beta=0.0):
+        """行优先、按 batch 对齐：C[b,M,N] = A[b,K,M]^T @ B[b,K,N]。
+
+        与 gemm_tn 同一套列主序转置，stride 把 E 个专家一次发出。
+        """
+        batch, K, M = A.shape
+        b2, K2, N = B.shape
+        assert batch == b2 and K == K2 and tuple(out.shape) == (batch, M, N)
+        assert A.is_contiguous() and B.is_contiguous() and out.is_contiguous()
+        self._strided_batched(
+            CUBLAS_OP_N, CUBLAS_OP_T, N, M, K,
+            B.data_ptr(), N, K * N,
+            A.data_ptr(), M, K * M,
+            out.data_ptr(), N, M * N, batch, beta)
+        return out
+
+    def gemm_nt_batched(self, A, B, out, beta=0.0):
+        """行优先：C[b,M,N] = A[b,M,K] @ B[b,N,K]^T。beta=1 可累加进同一 C。"""
+        batch, M, K = A.shape
+        b2, N, K2 = B.shape
+        assert batch == b2 and K == K2 and tuple(out.shape) == (batch, M, N)
+        assert A.is_contiguous() and B.is_contiguous() and out.is_contiguous()
+        self._strided_batched(
+            CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+            B.data_ptr(), K, N * K,
+            A.data_ptr(), K, M * K,
+            out.data_ptr(), N, M * N, batch, beta)
+        return out
+
+    def sgemm_batched(self, A, B, out, beta=0.0):
+        """行优先：C[b,M,N] = A[b,M,K] @ B[b,K,N]。"""
+        batch, M, K = A.shape
+        b2, K2, N = B.shape
+        assert batch == b2 and K == K2 and tuple(out.shape) == (batch, M, N)
+        assert A.is_contiguous() and B.is_contiguous() and out.is_contiguous()
+        self._strided_batched(
+            CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+            B.data_ptr(), N, K * N,
+            A.data_ptr(), K, M * K,
+            out.data_ptr(), N, M * N, batch, beta)
+        return out
+
     def close(self):
         if self.handle:
             self.dll.cublasDestroy_v2(self.handle)
