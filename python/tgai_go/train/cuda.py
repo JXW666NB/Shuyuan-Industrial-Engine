@@ -862,9 +862,160 @@ extern "C" __global__ void sumsq_sequential(const float* a, float* out, int n) {
 }
 """
 
+# MoE 派发/收集。专家 GEMM 仍走已有的 cublas/sgemm_mode，这里只做索引。
+# top-k：logit 更大者优先，平局保留更小的专家下标（与 moeblk 的 strict-greater argmax 一致）。
+_MOE_KERNELS = r"""
+extern "C" __global__ void moe_topk(const float* logits, int* idx, float* val,
+                                     int N, int E, int K) {
+    int t = (int)blockIdx.x;
+    if (t >= N || threadIdx.x != 0) return;
+    const float* row = logits + (long long)t * E;
+    int* irow = idx + (long long)t * K;
+    float* vrow = val + (long long)t * K;
+    for (int s = 0; s < K; ++s) {
+        int best_e = -1;
+        float best_v = 0.f;
+        for (int e = 0; e < E; ++e) {
+            int used = 0;
+            for (int p = 0; p < s; ++p) {
+                if (irow[p] == e) used = 1;
+            }
+            if (used) continue;
+            float v = row[e];
+            if (best_e < 0 || v > best_v || (v == best_v && e < best_e)) {
+                best_e = e;
+                best_v = v;
+            }
+        }
+        irow[s] = best_e;
+        vrow[s] = best_v;
+    }
+}
+
+extern "C" __global__ void moe_sigmoid(const float* x, float* y, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    float neg = __fmul_rn(x[i], -1.0f);
+    float e = exp32_bits(neg);
+    y[i] = __fdiv_rn(1.0f, __fadd_rn(1.0f, e));
+}
+
+extern "C" __global__ void moe_gather_pairs(const float* src, const int* idx, float* dst,
+                                             int N, int E, int K) {
+    int t = (int)blockIdx.x;
+    if (t >= N) return;
+    for (int s = (int)threadIdx.x; s < K; s += (int)blockDim.x) {
+        int e = idx[(long long)t * K + s];
+        dst[(long long)t * K + s] = src[(long long)t * E + e];
+    }
+}
+
+/* 单线程按 token、slot 的顺序加，和 CPU 的 np.add.at 同一方向。 */
+extern "C" __global__ void moe_scatter_pairs(const float* g, const int* idx, float* dst,
+                                              int N, int E, int K) {
+    if (threadIdx.x || blockIdx.x) return;
+    for (int i = 0; i < N * E; ++i) dst[i] = 0.f;
+    for (int t = 0; t < N; ++t) {
+        for (int s = 0; s < K; ++s) {
+            int e = idx[(long long)t * K + s];
+            dst[(long long)t * E + e] += g[(long long)t * K + s];
+        }
+    }
+}
+
+extern "C" __global__ void moe_compact(const int* idx, int* offsets, int* cursor,
+                                        int* tok, int* slot, int N, int E, int K) {
+    if (threadIdx.x || blockIdx.x) return;
+    for (int e = 0; e < E; ++e) offsets[e] = 0;
+    for (int t = 0; t < N; ++t) {
+        for (int s = 0; s < K; ++s) offsets[idx[(long long)t * K + s]]++;
+    }
+    int sum = 0;
+    for (int e = 0; e < E; ++e) {
+        int c = offsets[e];
+        offsets[e] = sum;
+        cursor[e] = sum;
+        sum += c;
+    }
+    offsets[E] = sum;
+    for (int t = 0; t < N; ++t) {
+        for (int s = 0; s < K; ++s) {
+            int e = idx[(long long)t * K + s];
+            int p = cursor[e]++;
+            tok[p] = t;
+            slot[p] = s;
+        }
+    }
+}
+
+extern "C" __global__ void moe_gather_rows(const float* x, const int* tok, float* out,
+                                            int begin, int m, int d) {
+    int i = (int)blockIdx.x;
+    if (i >= m) return;
+    int t = tok[begin + i];
+    const float* src = x + (long long)t * d;
+    float* dst = out + (long long)i * d;
+    for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x) dst[j] = src[j];
+}
+
+extern "C" __global__ void moe_scatter_rows(const float* y, const int* tok, float* out,
+                                             int begin, int m, int d) {
+    int i = (int)blockIdx.x;
+    if (i >= m) return;
+    int t = tok[begin + i];
+    const float* src = y + (long long)i * d;
+    float* dst = out + (long long)t * d;
+    for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x)
+        atomicAdd(dst + j, src[j]);
+}
+
+extern "C" __global__ void moe_gather_slots(const float* w, const int* tok, const int* slot,
+                                             float* out, int begin, int m, int K) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= m) return;
+    int t = tok[begin + i];
+    int s = slot[begin + i];
+    out[i] = w[(long long)t * K + s];
+}
+
+extern "C" __global__ void moe_scatter_slots(const float* g, const int* tok, const int* slot,
+                                              float* dst, int begin, int m, int N, int K) {
+    if (threadIdx.x || blockIdx.x) return;
+    for (int i = 0; i < N * K; ++i) dst[i] = 0.f;
+    for (int i = 0; i < m; ++i) {
+        int t = tok[begin + i];
+        int s = slot[begin + i];
+        dst[(long long)t * K + s] += g[i];
+    }
+}
+
+extern "C" __global__ void moe_row_scale(const float* y, const float* w, float* out,
+                                          int m, int d) {
+    int i = (int)blockIdx.x;
+    if (i >= m) return;
+    float s = w[i];
+    const float* src = y + (long long)i * d;
+    float* dst = out + (long long)i * d;
+    for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x)
+        dst[j] = __fmul_rn(src[j], s);
+}
+
+extern "C" __global__ void moe_row_dot(const float* g, const float* y, float* dw,
+                                        int m, int d) {
+    int i = (int)blockIdx.x;
+    if (i >= m || threadIdx.x != 0) return;
+    const float* gg = g + (long long)i * d;
+    const float* yy = y + (long long)i * d;
+    float s = 0.f;
+    for (int j = 0; j < d; ++j) s = __fadd_rn(s, __fmul_rn(gg[j], yy[j]));
+    dw[i] = s;
+}
+"""
+
 
 def _device_source():
-    return _CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS + "\n" + _M5_KERNELS
+    return (_CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS + "\n"
+            + _M5_KERNELS + "\n" + _MOE_KERNELS)
 
 
 class CudaError(RuntimeError):
@@ -2305,6 +2456,144 @@ class CudaRuntime:
         self.launch("sumsq_sequential", (1, 1, 1), (1, 1, 1), [
             self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
         ])
+        return out
+
+    def _moe_row_block(self, d):
+        d = int(d)
+        if d <= 32:
+            return 32
+        if d <= 128:
+            return 128
+        return 256
+
+    def moe_topk(self, logits, k):
+        """每个 token 的 top-k。返回 (idx int32 [N,K], 选中 logit [N,K])。"""
+        if len(logits.shape) != 2:
+            raise CudaError("moe_topk 需要 [N,E]，收到 %s" % (logits.shape,))
+        n, e = int(logits.shape[0]), int(logits.shape[1])
+        k = int(k)
+        if k < 1 or k > e:
+            raise CudaError("moe_topk k=%d 超出专家数 %d" % (k, e))
+        idx = self.empty((n, k), dtype=np.int32)
+        val = self.empty((n, k), dtype=np.float32)
+        if n and e:
+            self.launch("moe_topk", (n, 1, 1), (1, 1, 1), [
+                self._ptr(logits), self._ptr(idx), self._ptr(val),
+                (n, ctypes.c_int), (e, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        idx.keepalive = val
+        return idx, val
+
+    def moe_sigmoid(self, x):
+        out = self.empty(x.shape, dtype=np.float32)
+        if x.n:
+            grid, block = self._ewise_grid(x.n)
+            self.launch("moe_sigmoid", grid, block, [
+                self._ptr(x), self._ptr(out), (int(x.n), ctypes.c_int),
+            ])
+        return out
+
+    def moe_gather_pairs(self, src, idx, n, e, k):
+        out = self.empty((int(n), int(k)), dtype=np.float32)
+        if n and k:
+            self.launch("moe_gather_pairs", (int(n), 1, 1), (32, 1, 1), [
+                self._ptr(src), self._ptr(idx), self._ptr(out),
+                (int(n), ctypes.c_int), (int(e), ctypes.c_int), (int(k), ctypes.c_int),
+            ])
+        return out
+
+    def moe_scatter_pairs(self, g, idx, n, e, k):
+        out = self.zeros((int(n), int(e)), dtype=np.float32)
+        if n and e and k:
+            self.launch("moe_scatter_pairs", (1, 1, 1), (1, 1, 1), [
+                self._ptr(g), self._ptr(idx), self._ptr(out),
+                (int(n), ctypes.c_int), (int(e), ctypes.c_int), (int(k), ctypes.c_int),
+            ])
+        return out
+
+    def moe_compact(self, idx, n, e, k):
+        """按专家把 (token, slot) 收成三段连续区间。offsets 长度 E+1。"""
+        n, e, k = int(n), int(e), int(k)
+        offsets = self.empty((e + 1,), dtype=np.int32)
+        cursor = self.empty((max(e, 1),), dtype=np.int32)
+        slots = n * k
+        tok = self.empty((max(slots, 1),), dtype=np.int32)
+        slot = self.empty((max(slots, 1),), dtype=np.int32)
+        tok.n = slots
+        slot.n = slots
+        tok.shape = (slots,)
+        slot.shape = (slots,)
+        if e:
+            self.launch("moe_compact", (1, 1, 1), (1, 1, 1), [
+                self._ptr(idx), self._ptr(offsets), self._ptr(cursor),
+                self._ptr(tok), self._ptr(slot),
+                (n, ctypes.c_int), (e, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        offsets.keepalive = (cursor, tok, slot, idx)
+        return offsets, tok, slot
+
+    def moe_gather_rows(self, x, tok, begin, m, d):
+        out = self.empty((int(m), int(d)), dtype=np.float32)
+        if m and d:
+            self.launch("moe_gather_rows", (int(m), 1, 1), (self._moe_row_block(d), 1, 1), [
+                self._ptr(x), self._ptr(tok), self._ptr(out),
+                (int(begin), ctypes.c_int), (int(m), ctypes.c_int), (int(d), ctypes.c_int),
+            ])
+        return out
+
+    def moe_scatter_rows(self, y, tok, begin, m, n, d):
+        out = self.zeros((int(n), int(d)), dtype=np.float32)
+        if m and d:
+            self.launch("moe_scatter_rows", (int(m), 1, 1), (self._moe_row_block(d), 1, 1), [
+                self._ptr(y), self._ptr(tok), self._ptr(out),
+                (int(begin), ctypes.c_int), (int(m), ctypes.c_int), (int(d), ctypes.c_int),
+            ])
+        return out
+
+    def moe_gather_slots(self, w, tok, slot, begin, m, k):
+        out = self.empty((int(m),), dtype=np.float32)
+        if m:
+            grid, block = self._ewise_grid(m)
+            self.launch("moe_gather_slots", grid, block, [
+                self._ptr(w), self._ptr(tok), self._ptr(slot), self._ptr(out),
+                (int(begin), ctypes.c_int), (int(m), ctypes.c_int), (int(k), ctypes.c_int),
+            ])
+        return out
+
+    def moe_scatter_slots(self, g, tok, slot, begin, m, n, k):
+        out = self.zeros((int(n), int(k)), dtype=np.float32)
+        if m and n and k:
+            self.launch("moe_scatter_slots", (1, 1, 1), (1, 1, 1), [
+                self._ptr(g), self._ptr(tok), self._ptr(slot), self._ptr(out),
+                (int(begin), ctypes.c_int), (int(m), ctypes.c_int),
+                (int(n), ctypes.c_int), (int(k), ctypes.c_int),
+            ])
+        return out
+
+    def moe_row_scale(self, y, w):
+        if len(y.shape) != 2:
+            raise CudaError("moe_row_scale 需要 2D，收到 %s" % (y.shape,))
+        m, d = int(y.shape[0]), int(y.shape[1])
+        if int(w.n) != m:
+            raise CudaError("moe_row_scale 权重长度 %d != 行数 %d" % (w.n, m))
+        out = self.empty((m, d), dtype=np.float32)
+        if m and d:
+            self.launch("moe_row_scale", (m, 1, 1), (self._moe_row_block(d), 1, 1), [
+                self._ptr(y), self._ptr(w), self._ptr(out),
+                (m, ctypes.c_int), (d, ctypes.c_int),
+            ])
+        return out
+
+    def moe_row_dot(self, g, y):
+        m, d = int(g.shape[0]), int(g.shape[1])
+        out = self.empty((m,), dtype=np.float32)
+        if m and d:
+            self.launch("moe_row_dot", (m, 1, 1), (1, 1, 1), [
+                self._ptr(g), self._ptr(y), self._ptr(out),
+                (m, ctypes.c_int), (d, ctypes.c_int),
+            ])
+        elif m:
+            self._memset32(out, 0)
         return out
 
 

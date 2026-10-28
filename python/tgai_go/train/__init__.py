@@ -51,6 +51,18 @@ M4 CUDA（优化器更新留在显存上。主机只算偏差校正、学习率�
       参数误差超过 1e-7，所以这里不用它。转置守卫在设备上做 transpose2d。
       ||X|| 的平方和在设备上顺序累加，只把这一个标量降回主机做 float32 sqrt
 
+MoE（nn.MoE，CPU / CUDA 同一份模块，激活不整段拉回主机）：
+    * gate="sigmoid"：top-k（logit 更大者优先，平局取更小下标），权重 = sigmoid(logit)。
+      top_k=1 与 tgai_moeblk.cu 的路由一致：argmax、平局取小下标、门控 = sigmoid。
+    * gate="softmax"：先对全部 E 个 logit 做 softmax，再取同一个 top-k，权重就是这些
+      softmax 值，不再在 top-k 内归一。反向走标准 softmax VJP，未选中的 logit
+      会通过分母拿到梯度；sigmoid 则只有被选中的专家行有路由梯度。
+    * 专家：h = silu(x @ gate.T) * (x @ up.T)，y = h @ down.T，再按门控加权求和。
+      参数名 router.weight [E,d]、experts.{e}.gate/up.weight [ff,d]、
+      experts.{e}.down.weight [d,ff]。
+    * CUDA 只把每个专家的 token 计数（E+1 个 int32）读回主机，用来决定发不发 GEMM。
+      空专家不发 GEMM，梯度保持 None（等于没贡献）。
+
 尚未做：
     * M5 里仍只在 CPU 上的算子：exp / log / abs / clamp / cat / stack / einsum
       / max / min / topk / where（CUDA 上仍是 NotImplementedError）
@@ -246,7 +258,7 @@ def _cross_entropy_fused(logits, tgt):
 __all__ = [
     "Tensor", "Parameter", "no_grad", "set_device", "get_device",
     "Module", "Linear", "Embedding", "RMSNorm", "Sequential", "ModuleList",
-    "CausalSelfAttention",
+    "CausalSelfAttention", "MoE",
     "functional", "nn", "optim",
     "tensor", "zeros", "ones", "full", "randn", "rand", "arange", "from_numpy",
     "manual_seed", "cat", "stack", "matmul", "bmm", "einsum", "permute",
@@ -2177,6 +2189,340 @@ class ModuleList(Module):
         return iter(self._list)
 
 
+def _sigmoid32(v):
+    """与 moe_sigmoid 同一套 exp32：1 / (1 + exp32(-v))。"""
+    v = np.asarray(v, dtype=np.float32)
+    neg = np.multiply(v, np.float32(-1.0), dtype=np.float32)
+    e = np.asarray(_exp32(neg), dtype=np.float32)
+    den = np.add(np.float32(1.0), e, dtype=np.float32)
+    return np.divide(np.float32(1.0), den, dtype=np.float32)
+
+
+def _sigmoid_deriv32(y):
+    """moeblk 用的 g*(1-g)，不是 exp32 多项式的导数。CPU / CUDA 同一式子。"""
+    y = np.asarray(y, dtype=np.float32)
+    neg = np.multiply(y, np.float32(-1.0), dtype=np.float32)
+    one_m = np.add(np.float32(1.0), neg, dtype=np.float32)
+    return np.multiply(y, one_m, dtype=np.float32)
+
+
+def _sigmoid_cuda(x):
+    rt = _cuda()
+    buf = rt.moe_sigmoid(x._gpu)
+    out = Tensor._from_gpu(buf, requires_grad=x.requires_grad, _parents=(x,))
+
+    def bw(g, grads):
+        if not x.requires_grad:
+            return
+        one = rt.full(tuple(int(s) for s in buf.shape), 1.0)
+        deriv = rt.mul(buf, rt.add(one, rt.scale(buf, -1.0)))
+        _acc(grads, x, rt.mul(g, deriv))
+
+    out._backward = bw
+    return out
+
+
+def _sigmoid_tensor(x):
+    if getattr(x, "device", "cpu") == "cuda":
+        return _sigmoid_cuda(x)
+    y = _sigmoid32(x.data)
+    out = Tensor(y, requires_grad=x.requires_grad, _parents=(x,))
+
+    def bw(g, grads):
+        if x.requires_grad:
+            _acc(grads, x, np.asarray(g, dtype=np.float32) * _sigmoid_deriv32(y))
+
+    out._backward = bw
+    return out
+
+
+def _moe_topk_idx(logits, k):
+    """logit 更大者优先，平局取更小下标。和 moe_topk kernel 同一套扫描。"""
+    z = np.asarray(logits, dtype=np.float32)
+    n, e = int(z.shape[0]), int(z.shape[1])
+    k = int(k)
+    idx = np.empty((n, k), dtype=np.int64)
+    for t in range(n):
+        row = z[t]
+        chosen = []
+        for s in range(k):
+            best_e = -1
+            best_v = np.float32(0.0)
+            for j in range(e):
+                used = False
+                for prev in chosen:
+                    if prev == j:
+                        used = True
+                        break
+                if used:
+                    continue
+                v = np.float32(row[j])
+                if best_e < 0 or v > best_v or (v == best_v and j < best_e):
+                    best_e = j
+                    best_v = v
+            chosen.append(best_e)
+            idx[t, s] = best_e
+    return idx
+
+
+def _moe_swiglu(rows, expert):
+    gate = rows @ expert.gate.weight.T
+    up = rows @ expert.up.weight.T
+    hidden = functional.silu(gate) * up
+    return hidden @ expert.down.weight.T
+
+
+def _moe_scatter_cpu(n, d, tok, rows):
+    tok = np.asarray(tok, dtype=np.int64)
+    buf = np.zeros((int(n), int(d)), dtype=np.float32)
+    if tok.size:
+        np.add.at(buf, tok, np.asarray(rows.data, dtype=np.float32))
+    out = Tensor(buf, requires_grad=rows.requires_grad, _parents=(rows,))
+
+    def bw(g, grads):
+        if rows.requires_grad:
+            _acc(grads, rows, np.asarray(g, dtype=np.float32)[tok])
+
+    out._backward = bw
+    return out
+
+
+def _moe_take_cuda(src, idx_buf, n, e, k):
+    rt = _cuda()
+    buf = rt.moe_gather_pairs(src._gpu, idx_buf, n, e, k)
+    out = Tensor._from_gpu(buf, requires_grad=src.requires_grad, _parents=(src,))
+
+    def bw(g, grads):
+        if src.requires_grad:
+            _acc(grads, src, rt.moe_scatter_pairs(g, idx_buf, n, e, k))
+
+    out._backward = bw
+    return out
+
+
+def _moe_gather_rows_cuda(x, tok, begin, m, d):
+    rt = _cuda()
+    buf = rt.moe_gather_rows(x._gpu, tok, begin, m, d)
+    out = Tensor._from_gpu(buf, requires_grad=x.requires_grad, _parents=(x,))
+
+    def bw(g, grads):
+        if x.requires_grad:
+            _acc(grads, x, rt.moe_scatter_rows(g, tok, begin, m, int(x.shape[0]), d))
+
+    out._backward = bw
+    return out
+
+
+def _moe_scatter_rows_cuda(n, d, tok, begin, m, rows):
+    rt = _cuda()
+    buf = rt.moe_scatter_rows(rows._gpu, tok, begin, m, n, d)
+    out = Tensor._from_gpu(buf, requires_grad=rows.requires_grad, _parents=(rows,))
+
+    def bw(g, grads):
+        if rows.requires_grad:
+            _acc(grads, rows, rt.moe_gather_rows(g, tok, begin, m, d))
+
+    out._backward = bw
+    return out
+
+
+def _moe_gather_slots_cuda(w, tok, slot, begin, m, k):
+    rt = _cuda()
+    n = int(w.shape[0])
+    buf = rt.moe_gather_slots(w._gpu, tok, slot, begin, m, k)
+    out = Tensor._from_gpu(buf, requires_grad=w.requires_grad, _parents=(w,))
+
+    def bw(g, grads):
+        if w.requires_grad:
+            _acc(grads, w, rt.moe_scatter_slots(g, tok, slot, begin, m, n, k))
+
+    out._backward = bw
+    return out
+
+
+def _moe_row_scale_cuda(y, w):
+    rt = _cuda()
+    buf = rt.moe_row_scale(y._gpu, w._gpu)
+    rg = y.requires_grad or w.requires_grad
+    out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(y, w))
+
+    def bw(g, grads):
+        if y.requires_grad:
+            _acc(grads, y, rt.moe_row_scale(g, w._gpu))
+        if w.requires_grad:
+            _acc(grads, w, rt.moe_row_dot(g, y._gpu))
+
+    out._backward = bw
+    return out
+
+
+class _MoEExpert(Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.gate = Linear(d_model, d_ff, bias=False)
+        self.up = Linear(d_model, d_ff, bias=False)
+        self.down = Linear(d_ff, d_model, bias=False)
+
+
+class _ExpertList(Module):
+    """名字用 "0","1"，这样 state_dict 是 experts.0.gate.weight，不是 experts.m0。"""
+
+    def __init__(self, experts):
+        super().__init__()
+        self._n = len(experts)
+        for i, expert in enumerate(experts):
+            setattr(self, str(i), expert)
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, i):
+        i = int(i)
+        if i < 0:
+            i += self._n
+        return getattr(self, str(i))
+
+    def __iter__(self):
+        for i in range(self._n):
+            yield self[i]
+
+
+class MoE(Module):
+    """带两种门控的 MoE。专家按 token 分组，空专家不参与 GEMM。
+
+    前向（每个 token）：
+        z = x @ router.weight.T
+        S = topk(z)                         # 更大的 logit 优先，平局取更小下标
+        sigmoid:  y = Σ_{e in S} sigmoid(z_e) * Expert_e(x)
+        softmax:  p = softmax(z);  y = Σ_{e in S} p_e * Expert_e(x)
+        Expert:   h = silu(x @ gate.T) * (x @ up.T);  out = h @ down.T
+    """
+
+    def __init__(self, d_model, d_ff, n_experts, top_k=2, gate="softmax"):
+        super().__init__()
+        d_model = int(d_model)
+        d_ff = int(d_ff)
+        n_experts = int(n_experts)
+        top_k = int(top_k)
+        if d_model < 1 or d_ff < 1:
+            raise ValueError("MoE 的 d_model / d_ff 必须为正")
+        if n_experts < 1:
+            raise ValueError("MoE 至少要 1 个专家")
+        if top_k < 1 or top_k > n_experts:
+            raise ValueError("top_k=%d 必须落在 [1, %d]" % (top_k, n_experts))
+        if gate not in ("softmax", "sigmoid"):
+            raise ValueError("gate 只接受 softmax / sigmoid，收到 %r" % (gate,))
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.gate = gate
+        self.router = Linear(d_model, n_experts, bias=False)
+        self.experts = _ExpertList([
+            _MoEExpert(d_model, d_ff) for _ in range(n_experts)
+        ])
+
+    def forward(self, x):
+        if not isinstance(x, Tensor):
+            x = _as_tensor(x)
+        if x.ndim < 1:
+            raise ValueError("MoE 输入至少 1 维")
+        if int(x.shape[-1]) != self.d_model:
+            raise ValueError(
+                "MoE 最后一维 %d != d_model %d" % (int(x.shape[-1]), self.d_model))
+        dev_x = getattr(x, "device", "cpu")
+        dev_w = getattr(self.router.weight, "device", "cpu")
+        if dev_x != dev_w:
+            raise RuntimeError("MoE 参数在 %s，输入在 %s" % (dev_w, dev_x))
+        n = 1
+        for s in x.shape[:-1]:
+            n *= int(s)
+        if n > 2147483647 // self.top_k:
+            raise ValueError("MoE token 数过大")
+        flat = x.reshape((n, self.d_model))
+        y = flat * 0.0 if n == 0 else self._forward_flat(flat)
+        return y.reshape(tuple(int(s) for s in x.shape))
+
+    def _forward_flat(self, x):
+        logits = x @ self.router.weight.T
+        if getattr(x, "device", "cpu") == "cuda":
+            return self._combine_cuda(x, logits)
+        return self._combine_cpu(x, logits)
+
+    def _weights_cpu(self, logits, idx):
+        n, k = int(idx.shape[0]), int(idx.shape[1])
+        rows = np.broadcast_to(np.arange(n, dtype=np.int64)[:, None], (n, k)).copy()
+        cols = np.asarray(idx, dtype=np.int64)
+        if self.gate == "sigmoid":
+            return _sigmoid_tensor(logits[rows, cols])
+        return functional.softmax(logits, axis=-1)[rows, cols]
+
+    def _combine_cpu(self, x, logits):
+        n = int(x.shape[0])
+        d = int(x.shape[1])
+        idx = _moe_topk_idx(logits.data, self.top_k)
+        w = self._weights_cpu(logits, idx)
+        acc = None
+        for e, expert in enumerate(self.experts):
+            tok = []
+            slot = []
+            for t in range(n):
+                row = idx[t]
+                for s in range(self.top_k):
+                    if int(row[s]) == e:
+                        tok.append(t)
+                        slot.append(s)
+            if not tok:
+                continue
+            tok_a = np.asarray(tok, dtype=np.int64)
+            slot_a = np.asarray(slot, dtype=np.int64)
+            y = _moe_swiglu(x[tok_a], expert)
+            y = y * w[tok_a, slot_a].reshape((-1, 1))
+            part = _moe_scatter_cpu(n, d, tok_a, y)
+            acc = part if acc is None else acc + part
+        if acc is None:
+            return x * 0.0
+        return acc
+
+    def _combine_cuda(self, x, logits):
+        rt = _cuda()
+        n = int(x.shape[0])
+        d = int(x.shape[1])
+        k = self.top_k
+        n_exp = self.n_experts
+        idx_buf, val_buf = rt.moe_topk(logits._gpu, k)
+        if self.gate == "sigmoid":
+            sel = Tensor._from_gpu(
+                val_buf, requires_grad=logits.requires_grad, _parents=(logits,))
+
+            def bw_sel(g, grads, _idx=idx_buf, _rt=rt, _logits=logits):
+                if _logits.requires_grad:
+                    _acc(grads, _logits, _rt.moe_scatter_pairs(g, _idx, n, n_exp, k))
+
+            sel._backward = bw_sel
+            w = _sigmoid_tensor(sel)
+        else:
+            w = _moe_take_cuda(functional.softmax(logits, axis=-1), idx_buf, n, n_exp, k)
+        off_buf, tok_buf, slot_buf = rt.moe_compact(idx_buf, n, n_exp, k)
+        # 只有 E+1 个计数回到主机，用来跳过空专家。激活留在设备上。
+        off = np.asarray(rt.d2h(off_buf), dtype=np.int32).reshape(-1)
+        acc = None
+        for e, expert in enumerate(self.experts):
+            begin = int(off[e])
+            count = int(off[e + 1]) - begin
+            if count <= 0:
+                continue
+            rows = _moe_gather_rows_cuda(x, tok_buf, begin, count, d)
+            y = _moe_swiglu(rows, expert)
+            ww = _moe_gather_slots_cuda(w, tok_buf, slot_buf, begin, count, k)
+            y = _moe_row_scale_cuda(y, ww)
+            part = _moe_scatter_rows_cuda(n, d, tok_buf, begin, count, y)
+            acc = part if acc is None else acc + part
+        if acc is None:
+            return x * 0.0
+        return acc
+
+
 # ─────────────────────────── optim ───────────────────────────
 class _Optim:
     def __init__(self, params, lr=1e-3):
@@ -2412,6 +2758,7 @@ class _OptimModule:
 class _NNModule:
     Module = Module
     CausalSelfAttention = CausalSelfAttention
+    MoE = MoE
     Parameter = Parameter
     Linear = Linear
     Embedding = Embedding

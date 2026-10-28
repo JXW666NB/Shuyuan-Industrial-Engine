@@ -169,3 +169,38 @@ AdamW（纯逐元素、无矩阵乘）能到 9e-08，正好印证这个解释。
 - **方案 B**：继续追 < 1e-7（需要让 numpy 侧也用 GPU 的累加顺序，或两边都改 float64 —— 等于改算法）。
 
 > 这条我**没有**擅自放宽：判据是目标里写的，改成 1e-6 需要你确认。
+
+---
+
+## MoE 模块（nn.MoE）✅ —— 为 V2.7 架构铺路
+
+**动机**：V2.7 是 E=8 top-2 的 MoE，而 `tgai_go.train` 原先只有 Dense FFN，无法表达真 V2.7 结构。
+
+**实现**：`nn.MoE(d_model, d_ff, n_experts, top_k, gate)`，参数命名与 .TG 对齐
+（`router.weight [E,d]`、`experts.{e}.{gate,up,down}.weight`）。
+`gate="softmax"` 对全部 E 个 logits 做 softmax 再取 top-k；`gate="sigmoid"` 为 `sigmoid(logit)`，
+`top_k=1` 时与已验收的 `training/kernels/tgai_moeblk.cu` 语义一致（argmax，平局取小索引）。
+
+**实测（48GB 4090，我独立复跑 `training/harness/moe_selfcheck.py`）**：
+
+| 用例 | CPU vs CUDA | 说明 |
+|---|---|---|
+| `sigmoid-k1-tie-empty` | **1.370e-07** | 含空专家 `[1,2]`；未选中专家 router 梯度 **0.000e+00** |
+| `softmax-k2-3d-empty` | **1.331e-07** | 3D 输入 |
+| `sigmoid-k2-random` | **1.393e-07** | 未选中专家 router 梯度 **0.000e+00** |
+| `softmax-k1-single` | **1.716e-07** | 3 个空专家 `[1,2,3]` |
+| `tie->smaller` | **6.193e-08** | 精确平局取小索引（与解析参考比） |
+| 有限差分 vs 解析 | PASS | dW / dx 均吻合到 1e-6 |
+
+**VERDICT ok=True**（判据 < 1e-5）。
+
+> **判分台自身修了两处**（记录在案，避免再犯）：
+> 1. `grad` 在 CPU 后端是 ndarray，脚本却无条件 `.to_numpy()` → 崩。
+> 2. 原 `tie` 测试用「把 router 某行设成 -20」来"强制"专家胜出 —— 那是**权重行**不是 bias，
+>    logit = x·(-20) 对随机 x 接近 0，根本压不住，导致假失败。
+>    改成「两行权重完全相同 + 第三行取负 + x 首维固定」后 PASS。
+>    **判分台先自证这条纪律，又一次保护了实现方。**
+
+**回归**：一致性 CPU/CUDA 均 11/11；四 selftest 全 0；单步性能未退化（0.15 s，13728 tokens/s）。
+
+**仍未覆盖**：MoE 在 V2.7 规模（E=8/ff=4096/seq=8192）的端到端训练与吞吐 —— 下一轮做。
