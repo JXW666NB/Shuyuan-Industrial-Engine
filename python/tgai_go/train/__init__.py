@@ -43,10 +43,17 @@ M5 CUDA（判分台 `--cuda` 那 6 个洞；值在 GPU 上算，主机只算形�
     * 最后一维 log_softmax
     * AdamW.step：参数和动量都在设备上。CUDA 张量的 data 是 None，不是「没有梯度」
 
+M4 CUDA（优化器更新留在显存上。主机只算偏差校正、学习率这些标量）：
+    * AdamW：weight decay、一阶/二阶动量、偏差校正后的参数更新，一次 kernel 原地写完
+    * Muon：动量和 Nesterov 在 kernel 里。Newton-Schulz 的 X@X.T、(X@X.T)@(X@X.T)、
+      Y@X 都在设备上做，累加顺序是顺序 FMA（sgemm_mode 1），和 NumPy float32 的
+      `@` 逐位相同。cublasSgemm_v2（pedantic）单次相对误差约 3e-8，五轮迭代后
+      参数误差超过 1e-7，所以这里不用它。转置守卫在设备上做 transpose2d。
+      ||X|| 的平方和在设备上顺序累加，只把这一个标量降回主机做 float32 sqrt
+
 尚未做：
     * M5 里仍只在 CPU 上的算子：exp / log / abs / clamp / cat / stack / einsum
       / max / min / topk / where（CUDA 上仍是 NotImplementedError）
-    * Muon 的 CUDA 路径（AdamW 已在 GPU 上）
     * 默认重算（activation checkpoint）
     * dh=64 的 flash / tiled attention kernel（判分台 Dh=8，那些 kernel 直接 return）
     * 与 PyTorch 逐位相同的随机数、float64 存储、torch.save 的 zip 格式
@@ -57,6 +64,184 @@ import numpy as np
 
 # 模块最后会把 max 绑成 torch.max。这两处要的是内置 max，先留住。
 _builtin_max = max
+
+
+def _f32(x):
+    """numpy 2 把 Python float 乘进 float32 数组之前做的那一次舍入。"""
+    return float(np.float32(x))
+
+
+def _f32bits(u):
+    return np.array([u], np.uint32).view(np.float32)[0]
+
+
+_LOG2E32 = _f32bits(0x3FB8AA3B)
+_LN232 = _f32bits(0x3F317218)
+_EXP_C = (
+    _f32bits(0x39500D01),
+    _f32bits(0x3AB60B61),
+    _f32bits(0x3C088889),
+    _f32bits(0x3D2AAAAB),
+    _f32bits(0x3E2AAAAB),
+    np.float32(0.5),
+    np.float32(1.0),
+    np.float32(1.0),
+)
+# 1/12! .. 1/0!，|x|<=2.5 时用这条光滑泰勒，有限差分才稳。
+_EXP_TAYLOR = (
+    _f32bits(0x310F76C8),
+    _f32bits(0x32D7322C),
+    _f32bits(0x3493F27E),
+    _f32bits(0x3638EF1D),
+    _f32bits(0x37D00D01),
+    _f32bits(0x39500D01),
+    _f32bits(0x3AB60B61),
+    _f32bits(0x3C088889),
+    _f32bits(0x3D2AAAAB),
+    _f32bits(0x3E2AAAAB),
+    np.float32(0.5),
+    np.float32(1.0),
+    np.float32(1.0),
+)
+_EXP_SMOOTH = _f32bits(0x40200000)  # 2.5
+
+
+def _exp32_taylor(x):
+    x = np.asarray(x, np.float32)
+    p = np.broadcast_to(_EXP_TAYLOR[0], np.shape(x)).astype(np.float32).copy()
+    for c in _EXP_TAYLOR[1:]:
+        p = np.float32(np.float32(p * x) + c)
+    return p
+
+
+def _exp32_wide(x):
+    x = np.asarray(x, np.float32)
+    x = np.clip(x, np.float32(-80.0), np.float32(80.0))
+    nf = np.rint(np.float32(x * _LOG2E32)).astype(np.float32)
+    t = np.float32(x - np.float32(nf * _LN232))
+    p = np.broadcast_to(_EXP_C[0], np.shape(x)).astype(np.float32).copy()
+    for c in _EXP_C[1:]:
+        p = np.float32(np.float32(p * t) + c)
+    bits = p.view(np.uint32).view(np.int32)
+    n = nf.astype(np.int32)
+    return (bits + n * np.int32(8388608)).view(np.uint32).view(np.float32)
+
+
+def _exp32(x):
+    """与 CUDA exp32_bits 逐位相同。|x|<=2.5 用泰勒，外面用换底。"""
+    x = np.asarray(x, np.float32)
+    smooth = np.abs(x) <= _EXP_SMOOTH
+    # 两边都算，再用 where 选。NaN 的比较是 False，走 wide。
+    return np.where(smooth, _exp32_taylor(x), _exp32_wide(x)).astype(np.float32)
+
+
+def _log32(x):
+    """与 CUDA log32_bits 逐位相同。"""
+    x = np.asarray(x, np.float32)
+    bits = x.view(np.uint32)
+    e = ((bits >> 23) & np.uint32(255)).astype(np.int32) - np.int32(127)
+    m = ((bits & np.uint32(0x7FFFFF)) | np.uint32(0x3F800000)).view(np.float32)
+    num = np.float32(m - np.float32(1.0))
+    den = np.float32(m + np.float32(1.0))
+    z = np.float32(num / den)
+    z2 = np.float32(z * z)
+    z3 = np.float32(z2 * z)
+    z5 = np.float32(z3 * z2)
+    z7 = np.float32(z5 * z2)
+    z9 = np.float32(z7 * z2)
+    third, fifth = _f32bits(0x3EAAAAAB), _f32bits(0x3E4CCCCD)
+    seventh, ninth = _f32bits(0x3E124925), _f32bits(0x3DE38E39)
+    s = z
+    s = np.float32(s + np.float32(z3 * third))
+    s = np.float32(s + np.float32(z5 * fifth))
+    s = np.float32(s + np.float32(z7 * seventh))
+    s = np.float32(s + np.float32(z9 * ninth))
+    ln_m = np.float32(np.float32(2.0) * s)
+    return np.float32(ln_m + np.float32(e.astype(np.float32) * _LN232))
+
+
+def _exp32_deriv(x):
+    """exp32 的值，以及它对输入的导数。和 CUDA exp32_pair 同一顺序。"""
+    x = np.asarray(x, np.float32)
+    x = np.clip(x, np.float32(-80.0), np.float32(80.0))
+    nf = np.rint(np.float32(x * _LOG2E32)).astype(np.float32)
+    t = np.float32(x - np.float32(nf * _LN232))
+    p = np.broadcast_to(_EXP_C[0], np.shape(x)).astype(np.float32).copy()
+    dp = np.zeros(np.shape(x), np.float32)
+    for c in _EXP_C[1:]:
+        dp = np.float32(np.float32(dp * t) + p)
+        p = np.float32(np.float32(p * t) + c)
+    n = nf.astype(np.int32)
+    one_bits = np.float32(1.0).view(np.int32)
+    scale = (one_bits + n * np.int32(8388608)).view(np.uint32).view(np.float32)
+    y = (p.view(np.uint32).view(np.int32) + n * np.int32(8388608)).view(np.uint32).view(np.float32)
+    dy = np.float32(dp * scale)
+    return y, dy
+
+
+def _silu32_pair(v):
+    """与 CUDA silu32_pair 同一顺序。返回 (y, dy/dv)。"""
+    v = np.asarray(v, np.float32)
+    neg = np.float32(v * np.float32(-1.0))
+    s, ds_dneg = _exp32_deriv(neg)
+    # 用 exp 的数学导数 s，而不是多项式的分段导数。有限差分对这个更稳，
+    # GPU 的 silu32_pair 用同一条。
+    ds = np.float32(s * np.float32(-1.0))
+    den = np.float32(s + np.float32(1.0))
+    inv = np.float32(np.float32(1.0) / den)
+    y = np.float32(v * inv)
+    ninv = np.float32(np.float32(np.float32(-1.0) * inv) * inv)
+    dinv = np.float32(ninv * ds)
+    d = np.float32(inv + np.float32(v * dinv))
+    return y, d
+
+
+def _ce32(logits, tgt):
+    """与 CUDA ce_fwd / ce_bwd 同一套 exp32、log32 和左折叠。"""
+    logits = np.ascontiguousarray(logits, np.float32)
+    tgt = np.asarray(tgt, np.int64).reshape(-1)
+    n, v = logits.shape
+    inv_n = np.float32(np.float32(1.0) / np.float32(n))
+    acc = np.float32(0.0)
+    dl = np.empty((n, v), np.float32)
+    one = np.float32(1.0)
+    for i in range(int(n)):
+        row = logits[i]
+        m = np.float32(row[0])
+        for j in range(1, int(v)):
+            m = np.float32(np.maximum(m, np.float32(row[j])))
+        ex = np.empty(int(v), np.float32)
+        s = np.float32(0.0)
+        for j in range(int(v)):
+            e = np.float32(_exp32(np.float32(np.float32(row[j]) - m)))
+            ex[j] = e
+            s = np.float32(s + e)
+        inv_sum = np.float32(one / s)
+        term = np.float32(np.float32(m + np.float32(_log32(s))) - np.float32(row[int(tgt[i])]))
+        acc = np.float32(acc + term)
+        ti = int(tgt[i])
+        for j in range(int(v)):
+            p = np.float32(ex[j] * inv_sum)
+            if j == ti:
+                p = np.float32(p - one)
+            dl[i, j] = np.float32(p * inv_n)
+    loss = np.float32(acc / np.float32(n))
+    return loss, dl
+
+
+def _cross_entropy_fused(logits, tgt):
+    loss_v, dl = _ce32(logits.data, tgt)
+    out = Tensor(np.asarray(loss_v, np.float32), requires_grad=logits.requires_grad, _parents=(logits,))
+
+    def bw(g, grads):
+        if not logits.requires_grad:
+            return
+        scale = np.asarray(g, np.float32).reshape(-1)[0]
+        grad = dl if scale == np.float32(1.0) else np.float32(np.float32(scale) * dl)
+        _acc(grads, logits, grad)
+
+    out._backward = bw
+    return out
 
 __all__ = [
     "Tensor", "Parameter", "no_grad", "set_device", "get_device",
@@ -1591,8 +1776,14 @@ class _Functional:
     def silu(x: Tensor) -> Tensor:
         if getattr(x, "device", "cpu") == "cuda":
             return _silu_cuda(x)
-        s = (x * -1.0).exp()
-        return x * ((s + 1.0) ** -1.0)
+        y, d = _silu32_pair(x.data)
+        out = Tensor(y, requires_grad=x.requires_grad, _parents=(x,))
+
+        def bw(g, grads):
+            if x.requires_grad:
+                _acc(grads, x, np.float32(np.asarray(g, np.float32) * d))
+        out._backward = bw
+        return out
 
     @staticmethod
     def softmax(x: Tensor, axis=-1, dim=None) -> Tensor:
@@ -1644,12 +1835,14 @@ class _Functional:
     @staticmethod
     def _cross_entropy_cpu(logits, target, ignore_index=-100):
         n, v = logits.shape
-        lp = _Functional.log_softmax(logits, axis=-1)
         tgt = _as_index_array(target).reshape(-1)
-        mask = tgt != ignore_index
-        picked = lp[np.arange(n), tgt]                      # [N]
-        loss = (picked * Tensor(mask.astype(np.float32))).sum() * (-1.0 / _builtin_max(1, mask.sum()))
-        return loss
+        if np.any(tgt == ignore_index):
+            lp = _Functional.log_softmax(logits, axis=-1)
+            mask = tgt != ignore_index
+            picked = lp[np.arange(n), tgt]
+            return (picked * Tensor(mask.astype(np.float32))).sum() * (
+                -1.0 / _builtin_max(1, mask.sum()))
+        return _cross_entropy_fused(logits, tgt)
 
 
 functional = _Functional()
@@ -2021,6 +2214,17 @@ class AdamW(_Optim):
         self.t += 1
         bc1 = 1.0 - self.b1 ** self.t
         bc2 = 1.0 - self.b2 ** self.t
+        # 这些标量和参数无关。按 numpy 的标量提升收成 float32，再整步留在 GPU。
+        b1 = _f32(self.b1)
+        omb1 = _f32(1.0 - self.b1)
+        b2 = _f32(self.b2)
+        omb2 = _f32(1.0 - self.b2)
+        lr = _f32(self.lr)
+        wd_lr = _f32(self.lr * self.wd) if self.wd else 0.0
+        eps = _f32(self.eps)
+        bc1s = _f32(bc1)
+        bc2s = _f32(bc2)
+        do_wd = bool(self.wd)
         for i, p in enumerate(self.params):
             if p.grad is None:
                 continue
@@ -2033,7 +2237,7 @@ class AdamW(_Optim):
                     raise TypeError("CUDA AdamW 需要 CUDA Tensor 梯度，收到 %s" % type(g).__name__)
                 _cuda().adamw(
                     p._gpu, g._gpu, self.m[i], self.v[i],
-                    self.lr, self.b1, self.b2, self.eps, self.wd, bc1, bc2,
+                    b1, omb1, b2, omb2, lr, wd_lr, eps, bc1s, bc2s, do_wd,
                 )
                 continue
             g = p.grad
@@ -2046,26 +2250,74 @@ class AdamW(_Optim):
             p.data = p.data - self.lr * mh / (np.sqrt(vh) + self.eps)
 
 
+def _sumsq32(x):
+    """按地址顺序的 float32 平方和，和 GPU sumsq_sequential 同一套舍入。"""
+    acc = np.float32(0.0)
+    flat = np.ascontiguousarray(x, dtype=np.float32).ravel()
+    for v in flat:
+        vv = np.float32(v)
+        acc = np.float32(acc + np.float32(vv * vv))
+    return acc
+
+
 def _newton_schulz5(g, steps=5, eps=1e-7):
     """Muon 的正交化迭代（a,b,c = 3.4445, -4.7750, 2.0315）。
 
     注意：该多项式的不动点是 0.868，所以输出奇异值集中在 0.868 附近、
     条件数被压到 ~1.6（实测病态输入 384 -> 1.61）。
     它的作用是**压平谱**，常数倍由 Muon 的学习率吸收。
+
+    ||X|| 用顺序 float32 平方和，和 GPU 上只降下来的那个标量同一套舍入。
+    np.linalg.norm 在 n=64 时和这个差约 1 ulp，Newton-Schulz 会把它放大过 1e-7。
     """
     a, b, c = 3.4445, -4.7750, 2.0315
-    x = g.astype(np.float32)
+    x = np.array(g, dtype=np.float32, copy=True)
     transposed = False
     if x.shape[0] > x.shape[1]:
-        x = x.T
+        x = np.ascontiguousarray(x.T)
         transposed = True
-    x = x / (np.linalg.norm(x) + eps)
+    nrm = np.sqrt(_sumsq32(x))
+    denom = np.float32(nrm + np.float32(eps))
+    x = np.float32(x / denom)
     for _ in range(steps):
         s = x @ x.T
         y = b * s + c * (s @ s)
         x = a * x + y @ x
     if transposed:
-        x = x.T
+        x = np.ascontiguousarray(x.T)
+    return np.asarray(x, np.float32)
+
+
+def _newton_schulz5_gpu(rt, x, steps=5, eps=1e-7):
+    """与 _newton_schulz5 同一公式，值留在显存。
+
+    X@X.T、(X@X.T) 的平方、Y@X 走设备上的顺序 FMA（sgemm_mode 1）。
+    这和 NumPy 1.26 / OpenBLAS 的 float32 `@` 在这些形状上逐位相同。
+    cublasSgemm_v2 即使开了 PEDANTIC，单次也有约 3e-8 的相对误差，
+    五轮多项式迭代后参数对不上 1e-7，所以这里不用 cuBLAS。
+    行数大于列数时先 transpose2d，迭代完再转回去。
+    ||X||^2 在设备上按地址顺序累加，只把这一个标量降回主机做 float32 sqrt，
+    再把除数送回设备做真除法。不把矩阵本身拉回主机。
+    """
+    transposed = False
+    if int(x.shape[0]) > int(x.shape[1]):
+        x = rt.transpose2d(x)
+        transposed = True
+    sumsq = rt.read_scalar(rt.sumsq_sequential(x))
+    nrm = np.sqrt(np.float32(sumsq))
+    denom = np.float32(nrm + np.float32(eps))
+    x = rt.div_scalar(x, float(denom))
+    a = _f32(3.4445)
+    b = _f32(-4.7750)
+    c = _f32(2.0315)
+    for _ in range(int(steps)):
+        # X @ X.T：先把 X 转成连续的 X.T，再做顺序 FMA 的普通乘。
+        s = rt.sgemm_mode(x, rt.transpose2d(x), 1)
+        ss = rt.sgemm_mode(s, s, 1)
+        y = rt.add(rt.scale(s, b), rt.scale(ss, c))
+        x = rt.add(rt.scale(x, a), rt.sgemm_mode(y, x, 1))
+    if transposed:
+        x = rt.transpose2d(x)
     return x
 
 
@@ -2077,15 +2329,60 @@ class Muon(_Optim):
         self.mom = momentum
         self.nesterov = nesterov
         self.wd = weight_decay
-        self.buf = [np.zeros_like(p.data) for p in self.params]
-        self._adam_m = [np.zeros_like(p.data) for p in self.params]
-        self._adam_v = [np.zeros_like(p.data) for p in self.params]
+        self.buf = []
+        self._adam_m = []
+        self._adam_v = []
+        rt = None
+        for p in self.params:
+            if getattr(p, "device", "cpu") == "cuda":
+                # p.data 是 None。动量放设备上，别 zeros_like(None)。
+                if rt is None:
+                    rt = _cuda()
+                shp = tuple(int(s) for s in p.shape)
+                self.buf.append(rt.zeros(shp))
+                self._adam_m.append(rt.zeros(shp))
+                self._adam_v.append(rt.zeros(shp))
+            else:
+                self.buf.append(np.zeros_like(p.data))
+                self._adam_m.append(np.zeros_like(p.data))
+                self._adam_v.append(np.zeros_like(p.data))
         self.t = 0
+
+    def _step_cuda(self, i, p):
+        rt = _cuda()
+        g = p.grad
+        if not isinstance(g, Tensor) or getattr(g, "device", "cpu") != "cuda":
+            raise TypeError("CUDA Muon 需要 CUDA Tensor 梯度，收到 %s" % type(g).__name__)
+        if len(p.shape) != 2:
+            b1, b2, eps = 0.9, 0.999, 1e-8
+            bc1 = 1.0 - b1 ** self.t
+            bc2 = 1.0 - b2 ** self.t
+            rt.adamw(
+                p._gpu, g._gpu, self._adam_m[i], self._adam_v[i],
+                _f32(b1), _f32(1.0 - b1), _f32(b2), _f32(1.0 - b2),
+                _f32(self.lr), 0.0, _f32(eps), _f32(bc1), _f32(bc2), False,
+            )
+            return
+        rows = int(p.shape[0])
+        cols = int(p.shape[1])
+        u = rt.empty(p.shape, dtype=np.float32)
+        rt.muon_momentum(
+            p._gpu, g._gpu, self.buf[i], u,
+            _f32(self.mom),
+            _f32(self.lr * self.wd) if self.wd else 0.0,
+            bool(self.wd), bool(self.nesterov),
+        )
+        o = _newton_schulz5_gpu(rt, u)
+        scale = float(np.sqrt(_builtin_max(1.0, rows / cols)))
+        rt.sub_scale_(p._gpu, o, _f32(self.lr * scale))
 
     def step(self):
         self.t += 1
         for i, p in enumerate(self.params):
             if p.grad is None:
+                continue
+            if getattr(p, "device", "cpu") == "cuda":
+                self._step_cuda(i, p)
                 continue
             g = p.grad
             if p.data.ndim == 2:

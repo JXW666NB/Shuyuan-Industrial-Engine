@@ -35,6 +35,9 @@ CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
 _CE_AND_HELPERS = r"""
 /* transplanted from training/kernels/tgai_ce.cu — keep the math identical. */
 
+__device__ float exp32_bits(float x);
+__device__ float log32_bits(float x);
+
 __device__ float ce_row_max(const float* row, int V) {
     float m = row[0];
     for (int j = 1; j < V; ++j) {
@@ -46,7 +49,8 @@ __device__ float ce_row_max(const float* row, int V) {
 __device__ float ce_row_sumexp(const float* row, int V, float m) {
     float sum = 0.0f;
     for (int j = 0; j < V; ++j) {
-        sum += expf(row[j] - m);
+        float e = exp32_bits(__fsub_rn(row[j], m));
+        sum = __fadd_rn(sum, e);
     }
     return sum;
 }
@@ -59,27 +63,27 @@ extern "C" __global__ void ce_fwd(const float* logits, const int* targets, float
         const float m = ce_row_max(row, V);
         const float sum = ce_row_sumexp(row, V, m);
         const int t = targets[i];
-        acc += (m + logf(sum)) - row[t];
+        float term = __fsub_rn(__fadd_rn(m, log32_bits(sum)), row[t]);
+        acc = __fadd_rn(acc, term);
     }
-    loss[0] = acc / static_cast<float>(N);
+    loss[0] = __fdiv_rn(acc, static_cast<float>(N));
 }
 
 extern "C" __global__ void ce_bwd(const float* logits, const int* targets, float* dlogits,
                                   int N, int V) {
-    const float inv_n = 1.0f / static_cast<float>(N);
+    const float inv_n = __fdiv_rn(1.0f, static_cast<float>(N));
     for (int i = 0; i < N; ++i) {
         const float* row = logits + static_cast<long long>(i) * V;
         float* grow = dlogits + static_cast<long long>(i) * V;
         const float m = ce_row_max(row, V);
         const float sum = ce_row_sumexp(row, V, m);
-        const float inv_sum = 1.0f / sum;
+        const float inv_sum = __fdiv_rn(1.0f, sum);
         const int t = targets[i];
         for (int j = 0; j < V; ++j) {
-            float p = expf(row[j] - m) * inv_sum;
-            if (j == t) {
-                p -= 1.0f;
-            }
-            grow[j] = p * inv_n;
+            float e = exp32_bits(__fsub_rn(row[j], m));
+            float p = __fmul_rn(e, inv_sum);
+            if (j == t) p = __fsub_rn(p, 1.0f);
+            grow[j] = __fmul_rn(p, inv_n);
         }
     }
 }
@@ -107,6 +111,118 @@ extern "C" __global__ void ewise_scale(const float* a, float s, float* c, int n)
 extern "C" __global__ void ewise_mul(const float* a, const float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) c[i] = a[i] * b[i];
+}
+
+/* 与 Python _exp32 / _log32 同一套 float32 运算。不用 expf/logf，也不用 SVML。 */
+__device__ float exp32_taylor(float x) {
+    float cs[13];
+    cs[0] = __int_as_float(0x310f76c8);
+    cs[1] = __int_as_float(0x32d7322c);
+    cs[2] = __int_as_float(0x3493f27e);
+    cs[3] = __int_as_float(0x3638ef1d);
+    cs[4] = __int_as_float(0x37d00d01);
+    cs[5] = __int_as_float(0x39500d01);
+    cs[6] = __int_as_float(0x3ab60b61);
+    cs[7] = __int_as_float(0x3c088889);
+    cs[8] = __int_as_float(0x3d2aaaab);
+    cs[9] = __int_as_float(0x3e2aaaab);
+    cs[10] = 0.5f;
+    cs[11] = 1.0f;
+    cs[12] = 1.0f;
+    float p = cs[0];
+    for (int i = 1; i < 13; ++i) p = __fadd_rn(__fmul_rn(p, x), cs[i]);
+    return p;
+}
+
+__device__ void exp32_pair(float x, float* y_out, float* dy_out) {
+    if (!(x == x)) {
+        *y_out = x;
+        *dy_out = x;
+        return;
+    }
+    if (fabsf(x) <= __int_as_float(0x40200000)) {
+        *y_out = exp32_taylor(x);
+        *dy_out = *y_out;
+        return;
+    }
+    if (x > 80.0f) x = 80.0f;
+    if (x < -80.0f) x = -80.0f;
+    float log2e = __int_as_float(0x3fb8aa3b);
+    float ln2 = __int_as_float(0x3f317218);
+    float nf = rintf(__fmul_rn(x, log2e));
+    float t = __fsub_rn(x, __fmul_rn(nf, ln2));
+    float cs[8];
+    cs[0] = __int_as_float(0x39500d01);
+    cs[1] = __int_as_float(0x3ab60b61);
+    cs[2] = __int_as_float(0x3c088889);
+    cs[3] = __int_as_float(0x3d2aaaab);
+    cs[4] = __int_as_float(0x3e2aaaab);
+    cs[5] = 0.5f;
+    cs[6] = 1.0f;
+    cs[7] = 1.0f;
+    float p = cs[0];
+    float dp = 0.0f;
+    for (int i = 1; i < 8; ++i) {
+        dp = __fadd_rn(__fmul_rn(dp, t), p);
+        p = __fadd_rn(__fmul_rn(p, t), cs[i]);
+    }
+    int n = (int)nf;
+    int one_bits = __float_as_int(1.0f);
+    float scale = __int_as_float(one_bits + n * 8388608);
+    *y_out = __int_as_float(__float_as_int(p) + n * 8388608);
+    *dy_out = __fmul_rn(dp, scale);
+}
+
+__device__ float exp32_bits(float x) {
+    float y, dy;
+    exp32_pair(x, &y, &dy);
+    return y;
+}
+
+__device__ float log32_bits(float x) {
+    unsigned ub = __float_as_uint(x);
+    int e = (int)((ub >> 23) & 255u) - 127;
+    float m = __uint_as_float((ub & 0x7fffffu) | 0x3f800000u);
+    float num = __fsub_rn(m, 1.0f);
+    float den = __fadd_rn(m, 1.0f);
+    float z = __fdiv_rn(num, den);
+    float z2 = __fmul_rn(z, z);
+    float z3 = __fmul_rn(z2, z);
+    float z5 = __fmul_rn(z3, z2);
+    float z7 = __fmul_rn(z5, z2);
+    float z9 = __fmul_rn(z7, z2);
+    float s = z;
+    s = __fadd_rn(s, __fmul_rn(z3, __int_as_float(0x3eaaaaab)));
+    s = __fadd_rn(s, __fmul_rn(z5, __int_as_float(0x3e4ccccd)));
+    s = __fadd_rn(s, __fmul_rn(z7, __int_as_float(0x3e124925)));
+    s = __fadd_rn(s, __fmul_rn(z9, __int_as_float(0x3de38e39)));
+    float ln_m = __fmul_rn(2.0f, s);
+    return __fadd_rn(ln_m, __fmul_rn((float)e, __int_as_float(0x3f317218)));
+}
+
+extern "C" __global__ void ewise_exp32(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = exp32_bits(a[i]);
+}
+
+extern "C" __global__ void ewise_log32(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = log32_bits(a[i]);
+}
+
+extern "C" __global__ void ewise_exp(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = expf(a[i]);
+}
+
+extern "C" __global__ void ewise_log(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = logf(a[i]);
+}
+
+extern "C" __global__ void ewise_recip(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = __fdiv_rn(1.f, a[i]);
 }
 
 /* One block, 256 threads. The launch site must use that block size. */
@@ -157,15 +273,28 @@ extern "C" __global__ void rmsnorm_fwd(float* out, const float* x, const float* 
     }
 }
 
-__device__ __forceinline__ float silu_f(float v) {
-    if (v >= 0.f) return v / (1.f + expf(-v));
-    float e = expf(v);
-    return v * (e / (1.f + e));
+__device__ __forceinline__ void silu32_pair(float v, float* y_out, float* d_out) {
+    float neg = __fmul_rn(v, -1.0f);
+    float s, ds_dneg;
+    exp32_pair(neg, &s, &ds_dneg);
+    (void)ds_dneg;
+    float ds = __fmul_rn(s, -1.0f);
+    float den = __fadd_rn(s, 1.0f);
+    float inv = __fdiv_rn(1.0f, den);
+    float y = __fmul_rn(v, inv);
+    float ninv = __fmul_rn(__fmul_rn(-1.0f, inv), inv);
+    float dinv = __fmul_rn(ninv, ds);
+    *y_out = y;
+    *d_out = __fadd_rn(inv, __fmul_rn(v, dinv));
 }
 
 extern "C" __global__ void silu_mul_fwd(float* a, const float* b, int n) {
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (i < n) a[i] = silu_f(a[i]) * b[i];
+    if (i < n) {
+        float y, d;
+        silu32_pair(a[i], &y, &d);
+        a[i] = __fmul_rn(y, b[i]);
+    }
 }
 
 extern "C" __global__ void emb_gather_fwd(float* out, const float* emb, const int* ids,
@@ -234,12 +363,11 @@ extern "C" __global__ void silu_mul_bwd(const float* g, const float* a, const fl
     if (i >= n)
         return;
     const float av = a[i];
-    const float sig = 1.f / (1.f + expf(-av));
-    const float silu = av * sig;
-    const float dsilu = sig * (1.f + av * (1.f - sig));
+    float y, dsilu;
+    silu32_pair(av, &y, &dsilu);
     const float gv = g[i];
-    da[i] = gv * b[i] * dsilu;
-    db[i] = gv * silu;
+    da[i] = __fmul_rn(__fmul_rn(gv, b[i]), dsilu);
+    db[i] = __fmul_rn(gv, y);
 }
 
 extern "C" __global__ void emb_gather_bwd(const float* g, const int* ids, float* demb,
@@ -417,20 +545,269 @@ extern "C" __global__ void log_softmax_lastdim_bwd(const float* g, const float* 
     for (int j = 0; j < k; ++j) drow[j] = grow[j] - expf(yrow[j]) * sg;
 }
 
-/* 与 CPU AdamW.step 同一顺序：先 decoupled weight decay，再一阶/二阶动量。原地写 p/m/v。 */
+/* 与 CPU AdamW.step 同一顺序，且每步都是 IEEE 舍入（禁止 FMA 收缩）。
+   标量由主机按 numpy 2 的规则先收成 float32：例如 omb1 = float32(1 - b1)，
+   不是 float32(1) - float32(b1)。wd_lr = float32(lr * wd)。原地写 p/m/v。 */
 extern "C" __global__ void adamw_update(
     float* p, const float* g, float* m, float* v, int n,
-    float b1, float b2, float lr, float eps, float wd, float bc1, float bc2) {
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2, int do_wd) {
     int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
     if (i >= n) return;
     float gi = g[i];
     float pi = p[i];
-    if (wd != 0.f) pi = pi - lr * wd * pi;
-    float mi = b1 * m[i] + (1.f - b1) * gi;
-    float vi = b2 * v[i] + (1.f - b2) * gi * gi;
+    if (do_wd) pi = __fsub_rn(pi, __fmul_rn(wd_lr, pi));
+    float mi = __fadd_rn(__fmul_rn(b1, m[i]), __fmul_rn(omb1, gi));
+    float g2 = __fmul_rn(gi, gi);
+    float vi = __fadd_rn(__fmul_rn(b2, v[i]), __fmul_rn(omb2, g2));
     m[i] = mi;
     v[i] = vi;
-    p[i] = pi - lr * (mi / bc1) / (sqrtf(vi / bc2) + eps);
+    float mh = __fdiv_rn(mi, bc1);
+    float vh = __fdiv_rn(vi, bc2);
+    float denom = __fadd_rn(sqrtf(vh), eps);
+    float step = __fdiv_rn(__fmul_rn(lr, mh), denom);
+    p[i] = __fsub_rn(pi, step);
+}
+
+/* Muon 的动量。先 decoupled weight decay，再 buf = mom*buf + g，
+   Nesterov 时 u = g + mom*buf（用刚写完的 buf）。 */
+extern "C" __global__ void muon_momentum(
+    float* p, const float* g, float* buf, float* u, int n,
+    float mom, float wd_lr, int do_wd, int nesterov) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    if (do_wd) p[i] = __fsub_rn(p[i], __fmul_rn(wd_lr, p[i]));
+    float b = __fadd_rn(__fmul_rn(mom, buf[i]), g[i]);
+    buf[i] = b;
+    if (nesterov) u[i] = __fadd_rn(g[i], __fmul_rn(mom, b));
+    else u[i] = b;
+}
+
+extern "C" __global__ void ewise_div_scalar(const float* a, float s, float* c, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) c[i] = __fdiv_rn(a[i], s);
+}
+
+extern "C" __global__ void ewise_sub_scale(float* p, const float* o, float scale, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) p[i] = __fsub_rn(p[i], __fmul_rn(scale, o[i]));
+}
+
+/* 行优先 C = A@B，多种 K 维累加顺序。用来对齐 numpy 的 matmul，mode 选定后训练走那一种。 */
+extern "C" __global__ void sgemm_mode(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, int mode) {
+    int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    int total = M * N;
+    if (idx >= total || M <= 0 || N <= 0) return;
+    int i = idx / N;
+    int j = idx - i * N;
+    const float* a = A + (long long)i * K;
+    float acc = 0.f;
+    if (K <= 0) {
+        C[idx] = 0.f;
+        return;
+    }
+    if (mode == 0) {
+        for (int k = 0; k < K; ++k)
+            acc = __fadd_rn(acc, __fmul_rn(a[k], B[(long long)k * N + j]));
+    } else if (mode == 1) {
+        for (int k = 0; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 2) {
+        for (int k = K - 1; k >= 0; --k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 3) {
+        float p[32];
+        int n = K;
+        if (n > 32) n = 32;
+        for (int k = 0; k < n; ++k)
+            p[k] = __fmul_rn(a[k], B[(long long)k * N + j]);
+        int len = n;
+        while (len > 1) {
+            int m = len >> 1;
+            for (int t = 0; t < m; ++t)
+                p[t] = __fadd_rn(p[2 * t], p[2 * t + 1]);
+            if (len & 1) {
+                p[m] = p[len - 1];
+                m += 1;
+            }
+            len = m;
+        }
+        acc = p[0];
+        for (int k = n; k < K; ++k)
+            acc = __fadd_rn(acc, __fmul_rn(a[k], B[(long long)k * N + j]));
+    } else if (mode == 4) {
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int k = 0;
+        for (; k + 4 <= K; k += 4) {
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+            a2 = __fmaf_rn(a[k + 2], B[(long long)(k + 2) * N + j], a2);
+            a3 = __fmaf_rn(a[k + 3], B[(long long)(k + 3) * N + j], a3);
+        }
+        acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 5) {
+        int k = 0;
+        for (; k + 4 <= K; k += 4) {
+            float s = 0.f;
+            s = __fmaf_rn(a[k], B[(long long)k * N + j], s);
+            s = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], s);
+            s = __fmaf_rn(a[k + 2], B[(long long)(k + 2) * N + j], s);
+            s = __fmaf_rn(a[k + 3], B[(long long)(k + 3) * N + j], s);
+            acc = __fadd_rn(acc, s);
+        }
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 6) {
+        float a0 = 0.f, a1 = 0.f;
+        int k = 0;
+        for (; k + 2 <= K; k += 2) {
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+        }
+        acc = __fadd_rn(a0, a1);
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 7) {
+        for (int k = 0; k < K; ++k)
+            acc = __fadd_rn(acc, __fmul_rn(B[(long long)k * N + j], a[k]));
+    } else if (mode == 8) {
+        /* 每 8 个 K 做一对累加器，再加进 acc；尾巴继续一对累加器。 */
+        int k = 0;
+        for (; k + 8 <= K; k += 8) {
+            float a0 = 0.f, a1 = 0.f;
+            for (int t = 0; t < 8; t += 2) {
+                a0 = __fmaf_rn(a[k + t], B[(long long)(k + t) * N + j], a0);
+                a1 = __fmaf_rn(a[k + t + 1], B[(long long)(k + t + 1) * N + j], a1);
+            }
+            acc = __fadd_rn(acc, __fadd_rn(a0, a1));
+        }
+        float b0 = 0.f, b1 = 0.f;
+        int t = k;
+        for (; t + 1 < K; t += 2) {
+            b0 = __fmaf_rn(a[t], B[(long long)t * N + j], b0);
+            b1 = __fmaf_rn(a[t + 1], B[(long long)(t + 1) * N + j], b1);
+        }
+        acc = __fadd_rn(acc, __fadd_rn(b0, b1));
+        if (t < K) acc = __fmaf_rn(a[t], B[(long long)t * N + j], acc);
+    } else if (mode == 9) {
+        /* 前 8 个一对累加器，剩下的顺序 fma 加在和上。 */
+        int n8 = K < 8 ? K : 8;
+        if (n8 & 1) n8 -= 1;
+        float a0 = 0.f, a1 = 0.f;
+        int k = 0;
+        for (; k < n8; k += 2) {
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+        }
+        acc = __fadd_rn(a0, a1);
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 10) {
+        /* 4 路交错累加器，最后 (a0+a1)+(a2+a3)。 */
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int k = 0;
+        for (; k + 3 < K; k += 4) {
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+            a2 = __fmaf_rn(a[k + 2], B[(long long)(k + 2) * N + j], a2);
+            a3 = __fmaf_rn(a[k + 3], B[(long long)(k + 3) * N + j], a3);
+        }
+        acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 11) {
+        /* 前 8 个 4 路累加器，剩下顺序 fma。 */
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int n = K < 8 ? K : 8;
+        int k = 0;
+        for (; k + 3 < n; k += 4) {
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+            a2 = __fmaf_rn(a[k + 2], B[(long long)(k + 2) * N + j], a2);
+            a3 = __fmaf_rn(a[k + 3], B[(long long)(k + 3) * N + j], a3);
+        }
+        acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else {
+        /* mode 12：整段 2 路，但 a0+a1 的加法换成 fma 形式的顺序尾巴从 0 开始分块 4。 */
+        int k = 0;
+        for (; k + 4 <= K; k += 4) {
+            float a0 = 0.f, a1 = 0.f;
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+            a0 = __fmaf_rn(a[k + 2], B[(long long)(k + 2) * N + j], a0);
+            a1 = __fmaf_rn(a[k + 3], B[(long long)(k + 3) * N + j], a1);
+            acc = __fadd_rn(acc, __fadd_rn(a0, a1));
+        }
+        float b0 = 0.f, b1 = 0.f;
+        int t = k;
+        for (; t + 1 < K; t += 2) {
+            b0 = __fmaf_rn(a[t], B[(long long)t * N + j], b0);
+            b1 = __fmaf_rn(a[t + 1], B[(long long)(t + 1) * N + j], b1);
+        }
+        acc = __fadd_rn(acc, __fadd_rn(b0, b1));
+        if (t < K) acc = __fmaf_rn(a[t], B[(long long)t * N + j], acc);
+    }
+    C[idx] = acc;
+}
+
+/* K 维按给定切块累加。kind=1 块内顺序 fma；kind=2 块内奇偶两路 fma 再相加。块与块左加。 */
+extern "C" __global__ void sgemm_compose(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, int nchunks, int kind,
+    int c0, int c1, int c2, int c3, int c4, int c5, int c6, int c7) {
+    int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    int total = M * N;
+    if (idx >= total) return;
+    int i = idx / N;
+    int j = idx - i * N;
+    const float* a = A + (long long)i * K;
+    int chunks[8] = {c0, c1, c2, c3, c4, c5, c6, c7};
+    float acc = 0.f;
+    int k = 0;
+    int nch = nchunks;
+    if (nch > 8) nch = 8;
+    for (int c = 0; c < nch; ++c) {
+        int len = chunks[c];
+        if (len <= 0) break;
+        float part;
+        if (kind == 2) {
+            float a0 = 0.f, a1 = 0.f;
+            int t = 0;
+            for (; t + 1 < len; t += 2) {
+                a0 = __fmaf_rn(a[k + t], B[(long long)(k + t) * N + j], a0);
+                a1 = __fmaf_rn(a[k + t + 1], B[(long long)(k + t + 1) * N + j], a1);
+            }
+            part = __fadd_rn(a0, a1);
+            if (t < len)
+                part = __fmaf_rn(a[k + t], B[(long long)(k + t) * N + j], part);
+        } else {
+            part = 0.f;
+            for (int t = 0; t < len; ++t)
+                part = __fmaf_rn(a[k + t], B[(long long)(k + t) * N + j], part);
+        }
+        acc = __fadd_rn(acc, part);
+        k += len;
+    }
+    for (; k < K; ++k)
+        acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    C[idx] = acc;
+}
+
+/* 顺序累加平方和，一个线程。n 很小（优化器里的矩阵）。和 np.sum(x*x) 的左折叠对齐。 */
+extern "C" __global__ void sumsq_sequential(const float* a, float* out, int n) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    float s = 0.f;
+    for (int i = 0; i < n; ++i) {
+        float v = a[i];
+        s = __fadd_rn(s, __fmul_rn(v, v));
+    }
+    out[0] = s;
 }
 """
 
@@ -1442,6 +1819,51 @@ class CudaRuntime:
             ])
         return out
 
+    def log32(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_log32", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def exp32(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_exp32", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def exp(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_exp", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def log(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_log", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def recip(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_recip", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
     def scale(self, a, scalar):
         out = self.empty(a.shape, dtype=np.float32)
         if a.n:
@@ -1469,6 +1891,56 @@ class CudaRuntime:
             int(C), int(ldc),
         ), "cublasSgemm_v2")
 
+    def sgemm_compose(self, A, B, chunks, kind):
+        M, K = int(A.shape[0]), int(A.shape[1])
+        N = int(B.shape[1])
+        ch = [int(x) for x in chunks][:8]
+        while len(ch) < 8:
+            ch.append(0)
+        C = self.empty((M, N), dtype=np.float32)
+        total = M * N
+        if total and K:
+            grid, block = self._ewise_grid(total)
+            self.launch("sgemm_compose", grid, block, [
+                self._ptr(A), self._ptr(B), self._ptr(C),
+                (M, ctypes.c_int), (N, ctypes.c_int), (K, ctypes.c_int),
+                (len([x for x in chunks if int(x) > 0]), ctypes.c_int),
+                (int(kind), ctypes.c_int),
+            ] + [(int(x), ctypes.c_int) for x in ch])
+        return C
+
+    def sgemm_mode(self, A, B, mode):
+        """对照用：同一种形状的多种累加。mode 见 sgemm_mode kernel。"""
+        if len(A.shape) != 2 or len(B.shape) != 2:
+            raise CudaError("sgemm_mode 需要 2D")
+        M, K = int(A.shape[0]), int(A.shape[1])
+        K2, N = int(B.shape[0]), int(B.shape[1])
+        if K != K2:
+            raise CudaError("sgemm_mode K 不匹配")
+        if K > 32 and int(mode) == 3:
+            raise CudaError("pairwise mode 只支持 K<=32")
+        C = self.empty((M, N), dtype=np.float32)
+        total = M * N
+        if total and K:
+            grid, block = self._ewise_grid(total)
+            self.launch("sgemm_mode", grid, block, [
+                self._ptr(A), self._ptr(B), self._ptr(C),
+                (M, ctypes.c_int), (N, ctypes.c_int), (K, ctypes.c_int),
+                (int(mode), ctypes.c_int),
+            ])
+        elif total:
+            return self.full((M, N), 0.0)
+        return C
+
+    def _numpy_exact_gemm(self, M, N, K):
+        """这些尺寸上 NumPy 1.26 / OpenBLAS 的 float32 matmul 就是顺序 FMA。
+
+        实测 K<=16、M,N<=64 时 sgemm_mode 1 与 `@` 逐位相同。
+        cublasSgemm_v2 即使 PEDANTIC 也有约 3e-8，Muon 五轮迭代后超过 1e-7。
+        更大的矩阵仍走 cuBLAS，避免朴素 kernel 拖垮以后的训练。
+        """
+        return 0 <= M <= 64 and 0 <= N <= 64 and 0 <= K <= 16
+
     def sgemm(self, A, B):
         """行优先 C[M,N] = A[M,K] @ B[K,N]。"""
         if len(A.shape) != 2 or len(B.shape) != 2:
@@ -1479,6 +1951,8 @@ class CudaRuntime:
             raise CudaError("sgemm K 不匹配: %s @ %s" % (A.shape, B.shape))
         if M == 0 or N == 0 or K == 0:
             return self.full((M, N), 0.0)
+        if self._numpy_exact_gemm(M, N, K):
+            return self.sgemm_mode(A, B, 1)
         C = self.empty((M, N), dtype=np.float32)
         # 列主序视角: C^T(N,M) = B^T(op=N, ld=N) @ A^T(op=N, ld=K)
         self._sgemm(CUDA_OP_N, CUDA_OP_N, N, M, K, B.ptr, N, A.ptr, K, C.ptr, N)
@@ -1494,6 +1968,8 @@ class CudaRuntime:
             raise CudaError("gemm_nt K 不匹配: %s @ %s^T" % (A.shape, B.shape))
         if M == 0 or N == 0 or K == 0:
             return self.full((M, N), 0.0)
+        if self._numpy_exact_gemm(M, N, K):
+            return self.sgemm_mode(A, self.transpose2d(B), 1)
         C = self.empty((M, N), dtype=np.float32)
         self._sgemm(CUDA_OP_T, CUDA_OP_N, N, M, K, B.ptr, K, A.ptr, K, C.ptr, N)
         return C
@@ -1508,6 +1984,8 @@ class CudaRuntime:
             raise CudaError("gemm_tn K 不匹配: %s^T @ %s" % (A.shape, B.shape))
         if M == 0 or N == 0 or K == 0:
             return self.full((M, N), 0.0)
+        if self._numpy_exact_gemm(M, N, K):
+            return self.sgemm_mode(self.transpose2d(A), B, 1)
         C = self.empty((M, N), dtype=np.float32)
         self._sgemm(CUDA_OP_N, CUDA_OP_T, N, M, K, B.ptr, N, A.ptr, M, C.ptr, N)
         return C
@@ -1625,8 +2103,8 @@ class CudaRuntime:
             ])
         return dw
 
-    def adamw(self, p, g, m, v, lr, b1, b2, eps, wd, bc1, bc2):
-        """原地更新参数和两份动量。bc1/bc2 是主机上算的偏差校正分母（标量）。"""
+    def adamw(self, p, g, m, v, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
+        """原地更新参数和两份动量。标量必须已经按 numpy 的 float32 规则收好。"""
         n = int(p.n)
         if int(g.n) != n or int(m.n) != n or int(v.n) != n:
             raise CudaError(
@@ -1639,11 +2117,72 @@ class CudaRuntime:
         self.launch("adamw_update", grid, block, [
             self._ptr(p), self._ptr(g), self._ptr(m), self._ptr(v),
             (n, ctypes.c_int),
-            (float(b1), ctypes.c_float), (float(b2), ctypes.c_float),
-            (float(lr), ctypes.c_float), (float(eps), ctypes.c_float),
-            (float(wd), ctypes.c_float),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
             (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (1 if do_wd else 0, ctypes.c_int),
         ])
+
+    def div_scalar(self, a, scalar):
+        """c = a / scalar。真除法，不是乘倒数。"""
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            if int(a.n) > 2147483647:
+                raise CudaError("div_scalar 元素个数超过 int32")
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_div_scalar", grid, block, [
+                self._ptr(a), (float(scalar), ctypes.c_float), self._ptr(out),
+                (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def sub_scale_(self, p, o, scale):
+        """原地 p = p - scale * o。"""
+        n = int(p.n)
+        if int(o.n) != n:
+            raise CudaError("sub_scale 长度不一致: p=%d o=%d" % (n, o.n))
+        if n <= 0:
+            return p
+        if n > 2147483647:
+            raise CudaError("sub_scale 元素个数超过 int32")
+        grid, block = self._ewise_grid(n)
+        self.launch("ewise_sub_scale", grid, block, [
+            self._ptr(p), self._ptr(o), (float(scale), ctypes.c_float),
+            (n, ctypes.c_int),
+        ])
+        return p
+
+    def muon_momentum(self, p, g, buf, u, mom, wd_lr, do_wd, nesterov):
+        """原地写 p（weight decay）和 buf，u 是正交化的输入。"""
+        n = int(p.n)
+        if int(g.n) != n or int(buf.n) != n or int(u.n) != n:
+            raise CudaError(
+                "muon_momentum 长度不一致: p=%d g=%d buf=%d u=%d" % (n, g.n, buf.n, u.n))
+        if n <= 0:
+            return
+        if n > 2147483647:
+            raise CudaError("muon_momentum 元素个数超过 int32")
+        grid, block = self._ewise_grid(n)
+        self.launch("muon_momentum", grid, block, [
+            self._ptr(p), self._ptr(g), self._ptr(buf), self._ptr(u),
+            (n, ctypes.c_int),
+            (float(mom), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (1 if do_wd else 0, ctypes.c_int),
+            (1 if nesterov else 0, ctypes.c_int),
+        ])
+
+    def sumsq_sequential(self, buf):
+        """一个标量：按地址顺序的 sum(x*x)。调用方只把这个标量降回主机。"""
+        out = self.empty((), dtype=np.float32)
+        n = int(buf.n)
+        if n < 0 or n > 2147483647:
+            raise CudaError("sumsq 元素个数非法: %d" % n)
+        self.launch("sumsq_sequential", (1, 1, 1), (1, 1, 1), [
+            self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
+        ])
+        return out
 
 
 _RT = None
