@@ -28,21 +28,39 @@ M3 CUDA（同一份 CausalSelfAttention 公式，不改判分台）：
     * 可广播的 add（因果掩码）、最后一维 softmax
     * 因此 nn.CausalSelfAttention 整层在 GPU 上
 
+M5 CPU（同一份公共 API，浮点一律 fp32）：
+    * 工厂：tensor / zeros / ones / full / randn / rand / arange / from_numpy / manual_seed
+    * dtype（float32 / int64 等）、device、cuda.is_available
+    * permute / transpose(dim0, dim1) / contiguous / view / size / dim
+    * 模块级 exp / log / sqrt / abs / clamp / cat / stack / matmul / bmm / einsum
+      / max / min / topk / where / save / load
+    * matmul 支持任意前导维，因此 nn.Linear 接受 ND 输入
+
 尚未做：
+    * 上面这批 M5 算子的 CUDA 内核（CPU 可用；CUDA 上显式 NotImplementedError）
     * MoE / AdamW / Muon 的 CUDA 路径
-    * mean、pow、exp、下标，以及公开的带 axis 的 sum
     * 默认重算（activation checkpoint）
     * dh=64 的 flash / tiled attention kernel（判分台 Dh=8，那些 kernel 直接 return）
+    * 与 PyTorch 逐位相同的随机数、float64 存储、torch.save 的 zip 格式
 """
 from __future__ import annotations
 
 import numpy as np
+
+# 模块最后会把 max 绑成 torch.max。这两处要的是内置 max，先留住。
+_builtin_max = max
 
 __all__ = [
     "Tensor", "Parameter", "no_grad", "set_device", "get_device",
     "Module", "Linear", "Embedding", "RMSNorm", "Sequential", "ModuleList",
     "CausalSelfAttention",
     "functional", "nn", "optim",
+    "tensor", "zeros", "ones", "full", "randn", "rand", "arange", "from_numpy",
+    "manual_seed", "cat", "stack", "matmul", "bmm", "einsum", "permute",
+    "exp", "log", "sqrt", "abs", "clamp", "max", "min", "topk", "where",
+    "save", "load",
+    "dtype", "float32", "float64", "int32", "int64", "long",
+    "device", "cuda",
 ]
 
 # 默认 cpu。只有 set_device("cuda") 成功之后，新建张量才走 GPU。
@@ -70,8 +88,160 @@ def set_device(device):
 
 
 def _cuda():
-    from .cuda import runtime
-    return runtime()
+    """加载 train/cuda.py。导入会临时占用包属性名 cuda，这里把公开名字空间放回去。"""
+    import importlib
+    import sys
+    pkg = sys.modules[__name__]
+    saved = pkg.__dict__.get("cuda")
+    mod = importlib.import_module(__name__ + ".cuda")
+    if saved is not None and saved is not mod:
+        pkg.__dict__["cuda"] = saved
+    return mod.runtime()
+
+
+class DType:
+    """对应 torch.dtype。浮点运算仍一律存成 float32，见模块说明。"""
+
+    def __init__(self, name, numpy_dtype, floating):
+        self.name = name
+        self.numpy_dtype = np.dtype(numpy_dtype)
+        self.is_floating_point = bool(floating)
+
+    def __repr__(self):
+        return "torch." + self.name
+
+    def __eq__(self, other):
+        if isinstance(other, DType):
+            return self.numpy_dtype == other.numpy_dtype and self.name == other.name
+        return NotImplemented
+
+    def __hash__(self):
+        return hash((self.name, str(self.numpy_dtype)))
+
+
+dtype = DType
+float32 = DType("float32", np.float32, True)
+float64 = DType("float64", np.float64, True)
+int32 = DType("int32", np.int32, False)
+int64 = DType("int64", np.int64, False)
+long = int64
+_DTYPES = (float32, float64, int32, int64)
+
+
+def _as_dtype(dt):
+    if dt is None:
+        return None
+    if isinstance(dt, DType):
+        return dt
+    if dt is int:
+        return int64
+    if dt is float:
+        return float64
+    try:
+        np_dt = np.dtype(dt)
+    except TypeError:
+        raise TypeError("不认识的 dtype: %r" % (dt,))
+    for item in _DTYPES:
+        if item.numpy_dtype == np_dt:
+            return item
+    return DType(str(np_dt), np_dt, np.issubdtype(np_dt, np.floating))
+
+
+def _is_float_dtype(dt):
+    wrapped = _as_dtype(dt)
+    return wrapped is None or wrapped.is_floating_point
+
+
+def _numpy_dtype(dt):
+    return _as_dtype(dt).numpy_dtype
+
+
+def _wrap_dtype(np_dt):
+    np_dt = np.dtype(np_dt)
+    for item in _DTYPES:
+        if item.numpy_dtype == np_dt:
+            return item
+    return DType(str(np_dt), np_dt, np.issubdtype(np_dt, np.floating))
+
+
+class Device:
+    """对应 torch.device。index 只做记录；真正建张量时只用 type（cpu / cuda）。"""
+
+    def __init__(self, type, index=None):
+        if isinstance(type, Device):
+            if index is not None:
+                raise RuntimeError("device() 不能同时从已有 device 再给 index")
+            self.type = type.type
+            self.index = type.index
+            return
+        text = str(type).strip()
+        if ":" in text:
+            name, idx_s = text.split(":", 1)
+            parsed = int(idx_s)
+            if index is not None and int(index) != parsed:
+                raise RuntimeError("device 字符串里的 index 和参数冲突")
+            self.type = name
+            self.index = parsed
+        else:
+            self.type = text
+            self.index = None if index is None else int(index)
+
+    def __repr__(self):
+        if self.index is None:
+            return "device(type=%r)" % self.type
+        return "device(type=%r, index=%s)" % (self.type, self.index)
+
+    def __str__(self):
+        if self.index is None:
+            return self.type
+        return "%s:%s" % (self.type, self.index)
+
+    def __eq__(self, other):
+        if isinstance(other, Device):
+            return self.type == other.type and self.index == other.index
+        if isinstance(other, str):
+            return str(self) == other or self.type == other
+        return NotImplemented
+
+
+device = Device
+
+
+def _device_arg(dev):
+    if dev is None:
+        return None
+    if isinstance(dev, Device):
+        return dev.type
+    if isinstance(dev, str):
+        if ":" in dev:
+            return dev.split(":", 1)[0]
+        return dev
+    raise TypeError("device 需要 str 或 torch.device，收到 %r" % (dev,))
+
+
+class _CudaAPI:
+    """对应 torch.cuda 的只读查询。不在 import 时加载驱动。"""
+
+    @staticmethod
+    def is_available():
+        try:
+            _cuda()
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def device_count():
+        return 1 if _CudaAPI.is_available() else 0
+
+    @staticmethod
+    def current_device():
+        if not _CudaAPI.is_available():
+            raise RuntimeError("CUDA 不可用")
+        return 0
+
+
+cuda = _CudaAPI()
 
 # ─────────────────────────── 自动微分 ───────────────────────────
 _GRAD_ENABLED = [True]
@@ -110,7 +280,9 @@ class Tensor:
     __slots__ = ("data", "grad", "requires_grad", "_parents", "_backward", "device", "_gpu")
     __array_priority__ = 1000        # 让 ndarray <op> Tensor 走我们的 __r*__
 
-    def __init__(self, data, requires_grad=False, _parents=(), _backward=None, device=None):
+    def __init__(self, data, requires_grad=False, _parents=(), _backward=None, device=None, dtype=None):
+        if device is not None and not isinstance(device, str):
+            device = _device_arg(device)
         dev = _DEVICE if device is None else device
         self.device = dev
         self._gpu = None
@@ -119,6 +291,12 @@ class Tensor:
         self._parents = _parents
         self._backward = _backward
         if dev == "cpu":
+            # 整数/布尔只当显式 dtype 给出时才保留。默认路径与原来一样，强制 float32。
+            if dtype is not None and not _is_float_dtype(dtype):
+                if requires_grad:
+                    raise RuntimeError("只有浮点张量可以 requires_grad")
+                self.data = np.asarray(data, dtype=_numpy_dtype(dtype))
+                return
             self.data = np.asarray(data, dtype=np.float32)
             return
         if dev != "cuda":
@@ -155,6 +333,12 @@ class Tensor:
         if self.device == "cuda":
             return len(self.shape)
         return self.data.ndim
+
+    @property
+    def dtype(self):
+        if self.data is None:
+            return float32
+        return _wrap_dtype(self.data.dtype)
 
     def numel(self):
         if self.device == "cuda":
@@ -211,6 +395,9 @@ class Tensor:
         self.grad = None
 
     def detach(self):
+        # CPU：和原来一样拷贝 data。CUDA：data 是 None，经 to_numpy 拉回主机。
+        if self.device == "cuda":
+            return Tensor(self.to_numpy().copy())
         return Tensor(self.data.copy())
 
     # ---- 算子 ----
@@ -354,8 +541,21 @@ class Tensor:
                     _acc(grads, other, np.matmul(np.swapaxes(a, -1, -2), g))
             out._backward = bw
             return out
-        raise NotImplementedError("matmul 支持 2D/3D，收到 %dD x %dD"
-                                  % (self.ndim, other.ndim))
+        # 任意前导维（nn.Linear 的 ND 输入走这里）。2D x 2D 和 3D x 3D 仍走上面的原路径。
+        if self.ndim >= 1 and other.ndim >= 1:
+            out = Tensor(np.matmul(self.data, other.data), requires_grad=rg, _parents=(self, other))
+            a_data, b_data = self.data, other.data
+
+            def bw(g, grads):
+                da, db = _matmul_grad_numpy(g, a_data, b_data)
+                if self.requires_grad:
+                    _acc(grads, self, da)
+                if other.requires_grad:
+                    _acc(grads, other, db)
+            out._backward = bw
+            return out
+        raise NotImplementedError("matmul 支持 2D/3D 以及带前导维的矩阵乘，收到 %dD x %dD"
+                                   % (self.ndim, other.ndim))
 
     def _matmul_cuda(self, other):
         rt = _cuda()
@@ -481,6 +681,8 @@ class Tensor:
         return out
 
     def exp(self):
+        if self.device == "cuda":
+            self._cpu_only("exp")
         e = np.exp(self.data)
         out = Tensor(e, requires_grad=self.requires_grad, _parents=(self,))
 
@@ -490,6 +692,8 @@ class Tensor:
         return out
 
     def log(self):
+        if self.device == "cuda":
+            self._cpu_only("log")
         out = Tensor(np.log(self.data), requires_grad=self.requires_grad, _parents=(self,))
 
         def bw(g, grads):
@@ -537,7 +741,10 @@ class Tensor:
             shape = tuple(shape[0])
         if self.device == "cuda":
             return self._reshape_cuda(shape)
-        out = Tensor(self.data.reshape(shape), requires_grad=self.requires_grad, _parents=(self,))
+        new = self.data.reshape(shape)
+        if not np.issubdtype(self.data.dtype, np.floating):
+            return Tensor(new, dtype=self.dtype, requires_grad=False)
+        out = Tensor(new, requires_grad=self.requires_grad, _parents=(self,))
         old = self.shape
 
         def bw(g, grads):
@@ -556,13 +763,133 @@ class Tensor:
         out._backward = bw
         return out
 
-    def transpose(self):
+    def transpose(self, dim0=None, dim1=None):
+        # 不传参数：原来的完整转置（.T 走这里）。2D 上与 transpose(0, 1) 相同。
+        if dim0 is None and dim1 is None:
+            if self.device == "cuda":
+                return self._transpose_cuda()
+            out = Tensor(self.data.T, requires_grad=self.requires_grad, _parents=(self,))
+
+            def bw(g, grads):
+                _acc(grads, self, g.T)
+            out._backward = bw
+            return out
+        if dim0 is None or dim1 is None:
+            raise TypeError("transpose() 要么不传参数，要么同时给 dim0 和 dim1")
         if self.device == "cuda":
-            return self._transpose_cuda()
-        out = Tensor(self.data.T, requires_grad=self.requires_grad, _parents=(self,))
+            nd = self.ndim
+            a = int(dim0) + (nd if int(dim0) < 0 else 0)
+            b = int(dim1) + (nd if int(dim1) < 0 else 0)
+            if nd == 2 and {a, b} == {0, 1}:
+                return self._transpose_cuda()
+            self._cpu_only("transpose(dim0, dim1)")
+        nd = self.ndim
+        a = int(dim0)
+        b = int(dim1)
+        if a < 0:
+            a += nd
+        if b < 0:
+            b += nd
+        axes = list(range(nd))
+        axes[a], axes[b] = axes[b], axes[a]
+        return self.permute(*axes)
+
+    def permute(self, *dims):
+        if len(dims) == 1 and isinstance(dims[0], (tuple, list)):
+            dims = tuple(dims[0])
+        if self.device == "cuda":
+            self._cpu_only("permute")
+        nd = self.ndim
+        axes = []
+        for d in dims:
+            d = int(d)
+            if d < 0:
+                d += nd
+            axes.append(d)
+        if sorted(axes) != list(range(nd)):
+            raise ValueError("permute 必须是 0..%d 的一个排列，收到 %s" % (nd - 1, axes))
+        moved = np.transpose(self.data, axes)
+        if not np.issubdtype(self.data.dtype, np.floating):
+            return Tensor(moved, dtype=self.dtype, requires_grad=False)
+        out = Tensor(moved, requires_grad=self.requires_grad, _parents=(self,))
+        inv = tuple(int(i) for i in np.argsort(axes))
 
         def bw(g, grads):
-            _acc(grads, self, g.T)
+            _acc(grads, self, np.transpose(g, inv))
+        out._backward = bw
+        return out
+
+    def contiguous(self):
+        if self.device == "cuda":
+            return self
+        if self.data.flags.c_contiguous:
+            return self
+        packed = np.ascontiguousarray(self.data)
+        if not np.issubdtype(self.data.dtype, np.floating):
+            return Tensor(packed, dtype=self.dtype, requires_grad=False)
+        out = Tensor(packed, requires_grad=self.requires_grad, _parents=(self,))
+
+        def bw(g, grads):
+            _acc(grads, self, np.asarray(g, dtype=np.float32).reshape(self.shape))
+        out._backward = bw
+        return out
+
+    def view(self, *shape):
+        # 近似：非连续时先拷贝。PyTorch 的 view 在非连续上会直接报错。
+        if self.device == "cuda":
+            return self.reshape(*shape)
+        if self.data.flags.c_contiguous:
+            return self.reshape(*shape)
+        return self.contiguous().reshape(*shape)
+
+    def size(self, dim=None):
+        if dim is None:
+            return self.shape
+        d = int(dim)
+        if d < 0:
+            d += self.ndim
+        return int(self.shape[d])
+
+    def dim(self):
+        return int(self.ndim)
+
+    def abs(self):
+        if self.device == "cuda":
+            self._cpu_only("abs")
+        out = Tensor(np.abs(self.data), requires_grad=self.requires_grad, _parents=(self,))
+        sign = np.sign(self.data).astype(np.float32)
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, g * sign)
+        out._backward = bw
+        return out
+
+    def sqrt(self):
+        return self ** 0.5
+
+    def clamp(self, min=None, max=None):
+        if self.device == "cuda":
+            self._cpu_only("clamp")
+        lo = _scalar_or_none(min, "clamp.min")
+        hi = _scalar_or_none(max, "clamp.max")
+        y = self.data
+        if lo is not None:
+            y = np.maximum(y, np.float32(lo))
+        if hi is not None:
+            y = np.minimum(y, np.float32(hi))
+        out = Tensor(y, requires_grad=self.requires_grad, _parents=(self,))
+        src = self.data
+
+        def bw(g, grads):
+            if not self.requires_grad:
+                return
+            mask = np.ones(src.shape, dtype=np.float32)
+            if lo is not None:
+                mask = np.where(src < lo, np.float32(0), mask)
+            if hi is not None:
+                mask = np.where(src > hi, np.float32(0), mask)
+            _acc(grads, self, g * mask)
         out._backward = bw
         return out
 
@@ -635,6 +962,580 @@ def _has_array_index(idx):
     return False
 
 
+def _matmul_grad_numpy(g, a, b):
+    """np.matmul 的反向。返回与 a、b 同形状的 (da, db)。"""
+    a_shape = a.shape
+    b_shape = b.shape
+    a_1 = a.ndim == 1
+    b_1 = b.ndim == 1
+    g = np.asarray(g, dtype=np.float32)
+    if a_1:
+        a = a.reshape(1, a.shape[0])
+    if b_1:
+        b = b.reshape(b.shape[0], 1)
+    if a_1 and b_1:
+        g2 = g.reshape(1, 1)
+    elif a_1:
+        g2 = np.expand_dims(g, axis=-2)
+    elif b_1:
+        g2 = np.expand_dims(g, axis=-1)
+    else:
+        g2 = g
+    da = np.matmul(g2, np.swapaxes(b, -1, -2))
+    db = np.matmul(np.swapaxes(a, -1, -2), g2)
+    if a_1:
+        da = np.squeeze(da, axis=-2)
+    if b_1:
+        db = np.squeeze(db, axis=-1)
+    da = _unbroadcast(np.asarray(da, dtype=np.float32), a_shape)
+    db = _unbroadcast(np.asarray(db, dtype=np.float32), b_shape)
+    return da, db
+
+
+def _scalar_or_none(v, name):
+    if v is None:
+        return None
+    if isinstance(v, Tensor):
+        if v.numel() != 1:
+            raise NotImplementedError("%s 目前只支持标量" % name)
+        return float(np.asarray(v.to_numpy()).reshape(-1)[0])
+    if isinstance(v, (bool, np.bool_)):
+        raise TypeError("%s 不接受布尔值" % name)
+    return float(v)
+
+
+def _as_index_array(target):
+    if isinstance(target, Tensor):
+        target = target.to_numpy()
+    return np.asarray(target, dtype=np.int64)
+
+
+def _normalize_size(size):
+    if len(size) == 1 and isinstance(size[0], (tuple, list, np.ndarray)):
+        return tuple(int(x) for x in size[0])
+    return tuple(int(x) for x in size)
+
+
+def _infer_dtype(data):
+    if isinstance(data, Tensor):
+        return data.dtype
+    if isinstance(data, np.ndarray):
+        if np.issubdtype(data.dtype, np.floating):
+            return float32
+        if data.dtype == np.int32:
+            return int32
+        if np.issubdtype(data.dtype, np.integer):
+            return int64
+        raise TypeError("tensor 暂不支持 dtype=%s" % data.dtype)
+    arr = np.asarray(data)
+    if arr.dtype == np.bool_:
+        raise TypeError("bool 张量尚未实现")
+    if np.issubdtype(arr.dtype, np.floating):
+        return float32
+    if np.issubdtype(arr.dtype, np.integer):
+        return int64
+    return float32
+
+
+def tensor(data, dtype=None, device=None, requires_grad=False):
+    if isinstance(data, Tensor):
+        data = data.to_numpy()
+    if dtype is None:
+        dtype = _infer_dtype(data)
+    else:
+        dtype = _as_dtype(dtype)
+    dev = _device_arg(device)
+    if _is_float_dtype(dtype):
+        return Tensor(data, requires_grad=requires_grad, device=dev)
+    if requires_grad:
+        raise RuntimeError("只有浮点张量可以 requires_grad")
+    return Tensor(data, requires_grad=False, device=dev, dtype=dtype)
+
+
+def _constant(shape, value, dt, device, requires_grad):
+    dev = _device_arg(device)
+    if dt is None or _is_float_dtype(dt):
+        data = np.full(shape, value, dtype=np.float32)
+        return Tensor(data, requires_grad=requires_grad, device=dev)
+    if requires_grad:
+        raise RuntimeError("只有浮点张量可以 requires_grad")
+    data = np.full(shape, value, dtype=_numpy_dtype(dt))
+    return Tensor(data, requires_grad=False, device=dev, dtype=_as_dtype(dt))
+
+
+def zeros(*size, dtype=None, device=None, requires_grad=False):
+    return _constant(_normalize_size(size), 0, dtype, device, requires_grad)
+
+
+def ones(*size, dtype=None, device=None, requires_grad=False):
+    return _constant(_normalize_size(size), 1, dtype, device, requires_grad)
+
+
+def full(size, fill_value, dtype=None, device=None, requires_grad=False):
+    if isinstance(size, (int, np.integer)) and not isinstance(size, bool):
+        shape = (int(size),)
+    else:
+        shape = tuple(int(x) for x in size)
+    return _constant(shape, fill_value, dtype, device, requires_grad)
+
+
+def randn(*size, dtype=None, device=None, requires_grad=False):
+    if dtype is not None and not _is_float_dtype(dtype):
+        raise TypeError("randn 只支持浮点 dtype")
+    data = np.random.standard_normal(_normalize_size(size)).astype(np.float32)
+    return Tensor(data, requires_grad=requires_grad, device=_device_arg(device))
+
+
+def rand(*size, dtype=None, device=None, requires_grad=False):
+    if dtype is not None and not _is_float_dtype(dtype):
+        raise TypeError("rand 只支持浮点 dtype")
+    data = np.random.random(_normalize_size(size)).astype(np.float32)
+    return Tensor(data, requires_grad=requires_grad, device=_device_arg(device))
+
+
+def arange(start, end=None, step=1, dtype=None, device=None, requires_grad=False):
+    if end is None:
+        end = start
+        start = 0
+    if dtype is None:
+        vals = (start, end, step)
+        integral = all(
+            isinstance(v, (int, np.integer)) and not isinstance(v, (bool, np.bool_))
+            for v in vals
+        )
+        dtype = int64 if integral else float32
+    else:
+        dtype = _as_dtype(dtype)
+    dev = _device_arg(device)
+    if _is_float_dtype(dtype):
+        data = np.arange(start, end, step, dtype=np.float32)
+        return Tensor(data, requires_grad=requires_grad, device=dev)
+    if requires_grad:
+        raise RuntimeError("只有浮点张量可以 requires_grad")
+    data = np.arange(start, end, step, dtype=_numpy_dtype(dtype))
+    return Tensor(data, requires_grad=False, device=dev, dtype=dtype)
+
+
+def manual_seed(seed):
+    """种子打进全局 numpy RNG。nn.Linear / Embedding 的初始化也吃这一个 RNG。
+
+    近似：没有 torch.Generator，也没有单独的 CUDA 随机流。
+    两次 randn 在同一种子下一致，但数值不会和 PyTorch 逐位相同。
+    """
+    np.random.seed(int(seed))
+    return int(seed)
+
+
+def from_numpy(ndarray):
+    """近似：总是拷贝，不和调用方共享内存。浮点收成 float32。"""
+    if not isinstance(ndarray, np.ndarray):
+        raise TypeError("from_numpy 需要 numpy.ndarray，收到 %s" % type(ndarray).__name__)
+    if ndarray.dtype == np.bool_:
+        raise TypeError("bool 张量尚未实现")
+    if np.issubdtype(ndarray.dtype, np.floating):
+        return Tensor(np.asarray(ndarray, dtype=np.float32).copy())
+    if ndarray.dtype == np.int32:
+        return Tensor(ndarray.copy(), dtype=int32)
+    if np.issubdtype(ndarray.dtype, np.integer):
+        return Tensor(np.asarray(ndarray, dtype=np.int64).copy(), dtype=int64)
+    raise TypeError("from_numpy 暂不支持 dtype=%s" % ndarray.dtype)
+
+
+def cat(tensors, dim=0):
+    ts = [_as_tensor(t) for t in tensors]
+    if not ts:
+        raise ValueError("cat 至少需要一个张量")
+    if any(getattr(t, "device", "cpu") == "cuda" for t in ts):
+        raise NotImplementedError("CUDA cat 尚未实现")
+    axis = int(dim)
+    if axis < 0:
+        axis += ts[0].ndim
+    data = np.concatenate([t.data for t in ts], axis=axis)
+    floating = all(np.issubdtype(t.data.dtype, np.floating) for t in ts)
+    if not floating:
+        return Tensor(data, dtype=ts[0].dtype, requires_grad=False)
+    rg = any(t.requires_grad for t in ts)
+    out = Tensor(data, requires_grad=rg, _parents=tuple(ts))
+    sizes = [int(t.shape[axis]) for t in ts]
+
+    def bw(g, grads):
+        parts = np.split(np.asarray(g, dtype=np.float32), np.cumsum(sizes)[:-1], axis=axis)
+        for t, part in zip(ts, parts):
+            if t.requires_grad:
+                _acc(grads, t, part)
+    out._backward = bw
+    return out
+
+
+def stack(tensors, dim=0):
+    ts = [_as_tensor(t) for t in tensors]
+    if not ts:
+        raise ValueError("stack 至少需要一个张量")
+    if any(getattr(t, "device", "cpu") == "cuda" for t in ts):
+        raise NotImplementedError("CUDA stack 尚未实现")
+    axis = int(dim)
+    data = np.stack([t.data for t in ts], axis=axis)
+    floating = all(np.issubdtype(t.data.dtype, np.floating) for t in ts)
+    if not floating:
+        return Tensor(data, dtype=ts[0].dtype, requires_grad=False)
+    rg = any(t.requires_grad for t in ts)
+    out = Tensor(data, requires_grad=rg, _parents=tuple(ts))
+
+    def bw(g, grads):
+        parts = np.split(np.asarray(g, dtype=np.float32), len(ts), axis=axis)
+        for t, part in zip(ts, parts):
+            if t.requires_grad:
+                _acc(grads, t, np.squeeze(part, axis=axis))
+    out._backward = bw
+    return out
+
+
+def matmul(input, other):
+    return _as_tensor(input) @ _as_tensor(other)
+
+
+def bmm(input, mat2):
+    a = _as_tensor(input)
+    b = _as_tensor(mat2)
+    if a.ndim != 3 or b.ndim != 3:
+        raise ValueError("bmm 需要两个 3D 张量，收到 %s x %s" % (a.shape, b.shape))
+    return a @ b
+
+
+def exp(input):
+    return _as_tensor(input).exp()
+
+
+def log(input):
+    return _as_tensor(input).log()
+
+
+def sqrt(input):
+    return _as_tensor(input).sqrt()
+
+
+def _api_abs(input):
+    return _as_tensor(input).abs()
+
+
+def _api_clamp(input, min=None, max=None):
+    return _as_tensor(input).clamp(min=min, max=max)
+
+
+def _reduce_values_grad(data, grad, axis, keepdim, pick):
+    idx = pick(data, axis=axis)
+    full = np.zeros(data.shape, dtype=np.float32)
+    g = np.asarray(grad, dtype=np.float32)
+    idx_exp = np.expand_dims(idx, axis)
+    if not keepdim:
+        g = np.expand_dims(g, axis)
+    np.put_along_axis(full, idx_exp, g, axis=axis)
+    return full
+
+
+def _reduce_pair(t, dim, keepdim, value_fn, index_fn):
+    if getattr(t, "device", "cpu") == "cuda":
+        raise NotImplementedError("CUDA max/min 尚未实现")
+    floating = np.issubdtype(t.data.dtype, np.floating)
+    if dim is None:
+        flat = t.data.reshape(-1)
+        flat_i = int(index_fn(flat))
+        raw = flat[flat_i]
+        if not floating:
+            return Tensor(np.array(raw), dtype=t.dtype, requires_grad=False)
+        out = Tensor(np.array(raw, dtype=np.float32), requires_grad=t.requires_grad, _parents=(t,))
+
+        def bw(g, grads):
+            if not t.requires_grad:
+                return
+            full = np.zeros(t.shape, dtype=np.float32)
+            full.reshape(-1)[flat_i] = np.asarray(g, dtype=np.float32).reshape(-1)[0]
+            _acc(grads, t, full)
+        out._backward = bw
+        return out
+    axis = int(dim)
+    if axis < 0:
+        axis += t.ndim
+    values = value_fn(t.data, axis=axis, keepdims=keepdim)
+    indices = index_fn(t.data, axis=axis)
+    if keepdim:
+        indices = np.expand_dims(indices, axis)
+    it = Tensor(indices, dtype=int64)
+    if not floating:
+        return Tensor(values, dtype=t.dtype, requires_grad=False), it
+    vt = Tensor(values, requires_grad=t.requires_grad, _parents=(t,))
+
+    def bw(g, grads):
+        if t.requires_grad:
+            _acc(grads, t, _reduce_values_grad(t.data, g, axis, keepdim, index_fn))
+    vt._backward = bw
+    return vt, it
+
+
+def _api_max(input, dim=None, keepdim=False):
+    return _reduce_pair(_as_tensor(input), dim, keepdim, np.max, np.argmax)
+
+
+def _api_min(input, dim=None, keepdim=False):
+    return _reduce_pair(_as_tensor(input), dim, keepdim, np.min, np.argmin)
+
+
+def topk(input, k, dim=-1, largest=True, sorted=True):
+    """近似：并列时名次跟 numpy.argpartition，不保证和 PyTorch 的稳定排序一致。"""
+    t = _as_tensor(input)
+    if getattr(t, "device", "cpu") == "cuda":
+        raise NotImplementedError("CUDA topk 尚未实现")
+    k = int(k)
+    axis = int(dim)
+    if axis < 0:
+        axis += t.ndim
+    n = int(t.shape[axis])
+    if k < 0 or k > n:
+        raise ValueError("topk 的 k=%d 超出维度长度 %d" % (k, n))
+    data = t.data
+    if k == 0:
+        shape = list(data.shape)
+        shape[axis] = 0
+        idx = np.zeros(shape, dtype=np.int64)
+        values = np.zeros(shape, dtype=np.float32 if np.issubdtype(data.dtype, np.floating) else data.dtype)
+    else:
+        if largest:
+            part = np.argpartition(data, n - k, axis=axis)
+            idx = np.take(part, np.arange(n - k, n), axis=axis)
+        else:
+            part = np.argpartition(data, k - 1, axis=axis)
+            idx = np.take(part, np.arange(0, k), axis=axis)
+        values = np.take_along_axis(data, idx, axis=axis)
+        if sorted:
+            key = -values if largest else values
+            order = np.argsort(key, axis=axis)
+            idx = np.take_along_axis(idx, order, axis=axis)
+            values = np.take_along_axis(values, order, axis=axis)
+    floating = np.issubdtype(data.dtype, np.floating)
+    saved_idx = np.array(idx, dtype=np.int64, copy=True)
+    it = Tensor(saved_idx, dtype=int64)
+    if not floating:
+        return Tensor(values, dtype=t.dtype, requires_grad=False), it
+    vt = Tensor(np.asarray(values, dtype=np.float32), requires_grad=t.requires_grad, _parents=(t,))
+
+    def bw(g, grads):
+        if not t.requires_grad:
+            return
+        full = np.zeros(data.shape, dtype=np.float32)
+        if k:
+            np.put_along_axis(full, saved_idx, np.asarray(g, dtype=np.float32), axis=axis)
+        _acc(grads, t, full)
+    vt._backward = bw
+    return vt, it
+
+
+def where(condition, x=None, y=None):
+    if isinstance(condition, Tensor):
+        cond = condition.to_numpy()
+    else:
+        cond = np.asarray(condition)
+    if x is None and y is None:
+        return tuple(Tensor(np.asarray(a, dtype=np.int64), dtype=int64) for a in np.nonzero(cond))
+    if x is None or y is None:
+        raise TypeError("where 需要只给 condition，或者同时给 x 和 y")
+    xt = _as_tensor(x)
+    yt = _as_tensor(y)
+    if getattr(xt, "device", "cpu") == "cuda" or getattr(yt, "device", "cpu") == "cuda":
+        raise NotImplementedError("CUDA where 尚未实现")
+    mask = np.asarray(cond, dtype=bool)
+    floating = np.issubdtype(xt.data.dtype, np.floating) or np.issubdtype(yt.data.dtype, np.floating)
+    if not floating:
+        return Tensor(np.where(mask, xt.data, yt.data), dtype=xt.dtype, requires_grad=False)
+    data = np.where(mask, xt.data, yt.data).astype(np.float32)
+    rg = xt.requires_grad or yt.requires_grad
+    out = Tensor(data, requires_grad=rg, _parents=(xt, yt))
+
+    def bw(g, grads):
+        gg = np.asarray(g, dtype=np.float32)
+        if xt.requires_grad:
+            _acc(grads, xt, _unbroadcast(np.where(mask, gg, np.float32(0)), xt.shape))
+        if yt.requires_grad:
+            _acc(grads, yt, _unbroadcast(np.where(mask, np.float32(0), gg), yt.shape))
+    out._backward = bw
+    return out
+
+
+def _split_einsum(equation, operands):
+    eq = equation.replace(" ", "")
+    if "..." in eq:
+        raise NotImplementedError("einsum 暂不支持省略号")
+    if "->" in eq:
+        lhs, rhs = eq.split("->")
+    else:
+        lhs = eq
+        counts = {}
+        for ch in lhs:
+            if ch.isalpha():
+                counts[ch] = counts.get(ch, 0) + 1
+        rhs = "".join(ch for ch in sorted(counts) if counts[ch] == 1)
+    labels = lhs.split(",") if lhs else []
+    if len(labels) != len(operands):
+        raise ValueError("einsum 操作数个数 %d 和方程 %r 不一致" % (len(operands), equation))
+    for lab in labels + [rhs]:
+        letters = [c for c in lab if c.isalpha()]
+        if len(letters) != len(set(letters)):
+            raise NotImplementedError("einsum 暂不支持重复字母: %r" % equation)
+        if any(not c.isalpha() for c in lab):
+            raise NotImplementedError("einsum 暂不支持字母以外的下标: %r" % equation)
+    return labels, rhs
+
+
+def _einsum_vjp(labels, rhs, operands, grad, index):
+    target = labels[index]
+    others_l = [labels[j] for j in range(len(operands)) if j != index]
+    others_a = [operands[j].data for j in range(len(operands)) if j != index]
+    provided = set(rhs)
+    for lab in others_l:
+        provided.update(lab)
+    missing = [c for c in target if c not in provided]
+    known = "".join(c for c in target if c in provided)
+    g = np.asarray(grad, dtype=np.float32)
+    if not missing:
+        if rhs == "" and not others_l:
+            return np.broadcast_to(g.reshape(()), operands[index].shape).astype(np.float32).copy()
+        if rhs == "":
+            gi = np.einsum(",".join(others_l) + "->" + target, *others_a) * g.reshape(())
+        else:
+            gi = np.einsum(",".join([rhs] + others_l) + "->" + target, g, *others_a)
+        return np.asarray(gi, dtype=np.float32).reshape(operands[index].shape)
+    if known == "" and not others_l and rhs == "":
+        return np.broadcast_to(g.reshape(()), operands[index].shape).astype(np.float32).copy()
+    if rhs == "":
+        if known == "":
+            partial = g.reshape(())
+        else:
+            partial = np.asarray(np.einsum(",".join(others_l) + "->" + known, *others_a), dtype=np.float32)
+            partial = partial * g.reshape(())
+    elif known == "":
+        partial = np.asarray(np.einsum(",".join([rhs] + others_l) + "->", g, *others_a), dtype=np.float32)
+    else:
+        partial = np.asarray(
+            np.einsum(",".join([rhs] + others_l) + "->" + known, g, *others_a), dtype=np.float32)
+    sizes = {c: n for c, n in zip(target, operands[index].shape)}
+    ones_labels = "".join(missing)
+    ones = np.ones(tuple(sizes[c] for c in ones_labels), dtype=np.float32)
+    if known == "":
+        gi = np.einsum(ones_labels + "->" + target, ones) * np.asarray(partial, dtype=np.float32).reshape(())
+    else:
+        gi = np.einsum(known + "," + ones_labels + "->" + target, np.asarray(partial, dtype=np.float32), ones)
+    return np.asarray(gi, dtype=np.float32).reshape(operands[index].shape)
+
+
+def einsum(equation, *operands):
+    """近似：不支持省略号和重复字母。浮点结果收成 float32。"""
+    ops = [_as_tensor(o) for o in operands]
+    if any(getattr(o, "device", "cpu") == "cuda" for o in ops):
+        raise NotImplementedError("CUDA einsum 尚未实现")
+    if not ops or not all(np.issubdtype(o.data.dtype, np.floating) for o in ops):
+        raise NotImplementedError("einsum 目前只支持浮点张量")
+    labels, rhs = _split_einsum(equation, ops)
+    for o, lab in zip(ops, labels):
+        if o.ndim != len(lab):
+            raise ValueError("einsum %r 的字母数和形状 %s 不一致" % (lab, o.shape))
+    out_data = np.einsum(",".join(labels) + "->" + rhs, *[o.data for o in ops])
+    rg = any(o.requires_grad for o in ops)
+    out = Tensor(np.asarray(out_data, dtype=np.float32), requires_grad=rg, _parents=tuple(ops))
+
+    def bw(g, grads):
+        for i, o in enumerate(ops):
+            if o.requires_grad:
+                _acc(grads, o, _einsum_vjp(labels, rhs, ops, g, i))
+    out._backward = bw
+    return out
+
+
+def _pack(obj):
+    if isinstance(obj, Tensor):
+        return {
+            "__tgai__": "tensor",
+            "data": np.array(obj.to_numpy(), copy=True),
+            "requires_grad": bool(obj.requires_grad),
+        }
+    if isinstance(obj, Module):
+        return {"__tgai__": "state_dict", "data": obj.state_dict()}
+    if isinstance(obj, dict):
+        return {"__tgai__": "dict", "data": {str(k): _pack(v) for k, v in obj.items()}}
+    if isinstance(obj, tuple):
+        return {"__tgai__": "tuple", "data": [_pack(v) for v in obj]}
+    if isinstance(obj, list):
+        return {"__tgai__": "list", "data": [_pack(v) for v in obj]}
+    if isinstance(obj, np.ndarray):
+        return {"__tgai__": "ndarray", "data": np.array(obj, copy=True)}
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    raise TypeError("save 不支持 %s。这不是 torch.save 的 zip 格式。" % type(obj).__name__)
+
+
+def _unpack(obj):
+    if not isinstance(obj, dict) or "__tgai__" not in obj:
+        return obj
+    kind = obj["__tgai__"]
+    if kind == "tensor":
+        data = obj["data"]
+        if np.issubdtype(data.dtype, np.floating):
+            return Tensor(data, requires_grad=bool(obj.get("requires_grad", False)))
+        return Tensor(data, dtype=_wrap_dtype(data.dtype), requires_grad=False)
+    if kind == "ndarray":
+        return obj["data"]
+    if kind == "dict":
+        return {k: _unpack(v) for k, v in obj["data"].items()}
+    if kind == "list":
+        return [_unpack(v) for v in obj["data"]]
+    if kind == "tuple":
+        return tuple(_unpack(v) for v in obj["data"])
+    if kind == "state_dict":
+        return {k: np.array(v, copy=True) for k, v in obj["data"].items()}
+    raise TypeError("未知存档类型 %s" % kind)
+
+
+def _move_loaded(obj, dev):
+    if isinstance(obj, Tensor) and obj.data is not None and np.issubdtype(obj.data.dtype, np.floating):
+        return Tensor(obj.to_numpy(), requires_grad=obj.requires_grad, device=dev)
+    if isinstance(obj, dict):
+        return {k: _move_loaded(v, dev) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_move_loaded(v, dev) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_move_loaded(v, dev) for v in obj)
+    return obj
+
+
+def save(obj, f):
+    """近似：pickle 一份带标记的 numpy，不是 torch.save 的 zip，两边不能互读。"""
+    import pickle
+    payload = {"__tgai_save__": 1, "obj": _pack(obj)}
+    if hasattr(f, "write"):
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return
+    with open(f, "wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load(f, map_location=None):
+    import pickle
+    if hasattr(f, "read"):
+        payload = pickle.load(f)
+    else:
+        with open(f, "rb") as fh:
+            payload = pickle.load(fh)
+    if not isinstance(payload, dict) or payload.get("__tgai_save__") != 1:
+        raise TypeError("不是 tgai_go.train.save 写出的文件（不能读 torch.save 的 zip）")
+    obj = _unpack(payload["obj"])
+    dest = None
+    if isinstance(map_location, Device):
+        dest = map_location.type
+    elif isinstance(map_location, str):
+        dest = map_location.split(":", 1)[0]
+    if dest not in (None, "cpu"):
+        obj = _move_loaded(obj, dest)
+    return obj
+
+
 # ─────────────────────────── functional ───────────────────────────
 class _Functional:
     @staticmethod
@@ -645,7 +1546,9 @@ class _Functional:
         return x * ((s + 1.0) ** -1.0)
 
     @staticmethod
-    def softmax(x: Tensor, axis=-1) -> Tensor:
+    def softmax(x: Tensor, axis=-1, dim=None) -> Tensor:
+        if dim is not None:
+            axis = dim
         if getattr(x, "device", "cpu") == "cuda":
             return _softmax_cuda(x, axis)
         m = x.data.max(axis=axis, keepdims=True)
@@ -654,17 +1557,26 @@ class _Functional:
         return e * (e.sum(axis=axis, keepdims=True) ** -1.0)
 
     @staticmethod
-    def log_softmax(x: Tensor, axis=-1) -> Tensor:
+    def log_softmax(x: Tensor, axis=-1, dim=None) -> Tensor:
+        if dim is not None:
+            axis = dim
+        if getattr(x, "device", "cpu") == "cuda":
+            raise NotImplementedError("CUDA log_softmax 尚未实现")
         m = x.data.max(axis=axis, keepdims=True)
         z = x - Tensor(m)
         e = z.exp()
         return z - e.sum(axis=axis, keepdims=True).log()
 
     @staticmethod
-    def scaled_dot_product_attention(q: Tensor, k: Tensor, v: Tensor, causal=False):
+    def scaled_dot_product_attention(q: Tensor, k: Tensor, v: Tensor, causal=False, is_causal=None, scale=None):
         """q,k,v: [B*H, S, Dh]（已展平 head）。causal=True 时做下三角掩码。"""
+        if is_causal is not None:
+            causal = bool(is_causal)
         dh = q.shape[-1]
-        scale = 1.0 / np.sqrt(dh)
+        if scale is None:
+            scale = 1.0 / np.sqrt(dh)
+        else:
+            scale = float(scale)
         scores = (q @ k.swap_last2()) * scale                  # [BH,S,S]
         if causal:
             S = scores.shape[-1]
@@ -684,10 +1596,10 @@ class _Functional:
     def _cross_entropy_cpu(logits, target, ignore_index=-100):
         n, v = logits.shape
         lp = _Functional.log_softmax(logits, axis=-1)
-        tgt = np.asarray(target, dtype=np.int64).reshape(-1)
+        tgt = _as_index_array(target).reshape(-1)
         mask = tgt != ignore_index
         picked = lp[np.arange(n), tgt]                      # [N]
-        loss = (picked * Tensor(mask.astype(np.float32))).sum() * (-1.0 / max(1, mask.sum()))
+        loss = (picked * Tensor(mask.astype(np.float32))).sum() * (-1.0 / _builtin_max(1, mask.sum()))
         return loss
 
 
@@ -731,7 +1643,7 @@ def _silu_cuda(x):
 
 def _cross_entropy_cuda(logits, target, ignore_index):
     """GPU 上的 mean CE。语义与 ce_fwd/ce_bwd 一致，不含 ignore_index。"""
-    tgt = np.asarray(target, dtype=np.int64).reshape(-1)
+    tgt = _as_index_array(target).reshape(-1)
     n, v = logits.shape
     if tgt.shape != (n,):
         raise ValueError("cross_entropy 目标长度 %s != N=%d" % (tgt.shape, n))
@@ -1095,7 +2007,7 @@ class Muon(_Optim):
                 self.buf[i] = self.mom * self.buf[i] + g
                 u = g + self.mom * self.buf[i] if self.nesterov else self.buf[i]
                 o = _newton_schulz5(u)
-                scale = np.sqrt(max(1.0, p.data.shape[0] / p.data.shape[1]))
+                scale = np.sqrt(_builtin_max(1.0, p.data.shape[0] / p.data.shape[1]))
                 p.data = p.data - self.lr * scale * o
             else:
                 b1, b2 = 0.9, 0.999
@@ -1120,7 +2032,21 @@ class _NNModule:
     RMSNorm = RMSNorm
     Sequential = Sequential
     ModuleList = ModuleList
+    functional = functional
 
 
 nn = _NNModule()
 optim = _OptimModule()
+
+def permute(input, dims):
+    """对应 torch.permute(input, dims)。dims 是轴的排列。"""
+    if not isinstance(dims, (tuple, list)):
+        raise TypeError("permute 的 dims 需要 tuple 或 list，收到 %s" % type(dims).__name__)
+    return _as_tensor(input).permute(*dims)
+
+
+# 公开名字放在文件末尾，避免盖住上面 Muon / cross_entropy 里的内置 max。
+abs = _api_abs
+clamp = _api_clamp
+max = _api_max
+min = _api_min

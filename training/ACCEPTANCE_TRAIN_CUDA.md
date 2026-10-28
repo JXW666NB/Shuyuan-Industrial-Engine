@@ -74,3 +74,47 @@ CPU 后端的 head 拆分是 `reshape(B,S,H,Dh).reshape(B*H,S,Dh)`，即 **C 顺
 
 **这不算退步**（数值对上、且全部在 GPU），但要记住：**想用 flash 前向，必须先做布局适配**
 （把 C 顺序的 head 拆分换成显式 permute）。这条留给 M5——真实模型 dh=64，那时 flash 才有意义。
+
+---
+
+## M5 · PyTorch 迁移一致性（进行中：CPU 11/11，CUDA 5/11）
+
+**用户硬指标**：把 `import torch` 换成 `import tgai_go.train as torch`，**其余代码一字不改**必须跑通。
+
+**判分台**：`training/harness/pytorch_conformance.py` —— 11 段**标准 PyTorch 写法**的用例：
+`tensor_basic / linear_nd / sequential / functional_names / cross_entropy / no_grad /
+optimizer_step / state_dict / reshape_permute / seed_repeat / rmsnorm_attn`
+
+| 后端 | 结果 |
+|---|---|
+| **CPU**（本机 Windows 与 V100 各跑一次） | **11/11 PASS** |
+| **CUDA**（V100 独立复跑） | **5/11 PASS** |
+
+### CUDA 侧未通过的 6 项与真实原因（这是下一步的工作清单）
+
+| 用例 | 失败原因 |
+|---|---|
+| `tensor_basic` | CUDA 标量广播坏了：`ewise_add 形状不同: (2,2) vs (1,)` |
+| `linear_nd` | CUDA matmul 只支持 2D/3D，收到 `3D x 2D`（CPU 侧已修，CUDA 未修） |
+| `functional_names` | `CudaRuntime` 缺 `silu_mul_fwd` |
+| `optimizer_step` | `float * NoneType`（某参数梯度为 None） |
+| `reshape_permute` | CUDA 后端**还没有 `permute`** |
+| `rmsnorm_attn` | `CudaRuntime` 缺 `rmsnorm_fwd` |
+
+### 已入库的 API 表面（CPU 后端）
+
+补上了 32 个缺失的顶层名字（38 个里原有 6 个）：
+`tensor / zeros / ones / full / randn / rand / arange / cat / stack / manual_seed / from_numpy /
+float32 / int64 / save / load / topk / where / max / min / exp / log / sqrt / abs / clamp /
+matmul / bmm / einsum / permute` 等，并把 `nn.Linear` 从"只吃 2D"改成支持任意前导维。
+
+**Grok 主动标注的"近似而非等价"（诚实项，必须保留）**：
+- 新算子是 CPU / float32 路径，**CUDA 张量上会 `NotImplementedError`**（正是 CUDA 5/11 的来源）
+- `manual_seed` 只保证**我们自己的**两次 `randn` 一致，**不保证与 PyTorch 逐位相同**
+- `save` / `load` **不是** `torch.save` 的 zip 格式
+- 比较运算 `>` `<` **未实现**
+
+### 我在判分台里发现自己一个错
+
+`tensor_basic` 原本断言 `sum == 22`，但 `x*2+1` 四个元素是 `3,5,7,9`，和应为 **24** ——
+**是我的判分台写错了**，Grok 指出并改正。判分台先自证这条纪律，反过来也保护了实现方不被冤枉。
