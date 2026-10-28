@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""tgai_go.train 的 CUDA 运行时（M1 + Linux + M2 算子）。
+"""tgai_go.train 的 CUDA 运行时（M1 + Linux + M2 + M3 算子）。
 
 不 import torch。只通过 ctypes 调用驱动、cuBLAS、NVRTC：
 
@@ -256,8 +256,73 @@ extern "C" __global__ void emb_gather_bwd(const float* g, const int* ids, float*
 """
 
 
+# M3：reshape 只改形状（主机 memcpy）。下面是 attention 公式里 CPU 还在用、
+# 但设备上还没有的几步。dh=64 的 flash/tiled kernel 对判分台的 Dh=8 会直接 return，
+# 所以 SDPA 走和 CPU 相同的 bmm + 掩码 + softmax，不改那两份已验收源码。
+_M3_KERNELS = r"""
+extern "C" __global__ void swap_last2(const float* a, float* b, int batch, int m, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    int total = batch * n * m;
+    if (i >= total || m <= 0 || n <= 0) return;
+    int m_i = i % m;
+    int n_i = (i / m) % n;
+    int b_i = i / (m * n);
+    b[i] = a[(b_i * m + m_i) * n + n_i];
+}
+
+/* 4D broadcast add. c0..c3 is the output shape (leading dims padded to 1).
+   a0..a3 and b0..b3 are source strides; a broadcast axis has stride 0.
+   Caller guarantees every output extent is >= 1. */
+extern "C" __global__ void bcast_add4(
+    const float* a, const float* b, float* c, int n,
+    int c0, int c1, int c2, int c3,
+    int a0, int a1, int a2, int a3,
+    int b0, int b1, int b2, int b3) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    int t = i;
+    int i3 = t % c3; t /= c3;
+    int i2 = t % c2; t /= c2;
+    int i1 = t % c1; t /= c1;
+    int i0 = t;
+    int ia = i0 * a0 + i1 * a1 + i2 * a2 + i3 * a3;
+    int ib = i0 * b0 + i1 * b1 + i2 * b2 + i3 * b3;
+    c[i] = a[ia] + b[ib];
+}
+
+extern "C" __global__ void softmax_lastdim(const float* x, float* y, int rows, int k) {
+    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (r >= rows || k <= 0) return;
+    const float* row = x + (long long)r * k;
+    float* orow = y + (long long)r * k;
+    float m = row[0];
+    for (int j = 1; j < k; ++j) m = fmaxf(m, row[j]);
+    float sum = 0.f;
+    for (int j = 0; j < k; ++j) {
+        float e = expf(row[j] - m);
+        orow[j] = e;
+        sum += e;
+    }
+    float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
+    for (int j = 0; j < k; ++j) orow[j] *= inv;
+}
+
+extern "C" __global__ void softmax_lastdim_bwd(const float* g, const float* y, float* dx,
+                                              int rows, int k) {
+    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (r >= rows || k <= 0) return;
+    const float* grow = g + (long long)r * k;
+    const float* yrow = y + (long long)r * k;
+    float* drow = dx + (long long)r * k;
+    float dot = 0.f;
+    for (int j = 0; j < k; ++j) dot += grow[j] * yrow[j];
+    for (int j = 0; j < k; ++j) drow[j] = yrow[j] * (grow[j] - dot);
+}
+"""
+
+
 def _device_source():
-    return _CE_AND_HELPERS + "\n" + _M2_KERNELS
+    return _CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS
 
 
 class CudaError(RuntimeError):
@@ -902,14 +967,179 @@ class CudaRuntime:
         return out
 
     def add(self, a, b):
-        if a.shape != b.shape:
-            raise CudaError("ewise_add 形状不同: %s vs %s" % (a.shape, b.shape))
-        out = self.empty(a.shape, dtype=np.float32)
-        if a.n:
-            grid, block = self._ewise_grid(a.n)
-            self.launch("ewise_add", grid, block, [
-                self._ptr(a), self._ptr(b), self._ptr(out),
-                (int(a.n), ctypes.c_int),
+        if tuple(a.shape) == tuple(b.shape):
+            out = self.empty(a.shape, dtype=np.float32)
+            if a.n:
+                grid, block = self._ewise_grid(a.n)
+                self.launch("ewise_add", grid, block, [
+                    self._ptr(a), self._ptr(b), self._ptr(out),
+                    (int(a.n), ctypes.c_int),
+                ])
+            return out
+        return self.add_broadcast(a, b)
+
+    def _broadcast_shapes(self, sa, sb):
+        sa = tuple(int(s) for s in sa)
+        sb = tuple(int(s) for s in sb)
+        ndim = max(len(sa), len(sb), 1)
+        if ndim > 4:
+            raise CudaError("broadcast 最高 4 维，收到 %s 和 %s" % (sa, sb))
+        pa = (1,) * (ndim - len(sa)) + sa
+        pb = (1,) * (ndim - len(sb)) + sb
+        out = []
+        for x, y in zip(pa, pb):
+            if x == y:
+                out.append(x)
+            elif x == 1:
+                out.append(y)
+            elif y == 1:
+                out.append(x)
+            else:
+                raise CudaError("形状不能广播: %s vs %s" % (sa, sb))
+        return tuple(out), pa, pb
+
+    def _pad4(self, shape):
+        shape = tuple(int(s) for s in shape)
+        if len(shape) > 4:
+            raise CudaError("内部 rank %d > 4" % len(shape))
+        return (1,) * (4 - len(shape)) + shape
+
+    def _strides4(self, padded):
+        """长度为 1 的维步长记 0，这样广播维不会读出源缓冲。"""
+        st = [0, 0, 0, 0]
+        stride = 1
+        for i in range(3, -1, -1):
+            st[i] = 0 if padded[i] == 1 else stride
+            stride *= int(padded[i])
+        return st
+
+    def add_broadcast(self, a, b):
+        out_shape, pa, pb = self._broadcast_shapes(a.shape, b.shape)
+        out = self.empty(out_shape, dtype=np.float32)
+        n = int(out.n)
+        if n == 0:
+            return out
+        if n > 2147483647:
+            raise CudaError("broadcast add 元素个数超过 int32")
+        c = self._pad4(out_shape)
+        sa = self._strides4(self._pad4(pa))
+        sb = self._strides4(self._pad4(pb))
+        grid, block = self._ewise_grid(n)
+        self.launch("bcast_add4", grid, block, [
+            self._ptr(a), self._ptr(b), self._ptr(out),
+            (n, ctypes.c_int),
+            (c[0], ctypes.c_int), (c[1], ctypes.c_int),
+            (c[2], ctypes.c_int), (c[3], ctypes.c_int),
+            (sa[0], ctypes.c_int), (sa[1], ctypes.c_int),
+            (sa[2], ctypes.c_int), (sa[3], ctypes.c_int),
+            (sb[0], ctypes.c_int), (sb[1], ctypes.c_int),
+            (sb[2], ctypes.c_int), (sb[3], ctypes.c_int),
+        ])
+        return out
+
+    def unbroadcast(self, g, shape):
+        """把广播后的梯度加回原形状。和主机 _unbroadcast 同一套规则。"""
+        shape = tuple(int(s) for s in shape)
+        if tuple(int(s) for s in g.shape) == shape:
+            return g
+        host = np.asarray(self.d2h(g), dtype=np.float32)
+        while host.ndim > len(shape):
+            host = host.sum(axis=0)
+        for axis, n in enumerate(shape):
+            if n == 1 and host.shape[axis] != 1:
+                host = host.sum(axis=axis, keepdims=True)
+        host = np.ascontiguousarray(host, dtype=np.float32).reshape(shape)
+        return self.h2d(host)
+
+    def reshape(self, buf, shape):
+        """C 顺序重解释。字节序不变，所以反向也只是再解释一次。"""
+        shape = tuple(int(s) for s in shape)
+        if any(s < 0 for s in shape):
+            raise CudaError("reshape 不支持负数维度 %s" % (shape,))
+        n = 1
+        for s in shape:
+            n *= int(s)
+        if n != int(buf.n):
+            raise CudaError("reshape %s -> %s 元素个数 %d != %d" % (buf.shape, shape, buf.n, n))
+        out = self.empty(shape, dtype=buf.dtype)
+        if n:
+            self._activate()
+            self._chk(self.cu.cuMemcpyDtoD(
+                ctypes.c_uint64(out.ptr),
+                ctypes.c_uint64(buf.ptr),
+                ctypes.c_size_t(n * int(buf.dtype.itemsize))), "cuMemcpyDtoD(reshape)")
+        return out
+
+    def swap_last2(self, buf):
+        if len(buf.shape) < 2:
+            raise CudaError("swap_last2 至少要 2 维，收到 %s" % (buf.shape,))
+        dims = tuple(int(s) for s in buf.shape)
+        m, n = dims[-2], dims[-1]
+        batch = 1
+        for s in dims[:-2]:
+            batch *= int(s)
+        out = self.empty(dims[:-2] + (n, m), dtype=np.float32)
+        total = batch * m * n
+        if total and m > 0 and n > 0:
+            grid, block = self._ewise_grid(total)
+            self.launch("swap_last2", grid, block, [
+                self._ptr(buf), self._ptr(out),
+                (batch, ctypes.c_int), (m, ctypes.c_int), (n, ctypes.c_int),
+            ])
+        return out
+
+    def bmm(self, A, B):
+        """行优先 C[b,M,N] = A[b,M,K] @ B[b,K,N]。每个 batch 走一次已验收的 sgemm。"""
+        if len(A.shape) != 3 or len(B.shape) != 3:
+            raise CudaError("bmm 需要 3D，收到 %s @ %s" % (A.shape, B.shape))
+        batch, M, K = (int(s) for s in A.shape)
+        batch2, K2, N = (int(s) for s in B.shape)
+        if batch != batch2:
+            raise CudaError("bmm batch 不同: %s @ %s" % (A.shape, B.shape))
+        if K != K2:
+            raise CudaError("bmm K 不匹配: %s @ %s" % (A.shape, B.shape))
+        if batch == 0 or M == 0 or N == 0:
+            return self.empty((batch, M, N), dtype=np.float32)
+        if K == 0:
+            return self.zeros((batch, M, N), dtype=np.float32)
+        C = self.empty((batch, M, N), dtype=np.float32)
+        a_bytes = M * K * 4
+        b_bytes = K * N * 4
+        c_bytes = M * N * 4
+        for i in range(batch):
+            self._sgemm(
+                CUDA_OP_N, CUDA_OP_N, N, M, K,
+                B.ptr + i * b_bytes, N,
+                A.ptr + i * a_bytes, K,
+                C.ptr + i * c_bytes, N,
+            )
+        return C
+
+    def softmax_lastdim(self, x):
+        if len(x.shape) < 1:
+            raise CudaError("softmax 需要至少 1 维，收到 %s" % (x.shape,))
+        k = int(x.shape[-1])
+        if k <= 0:
+            raise CudaError("softmax 最后一维是 %d" % k)
+        rows = int(x.n) // k
+        out = self.empty(x.shape, dtype=np.float32)
+        if rows:
+            grid, block = self._ewise_grid(rows)
+            self.launch("softmax_lastdim", grid, block, [
+                self._ptr(x), self._ptr(out),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return out
+
+    def softmax_lastdim_bwd(self, g, y):
+        k = int(y.shape[-1])
+        rows = int(y.n) // k if k else 0
+        out = self.empty(y.shape, dtype=np.float32)
+        if rows and k:
+            grid, block = self._ewise_grid(rows)
+            self.launch("softmax_lastdim_bwd", grid, block, [
+                self._ptr(g), self._ptr(y), self._ptr(out),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
             ])
         return out
 

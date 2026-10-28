@@ -39,3 +39,38 @@ Windows `nvcuda.dll` 同时导出**旧 32 位 ABI** 的无后缀符号 `cuMemAll
 ## M2 · 逐算子 GPU 化（待做）
 
 判据：rmsnorm / silu_mul / moe_add / emb_gather / rope / cross_entropy 每个算子对 CPU 后端 < 1e-5。
+
+---
+
+## M3 · attention 子层接 CUDA ✅
+
+**判据**：三层 attention 堆叠的小模型，loss 与全部 17 个参数梯度对 CPU 后端 < 1e-4。
+
+**判分台**：`training/harness/train_layer_parity.py`（**已自证**：CPU vs CPU 17 项全 0）
+
+模型：`x[B=2,S=16,D=32] → Linear(32,32) → CausalSelfAttention(32,nh=4)` ×3 `→ Linear(32,V=8) → CE`
+
+**实测（2026-10-28，我在 4090 上用仓库版本独立复跑）**：
+
+| 项 | 结果 |
+|---|---|
+| loss 相对误差 | **0.000e+00** |
+| 最差参数项 | `attn2.q_proj.weight` **1.047e-06** |
+| 判定 | **ok=True**（判据 1e-4） |
+| 三个 `--selftest` | 仍全 0 |
+| M1 / M2 `--cuda` | 无回归（仍 ok=True） |
+| `test_train_api.py` A–H | 全 PASS |
+| import torch | **否** |
+
+### 一个重要的布局发现（影响 M5 的选择）
+
+CPU 后端的 head 拆分是 `reshape(B,S,H,Dh).reshape(B*H,S,Dh)`，即 **C 顺序重解释**，
+而仓库里的 attention kernel（flash / tiled / nop）要求的是**显式 `[seq, nh, dh]` 布局**，且 dh=64。
+两者**不可直接互换**（Dh=8 时 kernel 还会直接 return）。
+
+因此 M3 的 attention **没有调用**我们的 flash kernel，而是用与 CPU 同构的分解：
+已验收的 `cublasSgemm_v2` 组出 bmm（batch = B*H = 8）+ `softmax_lastdim`；
+反向用同一套 bmm 加 `y*(dy - sum(dy*y))`。
+
+**这不算退步**（数值对上、且全部在 GPU），但要记住：**想用 flash 前向，必须先做布局适配**
+（把 C 顺序的 head 拆分换成显式 permute）。这条留给 M5——真实模型 dh=64，那时 flash 才有意义。

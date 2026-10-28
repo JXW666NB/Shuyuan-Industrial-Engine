@@ -22,10 +22,17 @@ M2 CUDA（同一份公共 API，不改判分台）：
     * nn.Embedding（重复下标走 kernel 里的 atomicAdd）
     * 判分台用来反传的全归约 sum
 
+M3 CUDA（同一份 CausalSelfAttention 公式，不改判分台）：
+    * reshape（C 顺序重解释）、最后两维交换
+    * 3D matmul：按 batch 循环已验收的 cublasSgemm
+    * 可广播的 add（因果掩码）、最后一维 softmax
+    * 因此 nn.CausalSelfAttention 整层在 GPU 上
+
 尚未做：
-    * attention / MoE / AdamW / Muon 的 CUDA 路径
-    * 带 axis 的 sum、mean、pow、exp、下标
+    * MoE / AdamW / Muon 的 CUDA 路径
+    * mean、pow、exp、下标，以及公开的带 axis 的 sum
     * 默认重算（activation checkpoint）
+    * dh=64 的 flash / tiled attention kernel（判分台 Dh=8，那些 kernel 直接 return）
 """
 from __future__ import annotations
 
@@ -134,8 +141,7 @@ class Tensor:
 
     def _cpu_only(self, op):
         if self.device == "cuda":
-            raise NotImplementedError(
-                "CUDA 后端 M1 还没有 %s（已实现 matmul / transpose / cross_entropy）" % op)
+            raise NotImplementedError("CUDA 后端还没有 %s" % op)
 
     # ---- 属性 ----
     @property
@@ -209,7 +215,9 @@ class Tensor:
 
     # ---- 算子 ----
     def __add__(self, other):
-        self._cpu_only("add")
+        if self.device == "cuda" or (
+                isinstance(other, Tensor) and getattr(other, "device", None) == "cuda"):
+            return self._add_cuda(other)
         other = _as_tensor(other)
         out = Tensor(self.data + other.data,
                      requires_grad=(self.requires_grad or other.requires_grad),
@@ -239,6 +247,28 @@ class Tensor:
                 _acc(grads, self, _unbroadcast(g * other.data, self.shape))
             if other.requires_grad:
                 _acc(grads, other, _unbroadcast(g * self.data, other.shape))
+        out._backward = bw
+        return out
+
+    def _add_cuda(self, other):
+        if not isinstance(other, Tensor):
+            other = _as_tensor(other)
+        if self.device != "cuda" or other.device != "cuda":
+            raise RuntimeError("add 不能混用 CPU 和 CUDA 张量")
+        rt = _cuda()
+        buf = rt.add(self._gpu, other._gpu)
+        rg = self.requires_grad or other.requires_grad
+        out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
+        a_shape, b_shape = tuple(self.shape), tuple(other.shape)
+        out_shape = tuple(buf.shape)
+
+        def bw(g, grads):
+            if self.requires_grad:
+                src = g if a_shape == out_shape else rt.unbroadcast(g, a_shape)
+                _acc(grads, self, src)
+            if other.requires_grad:
+                src = g if b_shape == out_shape else rt.unbroadcast(g, b_shape)
+                _acc(grads, other, src)
         out._backward = bw
         return out
 
@@ -328,10 +358,26 @@ class Tensor:
                                   % (self.ndim, other.ndim))
 
     def _matmul_cuda(self, other):
-        if self.ndim != 2 or other.ndim != 2:
-            raise NotImplementedError("CUDA matmul 目前只支持 2D，收到 %dD x %dD"
-                                      % (self.ndim, other.ndim))
         rt = _cuda()
+        if self.ndim == 3 and other.ndim == 3:
+            if self.shape[0] != other.shape[0]:
+                raise ValueError("3D matmul 需要相同 batch: %s vs %s"
+                                 % (self.shape, other.shape))
+            buf = rt.bmm(self._gpu, other._gpu)
+            rg = self.requires_grad or other.requires_grad
+            out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
+            a, b = self._gpu, other._gpu
+
+            def bw(g, grads):
+                if self.requires_grad:
+                    _acc(grads, self, rt.bmm(g, rt.swap_last2(b)))
+                if other.requires_grad:
+                    _acc(grads, other, rt.bmm(rt.swap_last2(a), g))
+            out._backward = bw
+            return out
+        if self.ndim != 2 or other.ndim != 2:
+            raise NotImplementedError("CUDA matmul 目前只支持 2D/3D，收到 %dD x %dD"
+                                      % (self.ndim, other.ndim))
         buf = rt.sgemm(self._gpu, other._gpu)
         rg = self.requires_grad or other.requires_grad
         out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
@@ -404,12 +450,25 @@ class Tensor:
 
     def swap_last2(self):
         """交换最后两维（attention 里对 k 用）。"""
-        self._cpu_only("swap_last2")
+        if self.device == "cuda":
+            return self._swap_last2_cuda()
         out = Tensor(np.swapaxes(self.data, -1, -2),
                      requires_grad=self.requires_grad, _parents=(self,))
 
         def bw(g, grads):
             _acc(grads, self, np.swapaxes(g, -1, -2))
+        out._backward = bw
+        return out
+
+    def _swap_last2_cuda(self):
+        if self.ndim < 2:
+            raise NotImplementedError("swap_last2 至少要 2 维，收到 %dD" % self.ndim)
+        rt = _cuda()
+        buf = rt.swap_last2(self._gpu)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+
+        def bw(g, grads):
+            _acc(grads, self, rt.swap_last2(g))
         out._backward = bw
         return out
 
@@ -476,11 +535,24 @@ class Tensor:
     def reshape(self, *shape):
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
+        if self.device == "cuda":
+            return self._reshape_cuda(shape)
         out = Tensor(self.data.reshape(shape), requires_grad=self.requires_grad, _parents=(self,))
         old = self.shape
 
         def bw(g, grads):
             _acc(grads, self, g.reshape(old))
+        out._backward = bw
+        return out
+
+    def _reshape_cuda(self, shape):
+        rt = _cuda()
+        buf = rt.reshape(self._gpu, shape)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+        old = self.shape
+
+        def bw(g, grads):
+            _acc(grads, self, rt.reshape(g, old))
         out._backward = bw
         return out
 
@@ -574,6 +646,8 @@ class _Functional:
 
     @staticmethod
     def softmax(x: Tensor, axis=-1) -> Tensor:
+        if getattr(x, "device", "cpu") == "cuda":
+            return _softmax_cuda(x, axis)
         m = x.data.max(axis=axis, keepdims=True)
         z = x - Tensor(m)                     # 常数，不参与求导
         e = z.exp()
@@ -618,6 +692,23 @@ class _Functional:
 
 
 functional = _Functional()
+
+
+def _softmax_cuda(x, axis):
+    """最后一维 softmax。反向用 y*(dy - sum(dy*y))，和 CPU 那条 exp/sum 链在 fp32 上差 ~1e-7。"""
+    if axis != -1 and axis != x.ndim - 1:
+        raise NotImplementedError("CUDA softmax 目前只支持最后一维，收到 axis=%r" % (axis,))
+    if x.ndim < 1:
+        raise NotImplementedError("CUDA softmax 需要至少 1 维")
+    rt = _cuda()
+    y = rt.softmax_lastdim(x._gpu)
+    out = Tensor._from_gpu(y, requires_grad=x.requires_grad, _parents=(x,))
+
+    def bw(g, grads):
+        if x.requires_grad:
+            _acc(grads, x, rt.softmax_lastdim_bwd(g, y))
+    out._backward = bw
+    return out
 
 
 def _silu_cuda(x):
