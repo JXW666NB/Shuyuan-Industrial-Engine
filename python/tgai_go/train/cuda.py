@@ -1226,17 +1226,25 @@ def _preload(path):
         ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
 
 
-def _alias_driver_symbol(cu, name):
-    """优先 _v2。Windows 上不带后缀的是旧 32 位 ABI，缺 _v2 就报错。
+def _alias_driver_symbol(cu, name, require_v2=True):
+    """优先 _v2（64 位 ABI）。
 
-    Linux 驱动 610.57 上实测：cuMemAlloc 与 cuMemAlloc_v2 地址不同，
-    不带后缀的 cuMemAlloc 在 primary context 上返回 201。所以这里也优先 _v2。
-    只有 Linux 且库里根本没有 _v2 时，才退回不带后缀的符号。
+    cuMemAlloc / cuMemFree / cuMemcpy* 这一族在 Windows 的 nvcuda.dll 里同时导出旧符号和 _v2，
+    旧的仍是 32 位 CUdeviceptr ABI，拿到 primary context 会返回 201，所以**必须**用 _v2。
+
+    但 cuMemsetD32Async 这类**从来就没有 _v2**（它历史上不存在 ABI 变更）。
+    早先对所有符号一刀切要求 _v2，导致在 V100 / 驱动 580.88 上直接初始化失败：
+        CudaError: 驱动库没有 cuMemsetD32Async_v2
+    因此增加 require_v2 开关：没有 _v2 的符号按无后缀解析，缺了才报错。
     """
     v2 = getattr(cu, name + "_v2", None)
     if v2 is not None:
         setattr(cu, name, v2)
         return
+    if not require_v2:
+        if getattr(cu, name, None) is not None:
+            return
+        raise CudaError("驱动库没有 %s（该符号本无 _v2 变体）。" % name)
     if sys.platform != "win32" and getattr(cu, name, None) is not None:
         return
     raise CudaError(
@@ -1368,9 +1376,13 @@ class CudaRuntime:
         # cuMemFree / cuMemcpy* 仍是 32 位 CUdeviceptr ABI，拿到
         # cuDevicePrimaryCtxRetain 的 context 会直接返回
         # CUDA_ERROR_INVALID_CONTEXT (201)，尽管 cuCtxGetCurrent 对得上。
+        # 有 _v2 的（64 位 ABI 变更过，必须走 _v2）
         for name in ("cuMemAlloc", "cuMemFree", "cuMemcpyHtoD", "cuMemcpyDtoH", "cuMemcpyDtoD",
-                     "cuMemcpyHtoDAsync", "cuMemcpyDtoHAsync", "cuMemsetD32Async"):
+                     "cuMemcpyHtoDAsync", "cuMemcpyDtoHAsync"):
             _alias_driver_symbol(cu, name)
+        # 本来就没有 _v2 的（缺了就真报错，但不强制后缀）
+        for name in ("cuMemsetD32Async",):
+            _alias_driver_symbol(cu, name, require_v2=False)
         cu.cuInit.argtypes = [ctypes.c_uint]
         cu.cuInit.restype = ctypes.c_int
         cu.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
