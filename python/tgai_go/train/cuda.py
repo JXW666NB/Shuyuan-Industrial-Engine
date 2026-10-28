@@ -1026,6 +1026,9 @@ class CudaError(RuntimeError):
 # 已验收内核，不内嵌进主模块，避免宏/符号和现有源码撞车，也避免改默认编译结果。
 _ATTN_NOP_SMEM = 32 * 1024
 _ATTN_NOP_BQ = 64
+# attn_bwd_flash：Q/dO stride 72，K/V/P/dS 各 64*32。见 tgai_attn_nop.cu。
+_ATTN_FLASH_SMEM = 69632
+_ATTN_FLASH_MAX_SMEM = 96 * 1024
 
 
 def attn_nop_source_path():
@@ -3039,7 +3042,23 @@ class CudaRuntime:
         self._attn_mod = mod
         self._attn_fns = {}
         self._attn_nop_path = path
+        self._attn_flash_ready = False
         return mod
+
+    def _attn_set_dyn_smem(self, name, smem):
+        """4090 上超过 48KB 的动态 smem 必须先抬高上限，并偏向 shared carveout。"""
+        fn = self._fn_module(self._attn_mod, name)
+        cu = self.cu
+        if not hasattr(cu, "_fnattr_ready"):
+            cu.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            cu.cuFuncSetAttribute.restype = ctypes.c_int
+            cu._fnattr_ready = True
+        # 8 = CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+        # 9 = CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT（百分数）
+        self._chk(cu.cuFuncSetAttribute(fn, 8, int(smem)),
+                  "cuFuncSetAttribute(%s maxdyn)" % name)
+        self._chk(cu.cuFuncSetAttribute(fn, 9, 100),
+                  "cuFuncSetAttribute(%s carveout)" % name)
 
     def _attn_nop_launch(self, name, seq, nh, dh, args):
         """grid=(nh, ceil(seq/64), 1)，block=256，dynamic smem=32KB。
@@ -3056,6 +3075,24 @@ class CudaRuntime:
         self.launch(
             name, (int(nh), gy, 1), (256, 1, 1), args,
             shared=_ATTN_NOP_SMEM, module=self._attn_mod)
+
+    def _attn_flash_launch(self, name, seq, nh, dh, args):
+        """与 nop 同一网格（query 块 64），动态 smem 给 flash 反向。"""
+        if dh != 64:
+            raise CudaError("attn_flash 只接受 dh=64，收到 %d" % dh)
+        if seq < 0 or nh < 0:
+            raise CudaError("attn_flash 形状非法 seq=%d nh=%d" % (seq, nh))
+        if not self._attn_flash_ready:
+            self._attn_set_dyn_smem(name, _ATTN_FLASH_MAX_SMEM)
+            self._attn_flash_ready = True
+        gy = (int(seq) + _ATTN_NOP_BQ - 1) // _ATTN_NOP_BQ
+        if gy < 1:
+            gy = 1
+        if seq == 0 or nh == 0:
+            return
+        self.launch(
+            name, (int(nh), gy, 1), (256, 1, 1), args,
+            shared=_ATTN_FLASH_SMEM, module=self._attn_mod)
 
     def attn_nop_fwd(self, q, k, v, scale):
         """q,k,v 为 [seq, nh, dh] fp32。只写 O，不写 P。"""
@@ -3084,6 +3121,47 @@ class CudaRuntime:
         dv = self.zeros((seq, nh, dh), dtype=np.float32)
         self._attn_nop_launch("attn_bwd_recompute", seq, nh, dh, [
             self._ptr(do), self._ptr(q), self._ptr(k), self._ptr(v),
+            self._ptr(dq), self._ptr(dk), self._ptr(dv),
+            (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
+            (float(scale), ctypes.c_float),
+        ])
+        return dq, dk, dv
+
+    def attn_nop_fwd_stats(self, q, k, v, scale):
+        """同 attn_nop_fwd，额外写出每行 online-softmax 的 m、l，形状 [seq, nh]。"""
+        self.ensure_attn_nop()
+        if len(q.shape) != 3 or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape):
+            raise CudaError("attn_nop_fwd_stats 需要同形状 3D，收到 %s %s %s" % (q.shape, k.shape, v.shape))
+        seq, nh, dh = (int(x) for x in q.shape)
+        o = self.zeros((seq, nh, dh), dtype=np.float32)
+        m = self.empty((seq, nh), dtype=np.float32)
+        lse = self.empty((seq, nh), dtype=np.float32)
+        self._attn_nop_launch("attn_fwd_stats", seq, nh, dh, [
+            self._ptr(q), self._ptr(k), self._ptr(v), self._ptr(o),
+            self._ptr(m), self._ptr(lse),
+            (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
+            (float(scale), ctypes.c_float),
+        ])
+        return o, m, lse
+
+    def attn_nop_bwd_flash(self, do, q, k, v, o, m, lse, scale):
+        """标准 flash 反向。P 不落全局。m/l 来自 attn_nop_fwd_stats，O 用来算 D。"""
+        self.ensure_attn_nop()
+        if (len(do.shape) != 3 or tuple(do.shape) != tuple(q.shape)
+                or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape)
+                or tuple(o.shape) != tuple(q.shape)):
+            raise CudaError("attn_nop_bwd_flash 形状不一致: dO%s Q%s K%s V%s O%s" % (
+                do.shape, q.shape, k.shape, v.shape, o.shape))
+        seq, nh, dh = (int(x) for x in q.shape)
+        if tuple(m.shape) != (seq, nh) or tuple(lse.shape) != (seq, nh):
+            raise CudaError("attn_nop_bwd_flash 的 m/l 应为 [%d,%d]，收到 %s %s" % (
+                seq, nh, m.shape, lse.shape))
+        dq = self.zeros((seq, nh, dh), dtype=np.float32)
+        dk = self.zeros((seq, nh, dh), dtype=np.float32)
+        dv = self.zeros((seq, nh, dh), dtype=np.float32)
+        self._attn_flash_launch("attn_bwd_flash", seq, nh, dh, [
+            self._ptr(do), self._ptr(q), self._ptr(k), self._ptr(v), self._ptr(o),
+            self._ptr(m), self._ptr(lse),
             self._ptr(dq), self._ptr(dk), self._ptr(dv),
             (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
             (float(scale), ctypes.c_float),

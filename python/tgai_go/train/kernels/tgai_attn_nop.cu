@@ -6,11 +6,14 @@
 //   dynamic smem 32 KB
 //
 // attn_fwd_nop: online-softmax causal forward. Writes O only.
-// attn_bwd_recompute: does not read P. Recomputes softmax from Q,K
-//   (D = rowsum(dO * O) with O rebuilt in registers) and applies the
-//   standard backward: dS = P*(dP-D), dQ = scale*dS*K, dK = scale*dS^T*Q,
-//   dV = P^T*dO. Each block owns one query tile for dQ and the same-index
-//   key tile for dK/dV, so there are no atomics.
+// attn_bwd_recompute: legacy cubic recompute. Kept so older launches stay
+//   bitwise-identical; the lowmem training path does not call it anymore.
+// attn_fwd_stats: same math as attn_fwd_nop, also writes final per-row
+//   m[seq, nh] and l[seq, nh].
+// attn_bwd_flash: standard flash backward. Each query tile walks K/V once.
+//   dP = dO @ V^T, dS = P*(dP-D), D = rowsum(dO*O). P and dS stay in smem.
+//   dQ is owned by the query tile; dK/dV are atomicAdd across query tiles.
+//   Launch: grid (nh, ceil(seq/64), 1), block 256, dynamic smem 69632.
 
 #define BT 64
 #define DH 64
@@ -378,6 +381,295 @@ extern "C" __global__ void attn_fwd_nop(const float* __restrict__ Q, const float
     EPI(6, ax6, ay6, lx6);
     EPI(7, ax7, ay7, lx7);
 #undef EPI
+}
+
+// ---------------------------------------------------------------------------
+// Forward that also keeps the online-softmax row stats. O matches attn_fwd_nop.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void attn_fwd_stats(const float* __restrict__ Q, const float* __restrict__ K,
+                                          const float* __restrict__ V, float* __restrict__ O,
+                                          float* __restrict__ m_out, float* __restrict__ l_out,
+                                          int seq, int nh, int dh, float scale) {
+    const int h = (int)blockIdx.x;
+    const int t0 = (int)blockIdx.y * BT;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int row0 = warp * 8;
+    if (t0 >= seq || dh != DH) return;
+
+    float* smQ = smem;
+    float* smK = smem + 4096;
+    float* smV = smK + 64 * BC;
+
+    load_QT(Q, smQ, t0, h, nh, dh, tid, seq);
+    __syncthreads();
+
+    float sx0 = 0.f, sx1 = 0.f, sx2 = 0.f, sx3 = 0.f, sx4 = 0.f, sx5 = 0.f, sx6 = 0.f, sx7 = 0.f;
+    float mx0 = NEG, mx1 = NEG, mx2 = NEG, mx3 = NEG, mx4 = NEG, mx5 = NEG, mx6 = NEG, mx7 = NEG;
+    float lx0 = 0.f, lx1 = 0.f, lx2 = 0.f, lx3 = 0.f, lx4 = 0.f, lx5 = 0.f, lx6 = 0.f, lx7 = 0.f;
+    float ax0 = 0.f, ax1 = 0.f, ax2 = 0.f, ax3 = 0.f, ax4 = 0.f, ax5 = 0.f, ax6 = 0.f, ax7 = 0.f;
+    float ay0 = 0.f, ay1 = 0.f, ay2 = 0.f, ay3 = 0.f, ay4 = 0.f, ay5 = 0.f, ay6 = 0.f, ay7 = 0.f;
+
+    int k_end = t0 + BT;
+    if (k_end > seq) k_end = seq;
+    if (k_end > 0) {
+        load_KT(K, smK, 0, h, nh, dh, tid, seq);
+        load_V(V, smV, 0, h, nh, dh, tid, seq);
+        __syncthreads();
+    }
+#pragma unroll 1
+    for (int k0 = 0; k0 < k_end; k0 += BC) {
+        int next = k0 + BC;
+        float4 ka, kb, va, vb;
+        bool more = next < k_end;
+        if (more) {
+            fa_pref(K, next, h, nh, dh, tid, seq, ka, kb);
+            fa_pref(V, next, h, nh, dh, tid, seq, va, vb);
+            asm volatile("" ::: "memory");
+        }
+        if (k0 + BC <= t0)
+            fa_tile<true>(smQ, smK, smV, k0, t0, seq, scale, lane, row0,
+                          sx0, sx1, sx2, sx3, sx4, sx5, sx6, sx7,
+                          mx0, mx1, mx2, mx3, mx4, mx5, mx6, mx7,
+                          lx0, lx1, lx2, lx3, lx4, lx5, lx6, lx7,
+                          ax0, ax1, ax2, ax3, ax4, ax5, ax6, ax7,
+                          ay0, ay1, ay2, ay3, ay4, ay5, ay6, ay7);
+        else
+            fa_tile<false>(smQ, smK, smV, k0, t0, seq, scale, lane, row0,
+                           sx0, sx1, sx2, sx3, sx4, sx5, sx6, sx7,
+                           mx0, mx1, mx2, mx3, mx4, mx5, mx6, mx7,
+                           lx0, lx1, lx2, lx3, lx4, lx5, lx6, lx7,
+                           ax0, ax1, ax2, ax3, ax4, ax5, ax6, ax7,
+                           ay0, ay1, ay2, ay3, ay4, ay5, ay6, ay7);
+        if (more) {
+            fa_commit_KT(smK, tid, ka);
+            fa_commit_KT(smK, tid + 256, kb);
+            fa_commit_V(smV, tid, va);
+            fa_commit_V(smV, tid + 256, vb);
+            __syncthreads();
+        }
+    }
+
+#define EPI(i, xx, yy, ll)                                                       \
+    do {                                                                         \
+        int tr_ = t0 + row0 + (i);                                               \
+        if (tr_ < seq) {                                                         \
+            float inv_ = (ll > 0.f) ? (1.f / ll) : 0.f;                          \
+            float* orow_ = O + ((tr_ * nh + h) * dh);                            \
+            orow_[lane] = (xx) * inv_;                                           \
+            orow_[lane + 32] = (yy) * inv_;                                      \
+        }                                                                        \
+    } while (0)
+    EPI(0, ax0, ay0, lx0);
+    EPI(1, ax1, ay1, lx1);
+    EPI(2, ax2, ay2, lx2);
+    EPI(3, ax3, ay3, lx3);
+    EPI(4, ax4, ay4, lx4);
+    EPI(5, ax5, ay5, lx5);
+    EPI(6, ax6, ay6, lx6);
+    EPI(7, ax7, ay7, lx7);
+#undef EPI
+    if (lane == 0) {
+#define ST_ML(i, mx, lx)                                                         \
+        do {                                                                     \
+            int tr_ = t0 + row0 + (i);                                           \
+            if (tr_ < seq) {                                                     \
+                int mi_ = tr_ * nh + h;                                          \
+                m_out[mi_] = (mx);                                               \
+                l_out[mi_] = (lx);                                               \
+            }                                                                    \
+        } while (0)
+        ST_ML(0, mx0, lx0);
+        ST_ML(1, mx1, lx1);
+        ST_ML(2, mx2, lx2);
+        ST_ML(3, mx3, lx3);
+        ST_ML(4, mx4, lx4);
+        ST_ML(5, mx5, lx5);
+        ST_ML(6, mx6, lx6);
+        ST_ML(7, mx7, lx7);
+#undef ST_ML
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flash backward. Query tile is resident. Each K/V tile is visited once.
+// smem floats: Q 64*72, dO 64*72, K 64*32, V 64*32, P 64*32, dS 64*32 = 17408
+// = 69632 bytes. Q/dO stride 72 cuts the dK/dV smem bank conflicts.
+// ---------------------------------------------------------------------------
+
+#define QSTR 72
+
+__device__ __forceinline__ void load_T72(const float* __restrict__ src, float* __restrict__ dst,
+                                         int tok0, int h, int nh, int dh, int tid, int seq) {
+#pragma unroll 1
+    for (int e4 = tid; e4 < 1024; e4 += 256) {
+        int e = e4 << 2;
+        int local = e >> 6;
+        int d = e & 63;
+        int tok = tok0 + local;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (tok < seq)
+            v = *reinterpret_cast<const float4*>(src + ((tok * nh + h) * dh + d));
+        dst[(d + 0) * QSTR + local] = v.x;
+        dst[(d + 1) * QSTR + local] = v.y;
+        dst[(d + 2) * QSTR + local] = v.z;
+        dst[(d + 3) * QSTR + local] = v.w;
+    }
+}
+
+// Fused QK and dP. sx matches fa_tile's fma order so saved (m, l) rebuild P.
+__device__ __forceinline__ void flash_qk_dp(const float* __restrict__ smQ, const float* __restrict__ smDO,
+                                            const float* __restrict__ smK, const float* __restrict__ smV,
+                                            int row0, int lane, float sx[8], float dp[8]) {
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        sx[r] = 0.f;
+        dp[r] = 0.f;
+    }
+#pragma unroll 8
+    for (int d = 0; d < 64; ++d) {
+        float kv = smK[d * BC + lane];
+        float vv = smV[d * BC + lane];
+        float4 q0 = *reinterpret_cast<const float4*>(smQ + d * QSTR + row0);
+        float4 q1 = *reinterpret_cast<const float4*>(smQ + d * QSTR + row0 + 4);
+        float4 o0 = *reinterpret_cast<const float4*>(smDO + d * QSTR + row0);
+        float4 o1 = *reinterpret_cast<const float4*>(smDO + d * QSTR + row0 + 4);
+        sx[0] = fmaf(q0.x, kv, sx[0]); dp[0] = fmaf(o0.x, vv, dp[0]);
+        sx[1] = fmaf(q0.y, kv, sx[1]); dp[1] = fmaf(o0.y, vv, dp[1]);
+        sx[2] = fmaf(q0.z, kv, sx[2]); dp[2] = fmaf(o0.z, vv, dp[2]);
+        sx[3] = fmaf(q0.w, kv, sx[3]); dp[3] = fmaf(o0.w, vv, dp[3]);
+        sx[4] = fmaf(q1.x, kv, sx[4]); dp[4] = fmaf(o1.x, vv, dp[4]);
+        sx[5] = fmaf(q1.y, kv, sx[5]); dp[5] = fmaf(o1.y, vv, dp[5]);
+        sx[6] = fmaf(q1.z, kv, sx[6]); dp[6] = fmaf(o1.z, vv, dp[6]);
+        sx[7] = fmaf(q1.w, kv, sx[7]); dp[7] = fmaf(o1.w, vv, dp[7]);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 1)
+attn_bwd_flash(const float* __restrict__ dO, const float* __restrict__ Q,
+               const float* __restrict__ K, const float* __restrict__ V,
+               const float* __restrict__ O,
+               const float* __restrict__ m_in, const float* __restrict__ l_in,
+               float* __restrict__ dQ, float* __restrict__ dK, float* __restrict__ dV,
+               int seq, int nh, int dh, float scale) {
+    const int h = (int)blockIdx.x;
+    const int t0 = (int)blockIdx.y * BT;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int row0 = warp * 8;
+    if (t0 >= seq || dh != DH) return;
+
+    float* smQ = smem;
+    float* smDO = smQ + 64 * QSTR;
+    float* smK = smDO + 64 * QSTR;
+    float* smV = smK + 64 * BC;
+    float* smP = smV + 64 * BC;
+    float* smDS = smP + 64 * BC;
+
+    load_T72(Q, smQ, t0, h, nh, dh, tid, seq);
+    load_T72(dO, smDO, t0, h, nh, dh, tid, seq);
+    __syncthreads();
+
+    float m[8], l[8], D[8], dq0[8], dq1[8];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        int tr = t0 + row0 + r;
+        if (tr < seq) {
+            int mi = tr * nh + h;
+            m[r] = m_in[mi];
+            l[r] = l_in[mi];
+            float part = smDO[lane * QSTR + row0 + r] * O[qkv_at(tr, h, nh, dh) + lane]
+                       + smDO[(lane + 32) * QSTR + row0 + r] * O[qkv_at(tr, h, nh, dh) + lane + 32];
+            D[r] = warp_sum(part);
+        } else {
+            m[r] = NEG;
+            l[r] = 0.f;
+            D[r] = 0.f;
+        }
+        dq0[r] = 0.f;
+        dq1[r] = 0.f;
+    }
+
+    int k_end = t0 + BT;
+    if (k_end > seq) k_end = seq;
+    int ntiles = (k_end + BC - 1) / BC;
+    // Consecutive query tiles start on different K tiles so the atomic wave
+    // is not all hammering K tile 0 at once.
+    int phase = ntiles > 0 ? ((int)blockIdx.y % ntiles) : 0;
+#pragma unroll 1
+    for (int step = 0; step < ntiles; ++step) {
+        int k0 = ((phase + step) % ntiles) * BC;
+        load_KT(K, smK, k0, h, nh, dh, tid, seq);
+        load_KT(V, smV, k0, h, nh, dh, tid, seq);
+        __syncthreads();
+
+        float sx[8], dp[8];
+        flash_qk_dp(smQ, smDO, smK, smV, row0, lane, sx, dp);
+        bool tile_full = (k0 + BC <= t0);
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            sx[r] *= scale;
+            int tr = t0 + row0 + r;
+            int u = k0 + lane;
+            bool ok = (tr < seq) && (u < seq) && (tile_full || (u <= tr));
+            if (!ok) sx[r] = NEG;
+            float p = prob_of(sx[r], m[r], l[r]);
+            float ds = p * (dp[r] - D[r]);
+            smP[(row0 + r) * BC + lane] = p;
+            smDS[(row0 + r) * BC + lane] = ds;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            float g0 = 0.f, g1 = 0.f;
+            int q = row0 + r;
+#pragma unroll
+            for (int k = 0; k < BC; ++k) {
+                float s = smDS[q * BC + k];
+                g0 = fmaf(s, smK[lane * BC + k], g0);
+                g1 = fmaf(s, smK[(lane + 32) * BC + k], g1);
+            }
+            dq0[r] += g0;
+            dq1[r] += g1;
+        }
+
+#pragma unroll 1
+        for (int e = 0; e < 8; ++e) {
+            int idx = tid + e * 256;
+            int k = idx >> 6;
+            int d = idx & 63;
+            float ak = 0.f, av = 0.f;
+#pragma unroll 4
+            for (int q = 0; q < BT; ++q) {
+                float s = smDS[q * BC + k];
+                float p = smP[q * BC + k];
+                ak = fmaf(s, smQ[d * QSTR + q], ak);
+                av = fmaf(p, smDO[d * QSTR + q], av);
+            }
+            int tok = k0 + k;
+            if (tok < seq) {
+                float* dkrow = dK + qkv_at(tok, h, nh, dh);
+                float* dvrow = dV + qkv_at(tok, h, nh, dh);
+                atomicAdd(dkrow + d, scale * ak);
+                atomicAdd(dvrow + d, av);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        int tr = t0 + row0 + r;
+        if (tr < seq) {
+            float* rowp = dQ + qkv_at(tr, h, nh, dh);
+            rowp[lane] = scale * dq0[r];
+            rowp[lane + 32] = scale * dq1[r];
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

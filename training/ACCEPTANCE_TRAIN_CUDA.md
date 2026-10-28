@@ -458,3 +458,33 @@ cached 上限 12 GiB、超 2 GiB 触发"只释放已完成块"的回收；`empty
 
 **判定**：M4 通过。端到端 `<1e-7` 那条原始判据经实测证明**不可达**
 （等价于要求两条 float32 前向一致到 3e-9），已在本档中更正说明。
+
+---
+
+## 长上下文 kernel 优化：flash 式反向（seq=8192 1.037 s → 0.354 s）
+
+**问题**：原来的 `attn_bwd_recompute` 对每个 K 块都要把"后面所有 Q 行"的整段 softmax 重算一次，
+seq 越大浪费越大 —— seq=8192 时单步 1.037 s（PyTorch 0.189 s，5.5× 落后）。
+
+**改法**（Grok 实现）：
+- 前向换 `attn_fwd_stats`：同一套 online softmax，额外记下每行的 `m`、`l`（seq=8192/nh=16 约 1 MiB）
+- 反向换 `attn_bwd_flash`：**每个 Q 块只扫一遍 K/V 块**，`dP = dO @ Vᵀ`、`dS = P*(dP - D)`、`D = rowsum(dO*O)`；
+  P 与 dS **只留在 shared memory**；dQ 由该 Q 块独占写回，dK/dV 跨 Q 块 `atomicAdd`
+- 动态 smem 32 KB → 69632 B；旧 `attn_bwd_recompute` 保留在文件里但训练路径不再调用
+
+**实测（我在 4090 上用仓库版本独立复跑）**：
+
+| 配置 | 改前 | 改后 | PyTorch | 差距变化 |
+|---|---|---|---|---|
+| **seq=8192 / 1 层** | 1.037 s | **0.354 s** | 0.189 s | 5.5× → **1.87×** |
+| seq=2048 / 1 层 | 0.116 s | **0.106 s** | 0.104 s | 1.12× → **1.02×** |
+| seq=8192 峰值显存 | 14.17 GiB | **15.89 GiB**（nvidia-smi 采样，含池驻留） | 7.10 GB | — |
+
+> 显存口径说明：Grok 报告 13.84 GiB（运行时内部统计），我用 `nvidia-smi` 轮询整个进程得到 15.89 GiB。
+> **两个数都真实**，差别是"是否包含显存池的驻留块"。跑长上下文建议按 16 GiB 预算。
+
+**数值与回归（全部我复验）**：
+- `attn_lowmem_check`：dh=64 三组 PASS（最差 **6.503e-07**）； dh=32 / 非 causal 两条回退**逐位 0.000e+00**
+- loss 曲线与改前**完全一致**（10.5505 → 7.3241 → 5.6401），说明只改了执行方式、没动数学
+- `pytorch_conformance --cuda` 11/11；四 `--selftest` 全 0；`moe_selfcheck` 1.716e-07；
+  `opt_step_parity --cuda` AdamW/Muon 均逐位 0

@@ -1903,7 +1903,8 @@ def _sdpa_lowmem(q, k, v, scale):
     """[BH, S, Dh] -> 显式 permute 成 [S, BH, Dh] 再调内核，结果 permute 回来。
 
     B=1 时 BH 就是 H，布局正好是内核要的 [S, H, Dh]。B>1 时各头本来就不互相看，
-    把 BH 当成 nh 同样成立。反向不读 P，由 attn_bwd_recompute 重算。
+    把 BH 当成 nh 同样成立。反向不读 P：前向记下每行 m/l，attn_bwd_flash 每个
+    Q 块只扫一遍 K/V。
     """
     rt = _cuda()
     rt.ensure_attn_nop()
@@ -1911,7 +1912,7 @@ def _sdpa_lowmem(q, k, v, scale):
     q_sk = rt.permute(q._gpu, (1, 0, 2))
     k_sk = rt.permute(k._gpu, (1, 0, 2))
     v_sk = rt.permute(v._gpu, (1, 0, 2))
-    o_sk = rt.attn_nop_fwd(q_sk, k_sk, v_sk, scale)
+    o_sk, m_sk, l_sk = rt.attn_nop_fwd_stats(q_sk, k_sk, v_sk, scale)
     o_hs = rt.permute(o_sk, (1, 0, 2))
     need = bool(q.requires_grad or k.requires_grad or v.requires_grad)
     out = Tensor._from_gpu(o_hs, requires_grad=need, _parents=(q, k, v) if need else ())
@@ -1920,7 +1921,8 @@ def _sdpa_lowmem(q, k, v, scale):
 
     def bw(g, grads):
         g_sk = rt.permute(g, (1, 0, 2))
-        dq_sk, dk_sk, dv_sk = rt.attn_nop_bwd(g_sk, q_sk, k_sk, v_sk, scale)
+        dq_sk, dk_sk, dv_sk = rt.attn_nop_bwd_flash(
+            g_sk, q_sk, k_sk, v_sk, o_sk, m_sk, l_sk, scale)
         if q.requires_grad:
             _acc(grads, q, rt.permute(dq_sk, (1, 0, 2)))
         if k.requires_grad:
