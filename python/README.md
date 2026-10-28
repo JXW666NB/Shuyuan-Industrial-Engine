@@ -22,6 +22,72 @@ print(m.generate("什么是机器学习？", max_tokens=128))
 | **配置随模型走** | `.TG` 可内嵌对话模板（九标记 / ChatML / 纯文本），库自动读取 |
 | **流式输出** | `for chunk in m.stream(...)` 逐段拿文本 |
 | **CPU 友好** | 不需要独显；核显机器、笔记本、服务器都能跑 |
+| **可训练** | `tgai_go.train` 提供 CUDA 训练后端，**不依赖 PyTorch**，常用写法只改 `import` 即可迁移（见下） |
+
+---
+
+## 训练（CUDA 后端，1.4.0 起）
+
+从 1.4.0 开始，本库不止能推理，还能**训练**：`tgai_go.train` 是一个自研的自动微分 + CUDA 后端，
+显存、cuBLAS、NVRTC 全部由本包直接驱动，**不引入 PyTorch**。
+
+### 安装
+
+```bash
+pip install tgai-go              # 推理 + CPU 训练
+pip install "tgai-go[cuda]"      # 追加 CUDA 训练的运行时（cuBLAS / NVRTC）
+```
+
+> **Linux 必看**：`/usr/lib` 里通常**没有** cuBLAS，必须装 `[cuda]` extra（它拉
+> `nvidia-cublas-cu12` + `nvidia-cuda-nvrtc-cu12`）。不装时推理不受影响，只会在初始化
+> CUDA 训练后端时报 `找不到 libcublas.so.12`。
+> **实测**：干净 venv 里 `pip install "tgai-go[cuda]"` 后，11/11 迁移一致性用例全过（无 PyTorch、无 PYTHONPATH）。
+
+### 只改 import 即可迁移
+
+```python
+# 原来
+import torch
+import torch.nn as nn
+# 迁移后 —— 只改这一行，其余代码不动
+import tgai_go.train as torch
+import tgai_go.train as nn           # nn 也在这个名字空间里
+m = nn.Sequential(nn.Linear(16, 32), nn.Linear(32, 4))
+x = torch.randn(8, 16)
+y = m(x)
+loss = torch.nn.functional.cross_entropy(y, targets)
+opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
+opt.zero_grad(); loss.backward(); opt.step()
+```
+
+仓库里的 `training/harness/pytorch_conformance.py` 用 **11 段标准 PyTorch 写法**做了回归，
+**CPU 与 CUDA 两个后端都是 11/11 通过**。
+
+### 实测（RTX 4090 单卡，2026-10）
+
+| 场景 | 对比 PyTorch | 备注 |
+|---|---|---|
+| seq=2048 / MoE（E=8 top-2, 138.4M） | **0.116 s vs 0.104 s（1.12×）** | 短上下文已接近追平 |
+| seq=4096 / 4 层 MoE（453.0M） | 1.034 s vs 0.181 s（5.7×） | 长上下文差距在 attention 重算 |
+| seq=8192 / 1 层 MoE（138.4M） | 0.987 s vs 0.189 s（5.2×） | 峰值 14.2 GiB（PyTorch 7.1 GB） |
+
+过拟合验证：4 层 / 453.0M 的 V2.7 形状 MoE，40 步 loss **10.47 → 1.51**（PyTorch 同配置 10.45 → 1.80）。
+
+### 已支持 / 边界（重要）
+
+| 项 | 状态 |
+|---|---|
+| `nn.Linear / Embedding / RMSNorm / CausalSelfAttention / Sequential` | ✅ |
+| **`nn.MoE`**（`top_k` 可配，`gate="softmax"` 或 `"sigmoid"`） | ✅ 参数名与 `.TG` 对齐，便于直出 |
+| `optim.AdamW`（GPU 上更新） | ✅ 与 CPU 后端相对误差 **9.1e-08** |
+| `optim.Muon` | ⚠️ 相对误差 **7.0e-07**（跨 BLAS 累加顺序差异，未达 1e-7 的内部判据） |
+| 长上下文 `functional.scaled_dot_product_attention(..., lowmem=True)` | ✅ 不物化 P，seq=8192 可跑 |
+| dtype | 仅 `float32` / `int64`（**暂无 bf16/fp16 训练**） |
+| `torch.save/load` | 不是 torch 的 zip 格式（用 `state_dict` + `numpy.save`） |
+| 比较运算 `>` `<` | 未实现 |
+
+> **口径**：11/11 证明的是"这 11 种常用写法可以零改动迁移"，**不等于**任意 PyTorch 代码都能跑。
+> 边界见上表，遇到不支持的地方会明确抛异常，不会静默算错。
 
 ---
 

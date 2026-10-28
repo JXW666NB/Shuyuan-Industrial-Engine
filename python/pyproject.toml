@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tgai-go"
-version = "1.3.0"
+version = "1.4.0"
 description = "TGAI GO —— 纯 Python 的 TGAI 模型推理库（CPU 引擎，零编译安装）"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -34,6 +34,13 @@ dependencies = [
 tokenizer = ["tokenizers>=0.15"]
 # 开发/测试
 dev = ["pytest>=7"]
+# ★ 训练后端的 CUDA 运行库（Linux 上 pip 装完即可用；Windows 用系统或 CUDA toolkit 里的 DLL）
+#   不装这两个包时推理照常工作，只有 tgai_go.train 的 CUDA 后端会报
+#   "找不到 libcublas.so.12"。实测：/usr/lib 里通常没有 cuBLAS，必须靠这两个 wheel。
+cuda = [
+    "nvidia-cublas-cu12>=12.1",
+    "nvidia-cuda-nvrtc-cu12>=12.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/JXW666NB/TGAI-GO"
@@ -54,7 +61,7 @@ tgai-go = "tgai_go.__main__:main"
 #     -> Package would be ignored
 #   虽然实测 DLL 仍被打进 wheel（靠 package-data），但该警告属"配置含糊"，
 #   随时可能在某个 setuptools 版本变成真的丢文件。显式列出最稳。
-packages = ["tgai_go", "tgai_go._native"]
+packages = ["tgai_go", "tgai_go._native", "tgai_go.train"]
 include-package-data = true
 zip-safe = false
 
@@ -67,7 +74,12 @@ zip-safe = false
 [tool.setuptools.package-data]
 # ★ 原生引擎随包分发：用户 pip install 后无需编译
 #   文件名由 build_wheel.py 按平台放置
-"tgai_go" = ["_native/*.dll", "_native/*.so", "_native/*.dylib", "_native/README.md"]
+"tgai_go" = [
+    "_native/*.dll", "_native/*.so", "_native/*.dylib", "_native/README.md",
+    # ★ 训练后端的长上下文 attention 源码：运行时由 NVRTC 编译，必须随包分发
+    #   否则 pip 安装后 lowmem=True 会找不到 tgai_attn_nop.cu
+    "train/kernels/*.cu",
+]
 
 [tool.setuptools.exclude-package-data]
 "*" = ["*.pyc", "__pycache__/*", "*.c", "*.obj", "*.lib", "*.exp"]

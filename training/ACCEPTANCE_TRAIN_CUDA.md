@@ -358,3 +358,40 @@ cached 上限 12 GiB、超 2 GiB 触发"只释放已完成块"的回收；`empty
 **结论**：短上下文已经追到 1.1×；**一旦上长上下文，差距放大到 5×+**，
 根因是 lowmem 路径要重算 attention（vs PyTorch 的 flash），且我们的重算 kernel 效率不如 flash。
 **下一步优化应该集中在长上下文 attention kernel**，而不是继续压 Python 编排（那块已经基本到位）。
+
+---
+
+## M8 · 打包交付（v1.4.0）✅ 安装态实测通过
+
+**做法**
+- `tgai_go/train/` 里的 kernel 全部以**字符串内嵌**在 `cuda.py`（`_M2/_M3/_M5/_MOE_KERNELS`），
+  NVRTC 直接吃，所以**不需要额外编译**；唯一的外部源文件 `tgai_attn_nop.cu` 复制进
+  `tgai_go/train/kernels/` 并写进 `package-data`。
+- `attn_nop_source_path()` 改为**优先包内路径**，并删掉了原先写死的开发机路径
+  `/home/featurize/tgai/...`（否则用户机器上必然找不到）。
+- 版本 1.3.0 → **1.4.0**；新增 `[cuda]` extra（`nvidia-cublas-cu12` + `nvidia-cuda-nvrtc-cu12`）。
+- README 增加「训练（CUDA 后端）」整节：迁移写法、实测数据、**已支持/边界表**。
+
+**复验中抓到的两个真问题（都会让 1.4.0 直接废掉）**
+
+| # | 问题 | 后果 | 修法 |
+|---|---|---|---|
+| 1 | `pyproject.toml` 的 `packages` 只列了 `tgai_go` 和 `tgai_go._native`，**没有 `tgai_go.train`** | wheel 里 `train/__init__.py`、`cuda.py` 全丢，`import tgai_go.train` 得到空命名空间 | `packages` 加入 `tgai_go.train` |
+| 2 | Linux 上只搜 `/usr/lib/x86_64-linux-gnu` 和 `/usr/lib64`，而那里**没有 cuBLAS** | 干净 venv 装好后立刻报 `找不到 libcublas.so.12` | 新增 `[cuda]` extra；README 明确写「Linux 必须装」 |
+
+**安装态实测（两个环境，都不带 PYTHONPATH）**
+
+| 环境 | 测试 | 结果 |
+|---|---|---|
+| 本机 Windows venv（纯 CPU） | `pytorch_conformance` | **11/11 PASS** |
+| 本机 Windows venv（纯 CPU） | 真训 20 步（Linear→CE→AdamW） | loss **1.7149 → 0.8351**，参数确实更新 |
+| 云端 4090 venv + `[cuda]` | `pytorch_conformance --cuda` | **11/11 PASS**（无 torch、无 PYTHONPATH） |
+| 云端 4090 venv | 包内 `.cu` 定位 | `site-packages/tgai_go/train/kernels/tgai_attn_nop.cu` ✓ |
+
+**产物**：`tgai_go-1.4.0-py3-none-any.whl`（**831,971 B**）/ `.tar.gz`（837,334 B）；
+`twine check` 双 PASS；元数据 `Requires-Dist` **只有 `numpy`**（无 torch），`Provides-Extra: cuda`。
+
+**遗留（记录在案，不影响发布）**
+- `nn.Sequential` **不支持下标**（`m[0]`），PyTorch 支持 —— 属于 11 个用例之外的兼容缺口
+- `Muon` 相对误差 7.0e-07（未达内部 1e-7 判据，跨 BLAS 累加顺序差异）
+- dtype 仅 float32/int64；`torch.save` 格式不支持；比较运算未实现

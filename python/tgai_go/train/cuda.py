@@ -1035,9 +1035,11 @@ def attn_nop_source_path():
     cands = []
     if env:
         cands.append(env)
+    # ① 包内自带（pip 安装后的正常位置）
+    cands.append(os.path.join(here, "kernels", "tgai_attn_nop.cu"))
+    # ② 源码树（开发时从仓库根运行）
     cands.append(os.path.normpath(os.path.join(
         here, "..", "..", "..", "training", "kernels", "tgai_attn_nop.cu")))
-    cands.append("/home/featurize/tgai/training/kernels/tgai_attn_nop.cu")
     seen = []
     for p in cands:
         if not p:
