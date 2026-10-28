@@ -1911,15 +1911,17 @@ def _cross_entropy_cuda(logits, target, ignore_index):
     if np.any((tgt < 0) | (tgt >= v)):
         raise ValueError("cross_entropy 目标越界，合法范围是 [0, %d)" % v)
     rt = _cuda()
-    tgt_buf = rt.h2d(tgt, dtype=np.int32)
+    tgt_buf = rt.h2d(tgt, dtype=np.int32, cache_slot="ce_tgt")
     loss_buf = rt.ce_fwd(logits._gpu, tgt_buf, n, v)
     out = Tensor._from_gpu(loss_buf, requires_grad=logits.requires_grad, _parents=(logits,))
 
     def bw(g, grads):
         if not logits.requires_grad:
             return
-        dl = rt.ce_bwd(logits._gpu, tgt_buf, n, v)
+        # 根梯度几乎总是主机填好的 1。先读已知值，再发射 ce_bwd，
+        # 这样就算真要回读，也不会把 ce_bwd 自己等进去。
         scale = rt.read_scalar(g)
+        dl = rt.ce_bwd(logits._gpu, tgt_buf, n, v)
         if scale != 1.0:
             dl = rt.scale(dl, scale)
         _acc(grads, logits, dl)
@@ -2057,7 +2059,7 @@ class Embedding(Module):
         if flat.size and ((flat < 0) | (flat >= vocab)).any():
             raise IndexError("Embedding 下标越界，合法范围是 [0, %d)" % vocab)
         seq = int(flat.shape[0])
-        ids = rt.h2d(flat.astype(np.int32), dtype=np.int32)
+        ids = rt.h2d(flat.astype(np.int32), dtype=np.int32, cache_slot="emb_ids")
         out_shape = tuple(int(s) for s in idx.shape) + (d,)
         y = rt.emb_fwd(self.weight._gpu, ids, seq, d, vocab, out_shape)
         w = self.weight

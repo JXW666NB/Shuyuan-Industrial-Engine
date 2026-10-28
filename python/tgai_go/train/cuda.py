@@ -38,53 +38,104 @@ _CE_AND_HELPERS = r"""
 __device__ float exp32_bits(float x);
 __device__ float log32_bits(float x);
 
-__device__ float ce_row_max(const float* row, int V) {
-    float m = row[0];
-    for (int j = 1; j < V; ++j) {
-        m = fmaxf(m, row[j]);
+/* 一行一个 block、块内 256 线程。发射端必须用这个块大小。
+ * 每线程扫一段连续列，块内再按线程号左折叠。V<=256 时每段至多一个元素，
+ * 和原来的单线程左折叠逐位相同。exp32 / log32 / __fadd_rn 不换。
+ * sm 由 kernel 的 __shared__ 传入；归约函数末尾再栅栏一次，避免下一次复用 sm 时读穿。
+ */
+__device__ float ce_red_max(float v, float* sm) {
+    sm[threadIdx.x] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = sm[0];
+        for (int i = 1; i < 256; ++i) m = fmaxf(m, sm[i]);
+        sm[0] = m;
     }
-    return m;
+    __syncthreads();
+    float out = sm[0];
+    __syncthreads();
+    return out;
 }
 
-__device__ float ce_row_sumexp(const float* row, int V, float m) {
-    float sum = 0.0f;
-    for (int j = 0; j < V; ++j) {
+__device__ float ce_red_sum(float v, float* sm) {
+    sm[threadIdx.x] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < 256; ++i) s = __fadd_rn(s, sm[i]);
+        sm[0] = s;
+    }
+    __syncthreads();
+    float out = sm[0];
+    __syncthreads();
+    return out;
+}
+
+__device__ void ce_chunk_range(int V, int* begin_out, int* end_out) {
+    const int tid = (int)threadIdx.x;
+    const int chunk = (V + 255) >> 8;
+    int begin = tid * chunk;
+    int end = begin + chunk;
+    if (begin > V) begin = V;
+    if (end > V) end = V;
+    *begin_out = begin;
+    *end_out = end;
+}
+
+__device__ void ce_row_stats(const float* row, int V, float* sm, float* m_out, float* sum_out) {
+    int begin, end;
+    ce_chunk_range(V, &begin, &end);
+    float m = __int_as_float(0xff800000u);
+    for (int j = begin; j < end; ++j) m = fmaxf(m, row[j]);
+    m = ce_red_max(m, sm);
+    float s = 0.0f;
+    for (int j = begin; j < end; ++j) {
         float e = exp32_bits(__fsub_rn(row[j], m));
-        sum = __fadd_rn(sum, e);
+        s = __fadd_rn(s, e);
     }
-    return sum;
+    s = ce_red_sum(s, sm);
+    *m_out = m;
+    *sum_out = s;
 }
 
-extern "C" __global__ void ce_fwd(const float* logits, const int* targets, float* loss,
+extern "C" __global__ void ce_fwd_rows(const float* logits, const int* targets, float* terms,
                                   int N, int V) {
-    float acc = 0.0f;
-    for (int i = 0; i < N; ++i) {
-        const float* row = logits + static_cast<long long>(i) * V;
-        const float m = ce_row_max(row, V);
-        const float sum = ce_row_sumexp(row, V, m);
+    __shared__ float sm[256];
+    const int i = (int)blockIdx.x;
+    const float* row = logits + static_cast<long long>(i) * (long long)V;
+    float m, sum;
+    ce_row_stats(row, V, sm, &m, &sum);
+    if (threadIdx.x == 0) {
         const int t = targets[i];
-        float term = __fsub_rn(__fadd_rn(m, log32_bits(sum)), row[t]);
-        acc = __fadd_rn(acc, term);
+        terms[i] = __fsub_rn(__fadd_rn(m, log32_bits(sum)), row[t]);
     }
+}
+
+extern "C" __global__ void ce_fwd_mean(const float* terms, float* loss, int N) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    float acc = 0.0f;
+    for (int i = 0; i < N; ++i) acc = __fadd_rn(acc, terms[i]);
     loss[0] = __fdiv_rn(acc, static_cast<float>(N));
 }
 
 extern "C" __global__ void ce_bwd(const float* logits, const int* targets, float* dlogits,
                                   int N, int V) {
+    __shared__ float sm[256];
+    const int i = (int)blockIdx.x;
+    const float* row = logits + static_cast<long long>(i) * (long long)V;
+    float* grow = dlogits + static_cast<long long>(i) * (long long)V;
+    float m, sum;
+    ce_row_stats(row, V, sm, &m, &sum);
+    const float inv_sum = __fdiv_rn(1.0f, sum);
     const float inv_n = __fdiv_rn(1.0f, static_cast<float>(N));
-    for (int i = 0; i < N; ++i) {
-        const float* row = logits + static_cast<long long>(i) * V;
-        float* grow = dlogits + static_cast<long long>(i) * V;
-        const float m = ce_row_max(row, V);
-        const float sum = ce_row_sumexp(row, V, m);
-        const float inv_sum = __fdiv_rn(1.0f, sum);
-        const int t = targets[i];
-        for (int j = 0; j < V; ++j) {
-            float e = exp32_bits(__fsub_rn(row[j], m));
-            float p = __fmul_rn(e, inv_sum);
-            if (j == t) p = __fsub_rn(p, 1.0f);
-            grow[j] = __fmul_rn(p, inv_n);
-        }
+    const int t = targets[i];
+    int begin, end;
+    ce_chunk_range(V, &begin, &end);
+    for (int j = begin; j < end; ++j) {
+        float e = exp32_bits(__fsub_rn(row[j], m));
+        float p = __fmul_rn(e, inv_sum);
+        if (j == t) p = __fsub_rn(p, 1.0f);
+        grow[j] = __fmul_rn(p, inv_n);
     }
 }
 
@@ -823,7 +874,8 @@ class CudaError(RuntimeError):
 class GpuBuf:
     """一块设备内存。由创建它的 CudaRuntime 释放。不要复制 ptr 到第二个 GpuBuf。"""
 
-    __slots__ = ("rt", "ptr", "nbytes", "shape", "n", "dtype")
+    __slots__ = ("rt", "ptr", "nbytes", "shape", "n", "dtype",
+                 "known_scalar", "host_hold", "keepalive")
 
     def __init__(self, rt, ptr, nbytes, shape, n, dtype):
         self.rt = rt
@@ -832,6 +884,12 @@ class GpuBuf:
         self.shape = tuple(shape)
         self.n = int(n)
         self.dtype = np.dtype(dtype)
+        # 主机已经知道的标量（例如 backward() 填的 1）。读它不必再同步设备。
+        self.known_scalar = None
+        # 异步 H2D 期间主机缓冲必须活着。
+        self.host_hold = None
+        # 让还没跑完的 kernel 依赖的临时缓冲跟着本缓冲一起活。
+        self.keepalive = None
 
     def __del__(self):
         ptr = getattr(self, "ptr", 0)
@@ -1008,6 +1066,7 @@ class CudaRuntime:
         self.mod = None
         self._fns = {}
         self._dirs = []
+        self._h2d_cache = {}
 
     def ensure(self):
         if self.cu is None:
@@ -1066,7 +1125,8 @@ class CudaRuntime:
         # cuMemFree / cuMemcpy* 仍是 32 位 CUdeviceptr ABI，拿到
         # cuDevicePrimaryCtxRetain 的 context 会直接返回
         # CUDA_ERROR_INVALID_CONTEXT (201)，尽管 cuCtxGetCurrent 对得上。
-        for name in ("cuMemAlloc", "cuMemFree", "cuMemcpyHtoD", "cuMemcpyDtoH", "cuMemcpyDtoD"):
+        for name in ("cuMemAlloc", "cuMemFree", "cuMemcpyHtoD", "cuMemcpyDtoH", "cuMemcpyDtoD",
+                     "cuMemcpyHtoDAsync", "cuMemcpyDtoHAsync", "cuMemsetD32Async"):
             _alias_driver_symbol(cu, name)
         cu.cuInit.argtypes = [ctypes.c_uint]
         cu.cuInit.restype = ctypes.c_int
@@ -1090,6 +1150,14 @@ class CudaRuntime:
         cu.cuMemcpyDtoH.restype = ctypes.c_int
         cu.cuMemcpyDtoD.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_size_t]
         cu.cuMemcpyDtoD.restype = ctypes.c_int
+        cu.cuMemcpyHtoDAsync.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        cu.cuMemcpyHtoDAsync.restype = ctypes.c_int
+        cu.cuMemcpyDtoHAsync.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_void_p]
+        cu.cuMemcpyDtoHAsync.restype = ctypes.c_int
+        cu.cuMemsetD32Async.argtypes = [ctypes.c_uint64, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p]
+        cu.cuMemsetD32Async.restype = ctypes.c_int
+        cu.cuStreamSynchronize.argtypes = [ctypes.c_void_p]
+        cu.cuStreamSynchronize.restype = ctypes.c_int
         cu.cuModuleLoadData.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
         cu.cuModuleLoadData.restype = ctypes.c_int
         cu.cuModuleGetFunction.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p]
@@ -1367,25 +1435,54 @@ class CudaRuntime:
         ptr = self._alloc(nbytes)
         return GpuBuf(self, ptr, nbytes, shape, n, dt)
 
-    def h2d(self, arr, dtype=np.float32):
-        arr = np.ascontiguousarray(np.asarray(arr), dtype=dtype)
-        buf = self.empty(arr.shape, dtype=dtype)
-        if arr.nbytes:
-            self._chk(self.cu.cuMemcpyHtoD(
+    def _memset32(self, buf, word):
+        """按 32 位字填充。走默认流的异步 memset，不把前面的 kernel 同步回来。"""
+        n = int(buf.n)
+        if n <= 0:
+            return
+        self._activate()
+        self._chk(self.cu.cuMemsetD32Async(
+            ctypes.c_uint64(buf.ptr),
+            ctypes.c_uint(int(word) & 0xFFFFFFFF),
+            ctypes.c_size_t(n),
+            ctypes.c_void_p(0)), "cuMemsetD32Async")
+
+    def h2d(self, arr, dtype=np.float32, cache_slot=None):
+        """异步 H2D。cache_slot 命中时复用上一份设备缓冲，避免每步重传小索引。"""
+        src = np.ascontiguousarray(np.asarray(arr), dtype=dtype)
+        if cache_slot:
+            key = (src.shape, src.dtype.str, src.tobytes())
+            hit = self._h2d_cache.get(cache_slot)
+            if hit is not None and hit[0] == key:
+                return hit[1]
+        buf = self.empty(src.shape, dtype=dtype)
+        if src.nbytes:
+            # 调用方的数组可能马上被改掉，异步拷贝必须抓住自己的一份。
+            hold = np.array(src, copy=True, order="C")
+            self._activate()
+            self._chk(self.cu.cuMemcpyHtoDAsync(
                 ctypes.c_uint64(buf.ptr),
-                arr.ctypes.data_as(ctypes.c_void_p),
-                ctypes.c_size_t(int(arr.nbytes))), "cuMemcpyHtoD")
+                hold.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_size_t(int(hold.nbytes)),
+                ctypes.c_void_p(0)), "cuMemcpyHtoDAsync")
+            buf.host_hold = hold
+        if buf.n == 1 and np.issubdtype(buf.dtype, np.floating):
+            buf.known_scalar = float(src.reshape(-1)[0])
+        if cache_slot:
+            self._h2d_cache[cache_slot] = ((src.shape, src.dtype.str, src.tobytes()), buf)
         return buf
 
     def d2h(self, buf):
+        """只同步默认流。拷贝排在这条流已有工作之后，不再先 cuCtxSynchronize 整颗设备。"""
         self._activate()
         out = np.empty(buf.shape, dtype=buf.dtype)
         if buf.n:
-            self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize")
-            self._chk(self.cu.cuMemcpyDtoH(
+            self._chk(self.cu.cuMemcpyDtoHAsync(
                 out.ctypes.data_as(ctypes.c_void_p),
                 ctypes.c_uint64(buf.ptr),
-                ctypes.c_size_t(int(out.nbytes))), "cuMemcpyDtoH")
+                ctypes.c_size_t(int(out.nbytes)),
+                ctypes.c_void_p(0)), "cuMemcpyDtoHAsync")
+            self._chk(self.cu.cuStreamSynchronize(ctypes.c_void_p(0)), "cuStreamSynchronize")
         return out
 
     def clone(self, buf):
@@ -1395,15 +1492,26 @@ class CudaRuntime:
                 ctypes.c_uint64(out.ptr),
                 ctypes.c_uint64(buf.ptr),
                 ctypes.c_size_t(int(buf.n) * int(buf.dtype.itemsize))), "cuMemcpyDtoD")
+        out.known_scalar = buf.known_scalar
         return out
 
     def full(self, shape, value, dtype=np.float32):
-        host = np.full(tuple(shape), value, dtype=dtype)
-        return self.h2d(host, dtype=dtype)
+        dt = np.dtype(dtype)
+        if dt.itemsize != 4:
+            return self.h2d(np.full(tuple(shape), value, dtype=dt), dtype=dt)
+        buf = self.empty(shape, dtype=dt)
+        if buf.n:
+            word = int(np.array([value], dtype=dt).view(np.uint32)[0])
+            self._memset32(buf, word)
+        if buf.n == 1 and np.issubdtype(dt, np.floating):
+            buf.known_scalar = float(np.asarray(value, dtype=np.float32))
+        return buf
 
     def read_scalar(self, buf):
         if int(buf.n) != 1:
             raise CudaError("期望标量梯度，收到 shape=%s" % (buf.shape,))
+        if buf.known_scalar is not None:
+            return float(buf.known_scalar)
         return float(np.asarray(self.d2h(buf), dtype=np.float64).reshape(-1)[0])
 
     def _fn(self, name):
@@ -1991,23 +2099,38 @@ class CudaRuntime:
         return C
 
     def ce_fwd(self, logits, targets, n, v):
+        n = int(n)
+        v = int(v)
         loss = self.empty((), dtype=np.float32)
-        self.launch("ce_fwd", (1, 1, 1), (1, 1, 1), [
-            self._ptr(logits), self._ptr(targets), self._ptr(loss),
-            (int(n), ctypes.c_int), (int(v), ctypes.c_int),
+        if n <= 0 or v <= 0:
+            self._memset32(loss, 0)
+            loss.known_scalar = 0.0
+            return loss
+        terms = self.empty((n,), dtype=np.float32)
+        self.launch("ce_fwd_rows", (n, 1, 1), (256, 1, 1), [
+            self._ptr(logits), self._ptr(targets), self._ptr(terms),
+            (n, ctypes.c_int), (v, ctypes.c_int),
         ])
+        self.launch("ce_fwd_mean", (1, 1, 1), (1, 1, 1), [
+            self._ptr(terms), self._ptr(loss), (n, ctypes.c_int),
+        ])
+        # terms 还被 ce_fwd_mean 读着。挂在 loss 上，避免函数返回时 free() 把整条流同步掉。
+        loss.keepalive = terms
         return loss
 
     def ce_bwd(self, logits, targets, n, v):
-        dl = self.empty((int(n), int(v)), dtype=np.float32)
-        self.launch("ce_bwd", (1, 1, 1), (1, 1, 1), [
-            self._ptr(logits), self._ptr(targets), self._ptr(dl),
-            (int(n), ctypes.c_int), (int(v), ctypes.c_int),
-        ])
+        n = int(n)
+        v = int(v)
+        dl = self.empty((n, v), dtype=np.float32)
+        if n > 0 and v > 0:
+            self.launch("ce_bwd", (n, 1, 1), (256, 1, 1), [
+                self._ptr(logits), self._ptr(targets), self._ptr(dl),
+                (n, ctypes.c_int), (v, ctypes.c_int),
+            ])
         return dl
 
     def zeros(self, shape, dtype=np.float32):
-        return self.h2d(np.zeros(tuple(shape), dtype=dtype), dtype=dtype)
+        return self.full(shape, 0, dtype=dtype)
 
     def mul(self, a, b):
         if a.shape != b.shape or a.n != b.n:
