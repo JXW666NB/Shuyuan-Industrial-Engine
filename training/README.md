@@ -55,22 +55,29 @@ GEMM 全部走 **cuBLAS**（与 PyTorch 同一个库、逐位一致），element
 | attention fwd seq=512 | 0.3162 | 0.1704 | 1.86× |
 | attention bwd seq=512 | 0.7132 | 0.6589 | 1.08× |
 
-整层端到端（attention 块 + MoE FFN）：
+整层端到端（attention 块 + MoE FFN），五轮取中位：
 
-| 段 | 前向 | 反向 |
+| 指标 | grouped GEMM 后 | **再加 flash attention** |
 |---|---|---|
-| attention 块 | 0.58×\* | 0.88× |
-| MoE FFN | **0.90×** | **0.95×** |
-| **合计** | **0.79×**\* | **0.95×** |
+| 层内 attention 块 前向 | 0.58× | **0.49×** |
+| 层内 MoE FFN 前向 | 0.90× | **0.87×** |
+| 前向合计 | 0.79× | **0.75×**（中位 ms 3.069 / 4.350 = **0.71×**） |
+| 反向合计 | 0.95× | **0.94×** |
+| **前向 + 反向** | 0.89× | **0.85×** |
+| op 级 attention 前向 | 1.85× | **1.09×**（仍未追平 torch SDPA） |
+| op 级 attention 反向 | 1.08× | **0.97×** |
 
-\* 前向的 0.58× 偏乐观：PyTorch 基线的 RoPE 是朴素实现。保守估计前向约 0.9×。
-**前向+反向合计 = 0.89×（比 PyTorch 快约 11%）。**
+\* 前向的 attention 0.49× 偏乐观：PyTorch 基线的 RoPE 是朴素实现。保守估计层内前向约 0.85×。
+**前向+反向合计 = 0.85×（比 PyTorch 快约 15%）。**
 
 > 以上为 `harness/bench_median.py` 五轮取中位（产线 11450 共驻、util 0%）。
 > **MoE 反向曾落后 1.14×**：我们逐专家发 8 次 GEMM，torch 用 batched `bmm` 一次发完。
 > 已由 grouped GEMM 修掉 —— `cublas_bridge.py` 增加 `cublasSgemmStridedBatched`，
 > 8 个专家一次乘完，MoE 反向降到 **0.95×**。
-> 诚实说明：提速来自 bridge 的 batched GEMM，不是 .cu 的算术改动
+> **attention 前向曾落后 1.85×**：旧 kernel 把 P 和 softmax(P) 写进全局内存再读回。
+> 已换成 online-softmax 的 flash 前向（`kernels/tgai_attn_flash.cu`，不落地完整 P），
+> 单算子降到 **1.09×**、层内降到 **0.49×**。
+> 诚实说明：grouped GEMM 的提速来自 bridge 的 batched GEMM，不是 .cu 的算术改动
 > （同一个新 bridge 跑旧 kernel 也是 0.95×）。
 
 ---

@@ -287,3 +287,30 @@ Grok 修好了 tied 反传的崩溃（拆头方案：`F.linear(hn, emb.detach())
 - suite 在真实规模（seq=512/d=1024/ff=4096）会自己吃掉 8 GB/专家而 OOM —— 是 suite 的构造方式，
   数值校验用小规模（8/64/64/2），**速度**用 `bench_median.py` 在真实规模测
 
+
+## 十六、flash attention 前向（2026-10-28）
+
+**问题**：op 级 attention 前向 1.85× —— 旧 kernel（`kernels/tgai_attn_tiled.cu`）把
+P = QK^T/√d 和 softmax(P) 写进全局内存再读回，torch 用 SDPA（online softmax，不落地完整 P）。
+
+**改法**（Grok 实现，我独立复核）：新增 `kernels/tgai_attn_flash.cu`，online softmax 分块，
+running max/sum 随块更新，最后统一 rescale 写 O；K/V tile 常驻 shared。
+
+**实测**（产线共驻、util 0%）：
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| op 级 attention 前向 | 1.85× | **1.09×**（0.1860 vs 0.1703 ms） |
+| op 级 attention 反向 | 1.08× | **0.97×** |
+| 层内 attention 块 前向 | 0.58× | **0.49×** |
+| 层内 MoE FFN 前向 | 0.90× | **0.87×** |
+| 前向合计（5 轮中位） | 0.79× | **0.75×** |
+| 反向合计 | 0.95× | **0.94×** |
+| **前向 + 反向** | 0.89× | **0.85×** |
+
+**数值**：`attn_big_suite.py` 查 O/P/dQ/dK/dV 全字段 → **ok=True，worst_rel 4.46e-07**
+（seq=128/256 两档，fp32 对齐 torch SDPA）。
+
+**未达标项（诚实记录）**：我给出的目标曾是 op 级 attention 前向 ≤1.0×，
+实测停在 **1.09×** —— 还差 9%。整体判据（前+反 0.85×）不受影响，但这一项没做到就是没做到。
+
