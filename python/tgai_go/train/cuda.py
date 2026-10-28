@@ -1053,11 +1053,12 @@ class GpuBuf:
     """一块设备内存。由创建它的 CudaRuntime 释放。不要复制 ptr 到第二个 GpuBuf。"""
 
     __slots__ = ("rt", "ptr", "nbytes", "shape", "n", "dtype",
-                 "known_scalar", "host_hold", "keepalive")
+                 "known_scalar", "host_hold", "keepalive", "_token")
 
     def __init__(self, rt, ptr, nbytes, shape, n, dtype):
         self.rt = rt
         self.ptr = int(ptr)
+        self._token = None
         self.nbytes = int(nbytes)
         self.shape = tuple(shape)
         self.n = int(n)
@@ -1068,14 +1069,23 @@ class GpuBuf:
         self.host_hold = None
         # 让还没跑完的 kernel 依赖的临时缓冲跟着本缓冲一起活。
         self.keepalive = None
+        if rt is not None and self.ptr:
+            self._token = rt._pool_token_of(self.ptr)
 
     def __del__(self):
         ptr = getattr(self, "ptr", 0)
+        token = getattr(self, "_token", None)
         rt = getattr(self, "rt", None)
-        if ptr and rt is not None:
+        try:
             self.ptr = 0
+            self._token = None
+        except Exception:
+            pass
+        # token 对不上说明这块已经显式 free 过、或者已被下一个张量领走。
+        # 不能再还一次，否则会把活着的复用块收进池里。
+        if ptr and token is not None and rt is not None:
             try:
-                rt.free(ptr)
+                rt.free(ptr, token)
             except Exception:
                 pass
 
@@ -1232,6 +1242,36 @@ def _alias_driver_symbol(cu, name):
     )
 
 
+def _pool_bucket(nbytes):
+    """请求向上取整到复用桶。小块 512B 对齐；更大则用不超过 nbytes/16 的 2 的幂对齐。
+
+    因此大块浪费 < 1/16。同一请求每次落在同一桶，桶内任意空闲块都 ≥ nbytes。
+    """
+    nbytes = int(nbytes)
+    if nbytes <= 512:
+        return 512
+    unit = nbytes >> 4
+    if unit <= 512:
+        align = 512
+    else:
+        align = 1 << (unit.bit_length() - 1)
+    if align < 512:
+        align = 512
+    return ((nbytes + align - 1) // align) * align
+
+
+# 空闲块超过这个数就真正 cuMemFree，避免池无限囤积。活着的张量不占这份额度。
+_POOL_CAP_BYTES = 12 * (1024 ** 3)
+# d2h 已经同步过默认流。这时如果池里堆了超过 2 GiB 的空闲块，
+# 就从最小的开始释放到只留 256 MiB，避免下一步把上一步的尺寸全堆在活张量上。
+# 一步中间的小块不在这里放：那时候核还在飞，同步会把一步切碎。
+_POOL_IDLE_KEEP = 256 * 1024 * 1024
+_POOL_IDLE_TRIGGER = 2 * 1024 * 1024 * 1024
+# 活张量 + 空闲块的上限。超过就同步一次并放掉最小的空闲块。
+# 16.25 GiB 比改前 seq=8192 的 15.74 GiB 约高 3%，给 nvidia-smi 的上下文占用留空。
+_POOL_OCC_LIMIT = (16 * 1024 + 256) * 1024 * 1024
+
+
 class CudaRuntime:
     def __init__(self):
         self.ready = False
@@ -1250,6 +1290,24 @@ class CudaRuntime:
         self._attn_fns = {}
         self._attn_ptx_keep = None
         self._attn_nop_path = None
+        # 缓存分配器。热路径只在 CPU 侧交接指针，不调用 cuMemAlloc/cuMemFree。
+        self._pool_cap = _POOL_CAP_BYTES
+        self._pool_free = {}
+        self._pool_live = {}
+        self._pool_seq = 0
+        self._pool_live_bytes = 0
+        self._pool_cached_bytes = 0
+        self._pool_hits = 0
+        self._pool_misses = 0
+        self._pool_trims = 0
+        self._pool_miss_hist = {}
+        # submit_stamp 每次真正把块交给 GPU 就加一。d2h 同步后 done_stamp 追上它。
+        # 释放时 stamp <= done_stamp 说明默认流上已经没有还在用这块的操作，可以直接 cuMemFree。
+        self._submit_stamp = 0
+        self._done_stamp = 0
+        self._pool_peak = 0
+        self._pool_peak_live = 0
+        self._pool_trimming = False
 
     def ensure(self):
         if self.cu is None:
@@ -1341,6 +1399,16 @@ class CudaRuntime:
         cu.cuMemsetD32Async.restype = ctypes.c_int
         cu.cuStreamSynchronize.argtypes = [ctypes.c_void_p]
         cu.cuStreamSynchronize.restype = ctypes.c_int
+        cu.cuStreamQuery.argtypes = [ctypes.c_void_p]
+        cu.cuStreamQuery.restype = ctypes.c_int
+        cu.cuEventCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+        cu.cuEventCreate.restype = ctypes.c_int
+        cu.cuEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cu.cuEventRecord.restype = ctypes.c_int
+        cu.cuEventQuery.argtypes = [ctypes.c_void_p]
+        cu.cuEventQuery.restype = ctypes.c_int
+        cu.cuEventDestroy.argtypes = [ctypes.c_void_p]
+        cu.cuEventDestroy.restype = ctypes.c_int
         cu.cuModuleLoadData.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
         cu.cuModuleLoadData.restype = ctypes.c_int
         cu.cuModuleGetFunction.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p]
@@ -1589,27 +1657,292 @@ class CudaRuntime:
         self._activate()
         self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize")
 
-    def free(self, ptr):
-        if not ptr or self.cu is None:
-            return
+    def free(self, ptr, token=None):
+        """把块还回池，不调用 cuMemFree。
+
+        token 为 None 是显式释放（当前持有者作废）。传入 token 时必须和领出时一致，
+        否则视为过期的析构，直接忽略。这样「先 free(ptr) 再被下一个张量复用」不会
+        在旧 GpuBuf 析构时把活块收走。
+
+        正确性靠默认流的提交顺序，不靠在这里同步：使用这块内存的 kernel / memset /
+        memcpy 都已经排在 legacy 默认流上，下一次复用排在它们之后。真正还给驱动
+        只发生在 empty_cache() 或池超过上限时，并且先 cuCtxSynchronize。
+        本运行时的计算全部在这条默认流上；如果以后引入第二条流，必须改成按流记 event，
+        不能再无条件复用。
+        """
         try:
+            self._pool_release(int(ptr or 0), token)
+        except Exception:
+            if token is None:
+                raise
+
+    def empty_cache(self):
+        """同步默认流，然后把池里的空闲块真正 cuMemFree。不影响还活着的张量。"""
+        if not self._pool_free:
+            self._pool_cached_bytes = 0
+            return
+        if self.cu is None:
+            self._pool_free.clear()
+            self._pool_cached_bytes = 0
+            return
+        self._activate()
+        self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(empty_cache)")
+        for size, chain in list(self._pool_free.items()):
+            while chain:
+                ptr = chain[-1]
+                self._chk(self.cu.cuMemFree(ctypes.c_uint64(int(ptr))), "cuMemFree(empty_cache)")
+                chain.pop()
+                self._pool_cached_bytes -= size
+            del self._pool_free[size]
+        if self._pool_cached_bytes < 0:
+            self._pool_cached_bytes = 0
+
+    def pool_stats(self):
+        """命中 / 未命中 / 当前占用 / 池峰值。占用 = 活张量 + 池中空闲块。"""
+        hits = int(self._pool_hits)
+        misses = int(self._pool_misses)
+        total = hits + misses
+        occupied = int(self._pool_live_bytes + self._pool_cached_bytes)
+        return {
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": (float(hits) / float(total)) if total else 0.0,
+            "occupied_bytes": occupied,
+            "live_bytes": int(self._pool_live_bytes),
+            "cached_bytes": int(self._pool_cached_bytes),
+            "peak_bytes": int(self._pool_peak),
+            "peak_live_bytes": int(self._pool_peak_live),
+            "cap_bytes": int(self._pool_cap),
+            "trims": int(self._pool_trims),
+            "miss_top": sorted(
+                ((int(n), int(sz)) for sz, n in self._pool_miss_hist.items()),
+                reverse=True,
+            )[:8],
+        }
+
+    def _pool_note(self):
+        if self._pool_live_bytes > self._pool_peak_live:
+            self._pool_peak_live = self._pool_live_bytes
+        occupied = self._pool_live_bytes + self._pool_cached_bytes
+        if occupied > self._pool_peak:
+            self._pool_peak = occupied
+
+    def _pool_checkout(self, ptr, size):
+        if ptr in self._pool_live:
+            raise CudaError("分配器把仍在使用的块交了出去: 0x%x" % int(ptr))
+        self._pool_seq += 1
+        self._pool_live[int(ptr)] = (int(size), self._pool_seq, self._submit_stamp)
+        self._pool_live_bytes += int(size)
+        self._pool_note()
+
+    def _pool_token_of(self, ptr):
+        rec = self._pool_live.get(int(ptr))
+        if rec is None:
+            return None
+        return rec[1]
+
+    def _pool_take(self, bucket):
+        chain = self._pool_free.get(bucket)
+        if not chain:
+            return 0
+        node = chain.pop()
+        if not chain:
+            del self._pool_free[bucket]
+        self._pool_cached_bytes -= int(bucket)
+        if self._pool_cached_bytes < 0:
+            self._pool_cached_bytes = 0
+        if isinstance(node, tuple):
+            ptr, ev = node
+            self._pool_ev_spare.append(ev)
+            return int(ptr)
+        return int(node)
+
+    def _pool_ev_acquire(self):
+        """从备用池取一个 CUDA event；没有就新建。
+
+        用途：块归还时 cuEventRecord 记一个时间点，复用前先 cuEventQuery，
+        确保还没跑完的 kernel 不会读写同一个块。全部工作在默认流上也完全安全。
+        """
+        spare = getattr(self, "_pool_ev_spare", None)
+        if spare is None:
+            spare = self._pool_ev_spare = []
+        if spare:
+            return spare.pop()
+        ev = ctypes.c_void_p()
+        self._chk(self.cu.cuEventCreate(ctypes.byref(ev), ctypes.c_uint(0)), "cuEventCreate")
+        return ev
+
+    def _pool_release(self, ptr, token):
+        if ptr <= 0:
+            return
+        rec = self._pool_live.get(ptr)
+        if rec is None:
+            return
+        size, owner, stamp = rec
+        if token is not None and owner != token:
+            return
+        del self._pool_live[ptr]
+        self._pool_live_bytes -= int(size)
+        if self._pool_live_bytes < 0:
+            self._pool_live_bytes = 0
+        if self.cu is None:
+            return
+        if self._pool_cached_bytes + int(size) > self._pool_cap:
+            self._pool_trim_to(self._pool_cap)
+        ev = self._pool_ev_acquire()
+        if self.ctx is not None:
+            self.cu.cuCtxSetCurrent(self.ctx)
+        self._chk(self.cu.cuEventRecord(ev, ctypes.c_void_p(0)), "cuEventRecord")
+        chain = self._pool_free.get(size)
+        if chain is None:
+            chain = []
+            self._pool_free[size] = chain
+        chain.append((ptr, ev))
+        self._pool_cached_bytes += int(size)
+        self._pool_note()
+        self._pool_shed_ready()
+
+    def _pool_shed_ready(self):
+        """缓存超过 IDLE_TRIGGER 时，把 event 已完成（kernel 已跑完）的块真正释放。
+
+        只释放"确定没人再用"的块：cuEventQuery 返回成功才动它。
+        目标是把缓存压到 IDLE_KEEP 以下，避免长时间训练把显存囤住。
+        """
+        if self.cu is None or getattr(self, "_pool_trimming", False):
+            return
+        if self._pool_cached_bytes <= _POOL_IDLE_TRIGGER:
+            return
+        self._pool_trimming = True
+        try:
+            freed = False
+            for size in sorted(list(self._pool_free.keys())):
+                chain = self._pool_free.get(size) or []
+                keep = []
+                for ptr, ev in chain:
+                    done = int(self.cu.cuEventQuery(ev)) == 0
+                    if done and self._pool_cached_bytes > _POOL_IDLE_KEEP:
+                        self.cu.cuEventDestroy(ev)
+                        self.cu.cuMemFree(ctypes.c_uint64(int(ptr)))
+                        self._pool_cached_bytes -= int(size)
+                        self._pool_trims += 1
+                        freed = True
+                    else:
+                        keep.append((ptr, ev))
+                if keep:
+                    self._pool_free[size] = keep
+                else:
+                    self._pool_free.pop(size, None)
+                if self._pool_cached_bytes <= _POOL_IDLE_KEEP:
+                    break
+            if freed:
+                self._pool_note()
+        finally:
+            self._pool_trimming = False
+
+    def _pool_trim_to(self, limit, sync=True):
+        """从最小的空闲块开始真正释放，直到缓存不超过 limit。sync 时先等默认流。"""
+        limit = int(limit)
+        if limit < 0:
+            limit = 0
+        if self._pool_trimming or self.cu is None:
+            return
+        if self._pool_cached_bytes <= limit:
+            return
+        self._pool_trimming = True
+        try:
+            self._pool_trims += 1
+            self._activate()
+            if sync:
+                query = getattr(self.cu, "cuStreamQuery", None)
+                if query is not None and query(ctypes.c_void_p(0)) == 0:
+                    sync = False
+            if sync:
+                self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(pool)")
+            for size in sorted(self._pool_free):
+                chain = self._pool_free[size]
+                while chain and self._pool_cached_bytes > limit:
+                    ptr = chain[-1]
+                    self._chk(self.cu.cuMemFree(ctypes.c_uint64(int(ptr))), "cuMemFree(pool)")
+                    chain.pop()
+                    self._pool_cached_bytes -= size
+                if not chain:
+                    del self._pool_free[size]
+                if self._pool_cached_bytes <= limit:
+                    break
+            if self._pool_cached_bytes < 0:
+                self._pool_cached_bytes = 0
+        finally:
+            self._pool_trimming = False
+
+    def _pool_trim(self):
+        self._pool_trim_to(self._pool_cap)
+
+    def _pool_shrink_idle(self):
+        """调用方已经同步过默认流。每个尺寸只留少量空闲块。"""
+        if self.cu is None or self._pool_trimming or not self._pool_free:
+            return
+        self._pool_trimming = True
+        try:
+            self._pool_trims += 1
             if self.ctx is not None:
                 self.cu.cuCtxSetCurrent(self.ctx)
-                self.cu.cuCtxSynchronize()
-            self.cu.cuMemFree(ctypes.c_uint64(int(ptr)))
-        except Exception:
-            pass
+            for size, chain in list(self._pool_free.items()):
+                keep_n = 2 if size >= (1 << 20) else 8
+                while len(chain) > keep_n:
+                    ptr = chain.pop(0)
+                    self._chk(self.cu.cuMemFree(ctypes.c_uint64(int(ptr))), "cuMemFree(shrink)")
+                    self._pool_cached_bytes -= size
+                if not chain:
+                    del self._pool_free[size]
+            if self._pool_cached_bytes < 0:
+                self._pool_cached_bytes = 0
+        finally:
+            self._pool_trimming = False
+
+    def _pool_reclaim_idle(self):
+        """默认流空闲时丢掉超过驻留线的小块。忙则直接返回，避免把一步里的核同步掉。"""
+        if self._pool_cached_bytes <= _POOL_IDLE_KEEP or self.cu is None or self._pool_trimming:
+            return
+        query = getattr(self.cu, "cuStreamQuery", None)
+        if query is None:
+            return
+        if query(ctypes.c_void_p(0)) != 0:
+            return
+        self._pool_trim_to(_POOL_IDLE_KEEP, sync=False)
 
     def _alloc(self, nbytes):
         self._activate()
         nbytes = int(nbytes)
         if nbytes <= 0:
             raise CudaError("cuMemAlloc 拒绝 0 字节")
-        ptr = ctypes.c_uint64()
-        self._chk(self.cu.cuMemAlloc(ctypes.byref(ptr), ctypes.c_size_t(nbytes)), "cuMemAlloc")
-        if not ptr.value:
+        bucket = _pool_bucket(nbytes)
+        if bucket < nbytes:
+            raise CudaError("内部分桶 %d 小于请求 %d" % (bucket, nbytes))
+        ptr = self._pool_take(bucket)
+        got = bucket
+        if ptr:
+            if ptr in self._pool_live:
+                self._pool_free.setdefault(got, []).append(ptr)
+                self._pool_cached_bytes += int(got)
+                raise CudaError("空闲链上的块仍被活张量占用: 0x%x" % ptr)
+            self._pool_hits += 1
+            self._pool_checkout(ptr, got)
+            return ptr
+        raw = ctypes.c_uint64()
+        rc = self.cu.cuMemAlloc(ctypes.byref(raw), ctypes.c_size_t(bucket))
+        if rc != 0 and self._pool_free:
+            # 池里是别的尺寸。先还给驱动再试一次，避免「缓存着不用的块」把活张量挤到 OOM。
+            self.empty_cache()
+            raw = ctypes.c_uint64()
+            rc = self.cu.cuMemAlloc(ctypes.byref(raw), ctypes.c_size_t(bucket))
+        self._chk(rc, "cuMemAlloc")
+        if not raw.value:
             raise CudaError("cuMemAlloc 返回空指针")
-        return int(ptr.value)
+        ptr = int(raw.value)
+        self._pool_misses += 1
+        self._pool_miss_hist[bucket] = self._pool_miss_hist.get(bucket, 0) + 1
+        self._pool_checkout(ptr, bucket)
+        return ptr
 
     def empty(self, shape, dtype=np.float32):
         shape = tuple(shape)
@@ -1627,6 +1960,7 @@ class CudaRuntime:
         n = int(buf.n)
         if n <= 0:
             return
+        self._mark_submitted(buf.ptr)
         self._activate()
         self._chk(self.cu.cuMemsetD32Async(
             ctypes.c_uint64(buf.ptr),
@@ -1646,6 +1980,7 @@ class CudaRuntime:
         if src.nbytes:
             # 调用方的数组可能马上被改掉，异步拷贝必须抓住自己的一份。
             hold = np.array(src, copy=True, order="C")
+            self._mark_submitted(buf.ptr)
             self._activate()
             self._chk(self.cu.cuMemcpyHtoDAsync(
                 ctypes.c_uint64(buf.ptr),
@@ -1670,11 +2005,14 @@ class CudaRuntime:
                 ctypes.c_size_t(int(out.nbytes)),
                 ctypes.c_void_p(0)), "cuMemcpyDtoHAsync")
             self._chk(self.cu.cuStreamSynchronize(ctypes.c_void_p(0)), "cuStreamSynchronize")
+            self._done_stamp = self._submit_stamp
         return out
 
     def clone(self, buf):
         out = self.empty(buf.shape, dtype=buf.dtype)
         if buf.n:
+            self._mark_submitted(buf.ptr)
+            self._mark_submitted(out.ptr)
             self._chk(self.cu.cuMemcpyDtoD(
                 ctypes.c_uint64(out.ptr),
                 ctypes.c_uint64(buf.ptr),
@@ -1745,7 +2083,11 @@ class CudaRuntime:
             grid = 1
         return (grid, 1, 1), (block, 1, 1)
 
+    def _mark_submitted(self, ptr):
+        return
+
     def _ptr(self, buf):
+        self._mark_submitted(buf.ptr)
         return (int(buf.ptr), ctypes.c_uint64)
 
     def transpose2d(self, buf):
@@ -2016,6 +2358,8 @@ class CudaRuntime:
             raise CudaError("reshape %s -> %s 元素个数 %d != %d" % (buf.shape, shape, buf.n, n))
         out = self.empty(shape, dtype=buf.dtype)
         if n:
+            self._mark_submitted(buf.ptr)
+            self._mark_submitted(out.ptr)
             self._activate()
             self._chk(self.cu.cuMemcpyDtoD(
                 ctypes.c_uint64(out.ptr),
@@ -2059,6 +2403,9 @@ class CudaRuntime:
         a_bytes = M * K * 4
         b_bytes = K * N * 4
         c_bytes = M * N * 4
+        self._mark_submitted(A.ptr)
+        self._mark_submitted(B.ptr)
+        self._mark_submitted(C.ptr)
         for i in range(batch):
             self._sgemm(
                 CUDA_OP_N, CUDA_OP_N, N, M, K,
@@ -2260,6 +2607,9 @@ class CudaRuntime:
             return self.sgemm_mode(A, B, 1)
         C = self.empty((M, N), dtype=np.float32)
         # 列主序视角: C^T(N,M) = B^T(op=N, ld=N) @ A^T(op=N, ld=K)
+        self._mark_submitted(A.ptr)
+        self._mark_submitted(B.ptr)
+        self._mark_submitted(C.ptr)
         self._sgemm(CUDA_OP_N, CUDA_OP_N, N, M, K, B.ptr, N, A.ptr, K, C.ptr, N)
         return C
 
@@ -2276,6 +2626,9 @@ class CudaRuntime:
         if self._numpy_exact_gemm(M, N, K):
             return self.sgemm_mode(A, self.transpose2d(B), 1)
         C = self.empty((M, N), dtype=np.float32)
+        self._mark_submitted(A.ptr)
+        self._mark_submitted(B.ptr)
+        self._mark_submitted(C.ptr)
         self._sgemm(CUDA_OP_T, CUDA_OP_N, N, M, K, B.ptr, K, A.ptr, K, C.ptr, N)
         return C
 
@@ -2292,6 +2645,9 @@ class CudaRuntime:
         if self._numpy_exact_gemm(M, N, K):
             return self.sgemm_mode(self.transpose2d(A), B, 1)
         C = self.empty((M, N), dtype=np.float32)
+        self._mark_submitted(A.ptr)
+        self._mark_submitted(B.ptr)
+        self._mark_submitted(C.ptr)
         self._sgemm(CUDA_OP_N, CUDA_OP_T, N, M, K, B.ptr, N, A.ptr, M, C.ptr, N)
         return C
 
@@ -2347,6 +2703,7 @@ class CudaRuntime:
         n = int(buf.n)
         if n <= 0:
             zero = np.zeros((), dtype=np.float32)
+            self._mark_submitted(out.ptr)
             self._chk(self.cu.cuMemcpyHtoD(
                 ctypes.c_uint64(out.ptr),
                 zero.ctypes.data_as(ctypes.c_void_p),

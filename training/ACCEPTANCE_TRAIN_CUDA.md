@@ -282,3 +282,40 @@ AdamW（纯逐元素、无矩阵乘）能到 9e-08，正好印证这个解释。
 
 **回归**：conformance CPU/CUDA 11/11；四 selftest 全 0；`moe_selfcheck` ok=True（worst 1.716e-07）；
 seq=2048 旧路径 0.211 s（未变慢）。
+
+---
+
+## 性能攻坚：缓存分配器（显存池）—— 差距 1.75× → 1.12×
+
+**诊断（我实测，`training/harness/_prof_alloc.py`）**：
+
+| 分配大小 | `cuMemAlloc`+`cuMemFree` 单次 | 接池后 |
+|---|---|---|
+| 1.02 MB | 0.011 ms | 0.012 ms |
+| **10.24 MB** | **0.296 ms** | **0.014 ms（21×）** |
+| **102.40 MB** | **2.077 ms** | **0.011 ms（190×）** |
+
+一步训练里有 **580 次分配**（前向 168 次 / 含反向 583 次）。按 10 MB 单价算 ≈ **172 ms**，
+而整个 step 只有 150~250 ms —— **单步时间几乎全花在驱动分配上，不是算子**。
+
+**做法**：`CudaRuntime` 里加 size-bucket 空闲表 + CUDA event 记录/查询（复用前确认 kernel 已跑完），
+cached 上限 12 GiB、超 2 GiB 触发"只释放已完成块"的回收；`empty()` 语义不变、`zeros()` 仍 memset。
+
+**实测（seq=2048 MoE 1 层 138.4M，无采样器，各跑两次）**：
+
+| | 第 1 次 | 第 2 次 |
+|---|---|---|
+| 我们 | **0.116 s**（17709 tok/s） | 0.117 s（17566 tok/s） |
+| PyTorch | 0.104 s（19618 tok/s） | 0.105 s（19590 tok/s） |
+| 比值 | **1.12×** | 1.11× |
+
+历史上这条曲线：**97×（ce_bwd 单线程）→ 1.75×（pool 之前）→ 1.12×（pool 之后）**。
+
+**seq=8192（lowmem）**：0.987 s/step、峰值 15.90 GiB（pool 前 1.037 s / 14.17 GiB，慢一点点是池的驻留）。
+
+**回归**：conformance CPU/CUDA 11/11；四 selftest 全 0；`moe_selfcheck` ok=True（1.716e-07）；
+`attn_lowmem_check` 全 PASS（回退路径仍逐位 0）。
+
+> **过程记录（第三次替 Grok 收尾）**：这轮 Grok 把池写了大半，但 `_pool_ev_acquire` 与
+> `_pool_shed_ready` 两个方法缺失，直接崩在 `_pool_release`。我补齐后才跑通。
+> 结论：**Grok 产出的代码必须逐条跑，不能按"它说完成"就采信。**
