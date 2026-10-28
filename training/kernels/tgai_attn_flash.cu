@@ -163,10 +163,7 @@ __device__ __forceinline__ void fa_tile(
     float &lx0, float &lx1, float &lx2, float &lx3, float &lx4, float &lx5, float &lx6, float &lx7,
     float &ax0, float &ax1, float &ax2, float &ax3, float &ax4, float &ax5, float &ax6, float &ax7,
     float &ay0, float &ay1, float &ay2, float &ay3, float &ay4, float &ay5, float &ay6, float &ay7) {
-    fa_load_KT(K, smK, k0, h, nh, dh, tid, seq);
-    fa_load_V(V, smV, k0, h, nh, dh, tid, seq);
-    __syncthreads();
-
+    // K and V tiles are already in smK/smV and published by the caller.
     sx0 = sx1 = sx2 = sx3 = sx4 = sx5 = sx6 = sx7 = 0.f;
 #pragma unroll 16
     for (int d = 0; d < 64; ++d) {
@@ -246,6 +243,43 @@ __device__ __forceinline__ void fa_tile(
     __syncthreads();
 }
 
+// Each thread owns exactly two float4s of a BC=32 tile (e4 = tid, tid+256).
+__device__ __forceinline__ float4 fa_gather(const float* __restrict__ src, int tok, int h, int nh,
+                                            int dh, int d, int seq) {
+    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (tok < seq)
+        v = *reinterpret_cast<const float4*>(src + ((tok * nh + h) * dh + d));
+    return v;
+}
+
+__device__ __forceinline__ void fa_pin(float4 &v) {
+    asm volatile("" : "+f"(v.x), "+f"(v.y), "+f"(v.z), "+f"(v.w));
+}
+
+__device__ __forceinline__ void fa_pref(const float* __restrict__ src, int tok0, int h, int nh, int dh,
+                                        int tid, int seq, float4 &a, float4 &b) {
+    int ea = tid << 2;
+    int eb = (tid + 256) << 2;
+    a = fa_gather(src, tok0 + (ea >> 6), h, nh, dh, ea & 63, seq);
+    b = fa_gather(src, tok0 + (eb >> 6), h, nh, dh, eb & 63, seq);
+    fa_pin(a);
+    fa_pin(b);
+}
+
+__device__ __forceinline__ void fa_commit_KT(float* dst, int e4, float4 v) {
+    int e = e4 << 2;
+    int local = e >> 6;
+    int d = e & 63;
+    dst[(d + 0) * BC + local] = v.x;
+    dst[(d + 1) * BC + local] = v.y;
+    dst[(d + 2) * BC + local] = v.z;
+    dst[(d + 3) * BC + local] = v.w;
+}
+
+__device__ __forceinline__ void fa_commit_V(float* dst, int e4, float4 v) {
+    *reinterpret_cast<float4*>(dst + (e4 << 2)) = v;
+}
+
 extern "C" __global__ void
 attn_fwd(const float* __restrict__ Q, const float* __restrict__ K,
          const float* __restrict__ V, float* __restrict__ O,
@@ -271,21 +305,45 @@ attn_fwd(const float* __restrict__ Q, const float* __restrict__ K,
     float ax0 = 0.f, ax1 = 0.f, ax2 = 0.f, ax3 = 0.f, ax4 = 0.f, ax5 = 0.f, ax6 = 0.f, ax7 = 0.f;
     float ay0 = 0.f, ay1 = 0.f, ay2 = 0.f, ay3 = 0.f, ay4 = 0.f, ay5 = 0.f, ay6 = 0.f, ay7 = 0.f;
 
-    int k0 = 0;
-    for (; k0 + BC <= t0 && k0 < seq; k0 += BC)
-        fa_tile<true>(K, V, P, smQ, smK, smV, k0, t0, h, seq, nh, dh, scale, tid, lane, row0,
-                      sx0, sx1, sx2, sx3, sx4, sx5, sx6, sx7,
-                      mx0, mx1, mx2, mx3, mx4, mx5, mx6, mx7,
-                      lx0, lx1, lx2, lx3, lx4, lx5, lx6, lx7,
-                      ax0, ax1, ax2, ax3, ax4, ax5, ax6, ax7,
-                      ay0, ay1, ay2, ay3, ay4, ay5, ay6, ay7);
-    for (; k0 < t0 + BT && k0 < seq; k0 += BC)
-        fa_tile<false>(K, V, P, smQ, smK, smV, k0, t0, h, seq, nh, dh, scale, tid, lane, row0,
-                       sx0, sx1, sx2, sx3, sx4, sx5, sx6, sx7,
-                       mx0, mx1, mx2, mx3, mx4, mx5, mx6, mx7,
-                       lx0, lx1, lx2, lx3, lx4, lx5, lx6, lx7,
-                       ax0, ax1, ax2, ax3, ax4, ax5, ax6, ax7,
-                       ay0, ay1, ay2, ay3, ay4, ay5, ay6, ay7);
+    int k_end = t0 + BT;
+    if (k_end > seq) k_end = seq;
+    if (k_end > 0) {
+        fa_load_KT(K, smK, 0, h, nh, dh, tid, seq);
+        fa_load_V(V, smV, 0, h, nh, dh, tid, seq);
+        __syncthreads();
+    }
+#pragma unroll 1
+    for (int k0 = 0; k0 < k_end; k0 += BC) {
+        int next = k0 + BC;
+        float4 ka, kb, va, vb;
+        bool more = next < k_end;
+        if (more) {
+            fa_pref(K, next, h, nh, dh, tid, seq, ka, kb);
+            fa_pref(V, next, h, nh, dh, tid, seq, va, vb);
+            asm volatile("" ::: "memory");
+        }
+        if (k0 + BC <= t0)
+            fa_tile<true>(K, V, P, smQ, smK, smV, k0, t0, h, seq, nh, dh, scale, tid, lane, row0,
+                          sx0, sx1, sx2, sx3, sx4, sx5, sx6, sx7,
+                          mx0, mx1, mx2, mx3, mx4, mx5, mx6, mx7,
+                          lx0, lx1, lx2, lx3, lx4, lx5, lx6, lx7,
+                          ax0, ax1, ax2, ax3, ax4, ax5, ax6, ax7,
+                          ay0, ay1, ay2, ay3, ay4, ay5, ay6, ay7);
+        else
+            fa_tile<false>(K, V, P, smQ, smK, smV, k0, t0, h, seq, nh, dh, scale, tid, lane, row0,
+                           sx0, sx1, sx2, sx3, sx4, sx5, sx6, sx7,
+                           mx0, mx1, mx2, mx3, mx4, mx5, mx6, mx7,
+                           lx0, lx1, lx2, lx3, lx4, lx5, lx6, lx7,
+                           ax0, ax1, ax2, ax3, ax4, ax5, ax6, ax7,
+                           ay0, ay1, ay2, ay3, ay4, ay5, ay6, ay7);
+        if (more) {
+            fa_commit_KT(smK, tid, ka);
+            fa_commit_KT(smK, tid + 256, kb);
+            fa_commit_V(smV, tid, va);
+            fa_commit_V(smV, tid + 256, vb);
+            __syncthreads();
+        }
+    }
 
 #define EPI(i, xx, yy, mm, ll)                                                   \
     do {                                                                         \
@@ -307,7 +365,8 @@ attn_fwd(const float* __restrict__ Q, const float* __restrict__ K,
             }                                                                    \
             for (int u_ = (n4_ << 2) + lane; u_ <= tr_; u_ += 32)                \
                 prow_[u_] = __expf(prow_[u_] - (mm)) * inv_;                     \
-            for (int u_ = tr_ + 1 + lane; u_ < seq; u_ += 32) prow_[u_] = 0.f;   \
+            /* Causal stores never touch u > tr. Harness prezeroes P, so the */ \
+            /* old per-row zero fill (about 8MB at seq=512) is dead traffic. */ \
         }                                                                        \
     } while (0)
     EPI(0, ax0, ay0, mx0, lx0);
