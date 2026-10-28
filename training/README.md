@@ -16,7 +16,8 @@
 | `tgai_bwd.cu` | rmsnorm / silu_mul / moe_add / emb_gather / rope / residual / moe_route 的**反向** | 196 | 7/7 PASS |
 | `tgai_opt.cu` | **Muon**（Newton-Schulz 正交化）+ **AdamW** | 132 | 2.4e-07 |
 | `tgai_attn.cu` | causal MHA 前向 + 反向（小 seq 版） | 122 | 2.4e-07 |
-| `tgai_attn_tiled.cu` | **tiled** MHA 前向 + 反向（seq≥512） | 479 | 4.3e-07 |
+| `tgai_attn_tiled.cu` | tiled MHA 前向 + 反向（seq≥512 的早期版） | 479 | 4.3e-07 |
+| `tgai_attn_flash.cu` | **flash 前向**（online softmax，不落地完整 P） | 559 | 4.5e-07 |
 | `tgai_mm.cu` | matmul 前向 + 反向 | 62 | 1.1e-05 |
 | `tgai_moeblk.cu` | MoE FFN 块（rmsnorm → top-1 路由 → 专家 SwiGLU → 残差） | 151 | 6.9e-07 |
 | `tgai_layer.cu` | **整层**（attention + MoE，11 个梯度） | 329 | 9.0e-07 |
@@ -27,6 +28,7 @@
 
 `op_suite` / `opt_suite` / `attn_suite` / `attn_big_suite` / `mm_suite` / `moe_block_suite` /
 `layer_suite` / `ce_suite` / `fwd_suite` / `l2_train` / `op_bench` / `layer_bench` / `layer_bench_bwd`
+以及 `bench_median`（多轮取中位，消除产线共驻带来的抖动）
 
 每个判分台都**先自证**（用参考实现跑通）再用于考核；参考实现放在 `.*_private.cu` 里不随仓库分发。
 
@@ -46,14 +48,17 @@ GEMM 全部走 **cuBLAS**（与 PyTorch 同一个库、逐位一致），element
 
 | 算子 | 我们 | PyTorch | 比值 |
 |---|---|---|---|
-| rmsnorm [512,1024] | 0.0140 ms | 0.0539 ms | **0.26×** |
-| GEMM qkv (512×1024×3072) | 0.3060 | 0.3049 | 1.00× |
-| GEMM o (512×1024×1024) | 0.1161 | 0.1155 | 1.01× |
-| GEMM moe-up (1024×1024×4096) | 0.8755 | 0.8745 | 1.00× |
-| silu_mul | 0.0744 | 0.1095 | **0.68×** |
-| moe_add | 0.0130 | 0.0180 | **0.72×** |
-| attention fwd seq=512 | 0.3162 | 0.1704 | 1.86× |
-| attention bwd seq=512 | 0.7132 | 0.6589 | 1.08× |
+| rmsnorm [512,1024] | 0.0131 ms | 0.0534 ms | **0.25×** |
+| GEMM qkv (512×1024×3072) | 0.3057 | 0.3059 | 1.00× |
+| GEMM o (512×1024×1024) | 0.1154 | 0.1156 | 1.00× |
+| GEMM moe-up (1024×1024×4096) | 0.8739 | 0.8736 | 1.00× |
+| silu_mul | 0.0742 | 0.1096 | **0.68×** |
+| moe_add | 0.0127 | 0.0178 | **0.71×** |
+| attention fwd seq=512 | 0.1741 | 0.1706 | 1.02× |
+| attention bwd seq=512 | 0.7114 | 0.7350 | **0.97×** |
+
+> attention 前向的 1.02× 是在**额外产出 P** 的前提下取得的：我们的 `attn_bwd` 直接消费 P、不重算，
+> 所以前向必须写这份 25 MB 的概率矩阵；torch 的 SDPA 基线只产出 O。详见 `ACCEPTANCE.md` §16。
 
 整层端到端（attention 块 + MoE FFN），五轮取中位：
 
@@ -76,7 +81,7 @@ GEMM 全部走 **cuBLAS**（与 PyTorch 同一个库、逐位一致），element
 > 8 个专家一次乘完，MoE 反向降到 **0.95×**。
 > **attention 前向曾落后 1.85×**：旧 kernel 把 P 和 softmax(P) 写进全局内存再读回。
 > 已换成 online-softmax 的 flash 前向（`kernels/tgai_attn_flash.cu`，不落地完整 P），
-> 单算子降到 **1.09×**、层内降到 **0.49×**。
+> 单算子降到 **1.02×**、层内降到 **0.48×**。
 > 诚实说明：grouped GEMM 的提速来自 bridge 的 batched GEMM，不是 .cu 的算术改动
 > （同一个新 bridge 跑旧 kernel 也是 0.95×）。
 
@@ -86,14 +91,17 @@ GEMM 全部走 **cuBLAS**（与 PyTorch 同一个库、逐位一致），element
 
 语料：`_corpus/pelican_on_bike.html` + `bike_on_pelican.html`（24,651 字符，词表 78）
 
-| 项 | 数值 |
-|---|---|
-| 模型 | char-level，2 层… **10.57 M 参数**，`d=512 / nh=16 / ff=1024`，上下文 **1024** |
-| 训练 | 40,000 步，AdamW + OneCycle（max_lr 3e-3 → 1e-7） |
-| 最终 loss | **0.0108** |
-| 全语料 teacher-forced 准确率 | **99.65%** |
-| `pelican_on_bike` 逐字复现 | **100.0%** |
-| `bike_on_pelican` 逐字复现 | **100.0%** |
+| 项 | **tied 版（当前验收）** | 早期非 tied 版 |
+|---|---|---|
+| 结构 | char-level，**4 层**，`d=512 / nh=16 / ff=1024`，词表 **78** | 同左 |
+| 参数量（读 checkpoint 实测） | **10.530 M**（`emb[78,512]`、`Wqkv[512,1536]`、`Wg/Wu[512,1024]`、`Wd[1024,512]`） | 同左 |
+| 上下文 | **512** | 1024 |
+| 训练步数 | **20,000** | 40,000 |
+| 最终 loss | **0.0470** | 0.0108 |
+| `pelican_on_bike` 逐字复现 | **100.0%（400/400）** | 100.0% |
+| `bike_on_pelican` 逐字复现 | **100.0%（400/400）** | 100.0% |
+
+> 语料实测 **24,651 字符 / 词表 78**；任务书里写的是 24,657 / 85，以实测为准。
 
 > 关键坑：两份文档前 60 个字符完全相同，**必须从分叉点之后取 prompt**，否则贪心解码只会走一条分支
 > （第一版测试就是这样误报 24%）。另外 teacher-forced 99.2% 并不等于能复现 —— 每 127 字符错 1 个就雪崩。
