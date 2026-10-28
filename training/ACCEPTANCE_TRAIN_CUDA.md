@@ -242,3 +242,43 @@ AdamW（纯逐元素、无矩阵乘）能到 9e-08，正好印证这个解释。
 ### 结论（当前）
 - **短上下文（seq≤2048）**：MoE 可训，速度 1.75× 慢，显存 3.4× —— 可用但不划算。
 - **长上下文（seq=8192）**：**当前不可用**，必须先接 no-P attention 路径。
+
+---
+
+## M7 · 长上下文打通 ✅（seq=8192 从 OOM 到可跑）
+
+**做法**：接入"不物化 P"的 attention 路径 —— `functional.scaled_dot_product_attention(..., lowmem=True)`，
+内部用已验收的 `attn_fwd_nop` + `attn_bwd_recompute`（`training/kernels/tgai_attn_nop.cu`）。
+`dh=64` 且 `causal` 时把 `[B*H,S,64]` 显式 permute 成 `[S,H,64]`，grid `(nh, S//64, 1)`、block 256、shared 32KB；
+其它 `dh`、非因果、CPU 一律回退旧实现。默认仍是旧路径，`v27_moe_bench.py --attn lowmem|legacy` 可切。
+
+**数值等价性（我自己的判分台 `training/harness/attn_lowmem_check.py`，GPU 实测）**：
+
+| 配置 | O | dQ | dK | dV | worst |
+|---|---|---|---|---|---|
+| seq=128 nh=4 dh=64 | 8.59e-08 | 2.21e-07 | 5.95e-07 | 3.00e-07 | **5.954e-07** |
+| seq=256 nh=4 dh=64 | 5.90e-08 | 5.11e-07 | 4.53e-07 | 2.98e-07 | **5.107e-07** |
+| seq=128 nh=8 dh=64 | 6.64e-08 | 4.75e-07 | 5.17e-07 | 5.11e-07 | **5.167e-07** |
+| 回退：dh=32 / 非 causal | — | — | — | — | **0.000e+00（逐位一致）** |
+
+**长上下文实测（MoE，d=1024/nh=16/dh=64/ff=4096/E=8 top-2/V=32779，1 层，seq=8192）**：
+
+| 步 | 吞吐 | 峰值显存 | loss |
+|---|---|---|---|
+| 1 | 8834 tokens/s（0.927 s） | 14.26 GiB | 10.5505 |
+| 3（稳态） | 7902 tokens/s（**1.037 s**） | **14.17 GiB** | 10.5505 → 7.3241 → 5.6401 |
+
+**对照 PyTorch（同配置、同结构、138.4M 参数）**：0.189 s/step、43343 tokens/s、峰值 **7.10 GB**。
+
+| 项 | PyTorch | 我们 | 比 |
+|---|---|---|---|
+| 单步 | 0.189 s | 1.037 s | **5.5× 慢** |
+| 峰值显存 | 7.10 GB | 14.17 GiB | **2.0× 多** |
+| 能否跑 | ✅ | ✅（旧路径会 OOM，采样峰值 46.17 GiB） | 已从不可用变可用 |
+
+**结论**：长上下文**已打通但还不划算** —— 用 5.5× 时间换掉了 46→14 GiB 的显存。
+下一步优化顺序应该是：① 短序列用旧路径、长序列自动切 lowmem（现在要手动）；
+② 把 Python 编排开销压下去（seq=2048 时 PyTorch 0.123 s vs 我们 0.211 s，差距主要在这里而不是 kernel）。
+
+**回归**：conformance CPU/CUDA 11/11；四 selftest 全 0；`moe_selfcheck` ok=True（worst 1.716e-07）；
+seq=2048 旧路径 0.211 s（未变慢）。

@@ -437,7 +437,8 @@ extern "C" __global__ void emb_gather_bwd(const float* g, const int* ids, float*
 
 # M3：reshape 只改形状（主机 memcpy）。下面是 attention 公式里 CPU 还在用、
 # 但设备上还没有的几步。dh=64 的 flash/tiled kernel 对判分台的 Dh=8 会直接 return，
-# 所以 SDPA 走和 CPU 相同的 bmm + 掩码 + softmax，不改那两份已验收源码。
+# 所以默认 SDPA 仍走和 CPU 相同的 bmm + 掩码 + softmax，不改那两份已验收源码。
+# 不物化 P 的路径不进这份源码：lowmem=True 时单独编译 tgai_attn_nop.cu。
 _M3_KERNELS = r"""
 extern "C" __global__ void swap_last2(const float* a, float* b, int batch, int m, int n) {
     int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
@@ -1022,6 +1023,32 @@ class CudaError(RuntimeError):
     pass
 
 
+# 已验收内核，不内嵌进主模块，避免宏/符号和现有源码撞车，也避免改默认编译结果。
+_ATTN_NOP_SMEM = 32 * 1024
+_ATTN_NOP_BQ = 64
+
+
+def attn_nop_source_path():
+    """定位 training/kernels/tgai_attn_nop.cu。可用 TGAI_ATTN_NOP_CU 覆盖。"""
+    env = os.environ.get("TGAI_ATTN_NOP_CU")
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = []
+    if env:
+        cands.append(env)
+    cands.append(os.path.normpath(os.path.join(
+        here, "..", "..", "..", "training", "kernels", "tgai_attn_nop.cu")))
+    cands.append("/home/featurize/tgai/training/kernels/tgai_attn_nop.cu")
+    seen = []
+    for p in cands:
+        if not p:
+            continue
+        ap = os.path.abspath(p)
+        seen.append(ap)
+        if os.path.isfile(ap):
+            return ap
+    raise CudaError("找不到已验收的 tgai_attn_nop.cu。已查: %s" % seen)
+
+
 class GpuBuf:
     """一块设备内存。由创建它的 CudaRuntime 释放。不要复制 ptr 到第二个 GpuBuf。"""
 
@@ -1218,6 +1245,11 @@ class CudaRuntime:
         self._fns = {}
         self._dirs = []
         self._h2d_cache = {}
+        # 低显存 attention 是第二份 NVRTC 模块。默认路径不编译它。
+        self._attn_mod = None
+        self._attn_fns = {}
+        self._attn_ptx_keep = None
+        self._attn_nop_path = None
 
     def ensure(self):
         if self.cu is None:
@@ -1508,8 +1540,12 @@ class CudaRuntime:
         n.nvrtcDestroyProgram.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
         n.nvrtcDestroyProgram.restype = ctypes.c_int
 
-    def _compile(self, arch):
+    def _compile(self, arch, source=None, cu_name=b"tgai_train.cu"):
         # 源码没有 #include。不要把带空格的 CUDA include 塞进 -I，NVRTC 会把空格再拆开。
+        if source is None:
+            source = _device_source()
+        if isinstance(cu_name, str):
+            cu_name = cu_name.encode("utf-8")
         opts = [
             "--gpu-architecture=%s" % arch,
             "--std=c++14",
@@ -1519,7 +1555,7 @@ class CudaRuntime:
         arr = (ctypes.c_char_p * len(opts_b))(*opts_b)
         prog = ctypes.c_void_p()
         rc = self.nvrtc.nvrtcCreateProgram(
-            ctypes.byref(prog), _device_source().encode("utf-8"), b"tgai_train.cu", 0, None, None)
+            ctypes.byref(prog), source.encode("utf-8"), cu_name, 0, None, None)
         self._chk_nvrtc(rc, "nvrtcCreateProgram", prog)
         rc = self.nvrtc.nvrtcCompileProgram(prog, len(opts_b), arr)
         log = self._nvrtc_log(prog)
@@ -1675,9 +1711,19 @@ class CudaRuntime:
         self._fns[name] = out
         return out
 
-    def launch(self, name, grid, block, args, shared=0):
+    def _fn_module(self, module, name):
+        fn = self._attn_fns.get(name)
+        if fn is not None:
+            return fn
+        out = ctypes.c_void_p()
+        self._chk(self.cu.cuModuleGetFunction(ctypes.byref(out), module, name.encode("ascii")),
+                  "cuModuleGetFunction(%s)" % name)
+        self._attn_fns[name] = out
+        return out
+
+    def launch(self, name, grid, block, args, shared=0, module=None):
         self._activate()
-        fn = self._fn(name)
+        fn = self._fn(name) if module is None else self._fn_module(module, name)
         holders = []
         ptrs = (ctypes.c_void_p * len(args))()
         for i, (val, typ) in enumerate(args):
@@ -2595,6 +2641,76 @@ class CudaRuntime:
         elif m:
             self._memset32(out, 0)
         return out
+
+    def ensure_attn_nop(self):
+        """编译并加载 tgai_attn_nop.cu。重复调用不再编译。默认 SDPA 不走这里。"""
+        self.ensure()
+        if self._attn_mod is not None:
+            return self._attn_mod
+        path = attn_nop_source_path()
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        arch = self._cc_arch()
+        ptx = self._compile(arch, source=src, cu_name=b"tgai_attn_nop.cu")
+        mod = ctypes.c_void_p()
+        buf = ctypes.create_string_buffer(ptx)
+        self._chk(self.cu.cuModuleLoadData(
+            ctypes.byref(mod), ctypes.cast(buf, ctypes.c_void_p)),
+            "cuModuleLoadData(attn_nop)")
+        self._attn_ptx_keep = buf
+        self._attn_mod = mod
+        self._attn_fns = {}
+        self._attn_nop_path = path
+        return mod
+
+    def _attn_nop_launch(self, name, seq, nh, dh, args):
+        """grid=(nh, ceil(seq/64), 1)，block=256，dynamic smem=32KB。
+        seq 能被 64 整除时第二维就是 seq//64，和内核注释一致。"""
+        if dh != 64:
+            raise CudaError("attn_nop 只接受 dh=64，收到 %d" % dh)
+        if seq < 0 or nh < 0:
+            raise CudaError("attn_nop 形状非法 seq=%d nh=%d" % (seq, nh))
+        gy = (int(seq) + _ATTN_NOP_BQ - 1) // _ATTN_NOP_BQ
+        if gy < 1:
+            gy = 1
+        if seq == 0 or nh == 0:
+            return
+        self.launch(
+            name, (int(nh), gy, 1), (256, 1, 1), args,
+            shared=_ATTN_NOP_SMEM, module=self._attn_mod)
+
+    def attn_nop_fwd(self, q, k, v, scale):
+        """q,k,v 为 [seq, nh, dh] fp32。只写 O，不写 P。"""
+        self.ensure_attn_nop()
+        if len(q.shape) != 3 or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape):
+            raise CudaError("attn_nop_fwd 需要同形状 3D，收到 %s %s %s" % (q.shape, k.shape, v.shape))
+        seq, nh, dh = (int(x) for x in q.shape)
+        o = self.zeros((seq, nh, dh), dtype=np.float32)
+        self._attn_nop_launch("attn_fwd_nop", seq, nh, dh, [
+            self._ptr(q), self._ptr(k), self._ptr(v), self._ptr(o),
+            (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
+            (float(scale), ctypes.c_float),
+        ])
+        return o
+
+    def attn_nop_bwd(self, do, q, k, v, scale):
+        """不读 P。dQ/dK/dV 与 q 同为 [seq, nh, dh]。"""
+        self.ensure_attn_nop()
+        if (len(do.shape) != 3 or tuple(do.shape) != tuple(q.shape)
+                or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape)):
+            raise CudaError("attn_nop_bwd 形状不一致: dO%s Q%s K%s V%s" % (
+                do.shape, q.shape, k.shape, v.shape))
+        seq, nh, dh = (int(x) for x in q.shape)
+        dq = self.zeros((seq, nh, dh), dtype=np.float32)
+        dk = self.zeros((seq, nh, dh), dtype=np.float32)
+        dv = self.zeros((seq, nh, dh), dtype=np.float32)
+        self._attn_nop_launch("attn_bwd_recompute", seq, nh, dh, [
+            self._ptr(do), self._ptr(q), self._ptr(k), self._ptr(v),
+            self._ptr(dq), self._ptr(dk), self._ptr(dv),
+            (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
+            (float(scale), ctypes.c_float),
+        ])
+        return dq, dk, dv
 
 
 _RT = None

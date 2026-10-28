@@ -67,7 +67,9 @@ MoE（nn.MoE，CPU / CUDA 同一份模块，激活不整段拉回主机）：
     * M5 里仍只在 CPU 上的算子：exp / log / abs / clamp / cat / stack / einsum
       / max / min / topk / where（CUDA 上仍是 NotImplementedError）
     * 默认重算（activation checkpoint）
-    * dh=64 的 flash / tiled attention kernel（判分台 Dh=8，那些 kernel 直接 return）
+    * 默认 SDPA 仍物化 P。dh=64 且 causal 的低显存路径要显式 lowmem=True
+      （functional.sdpa_lowmem / scaled_dot_product_attention(..., lowmem=True)），
+      其它 dh 或非 causal 回退到物化实现。判分台 Dh=8，不会走到这条路径
     * 与 PyTorch 逐位相同的随机数、float64 存储、torch.save 的 zip 格式
 """
 from __future__ import annotations
@@ -1820,22 +1822,34 @@ class _Functional:
         return z - e.sum(axis=axis, keepdims=True).log()
 
     @staticmethod
-    def scaled_dot_product_attention(q: Tensor, k: Tensor, v: Tensor, causal=False, is_causal=None, scale=None):
-        """q,k,v: [B*H, S, Dh]（已展平 head）。causal=True 时做下三角掩码。"""
+    def scaled_dot_product_attention(q: Tensor, k: Tensor, v: Tensor, causal=False, is_causal=None,
+                                     scale=None, lowmem=False):
+        """q,k,v: [B*H, S, Dh]（已展平 head）。causal=True 时做下三角掩码。
+
+        lowmem=True 且设备是 CUDA、dh==64、causal 时，走不物化 P 的内核。
+        其它情况（含 dh!=64、非 causal、CPU）回退到下面的物化实现。默认 lowmem=False。
+        """
         if is_causal is not None:
             causal = bool(is_causal)
-        dh = q.shape[-1]
+        dh = int(q.shape[-1])
         if scale is None:
             scale = 1.0 / np.sqrt(dh)
         else:
             scale = float(scale)
-        scores = (q @ k.swap_last2()) * scale                  # [BH,S,S]
-        if causal:
-            S = scores.shape[-1]
-            mask = np.triu(np.full((S, S), -1e30, dtype=np.float32), k=1)
-            scores = scores + Tensor(mask)                     # 常数，不回传梯度
-        p = _Functional.softmax(scores, axis=-1)
-        return p @ v
+        if lowmem and _sdpa_lowmem_ok(q, k, v, causal, dh):
+            return _sdpa_lowmem(q, k, v, scale)
+        return _sdpa_materialized(q, k, v, causal, scale)
+
+    @staticmethod
+    def sdpa_lowmem(q: Tensor, k: Tensor, v: Tensor, causal=True, scale=None):
+        """不物化 P 的 SDPA。dh!=64、非 causal 或非 CUDA 时回退到物化实现。"""
+        return _Functional.scaled_dot_product_attention(
+            q, k, v, causal=causal, scale=scale, lowmem=True)
+
+    @staticmethod
+    def sdpa_lowmem_ready():
+        """提前编译 tgai_attn_nop.cu。计时前调用，避免把 NVRTC 算进 s/step。"""
+        return _cuda().ensure_attn_nop()
 
     @staticmethod
     def cross_entropy(logits: Tensor, target, ignore_index=-100):
@@ -1858,6 +1872,64 @@ class _Functional:
 
 
 functional = _Functional()
+
+
+def _sdpa_materialized(q, k, v, causal, scale):
+    """物化 scores/P 的 SDPA。默认路径，也是 lowmem 不合格时的回退。"""
+    scores = (q @ k.swap_last2()) * scale                  # [BH,S,S]
+    if causal:
+        S = scores.shape[-1]
+        mask = np.triu(np.full((S, S), -1e30, dtype=np.float32), k=1)
+        scores = scores + Tensor(mask)                     # 常数，不回传梯度
+    p = _Functional.softmax(scores, axis=-1)
+    return p @ v
+
+
+def _sdpa_lowmem_ok(q, k, v, causal, dh):
+    """内核契约：CUDA、causal、dh==64、三维同形状 [BH, S, Dh]。"""
+    if not causal or dh != 64:
+        return False
+    if getattr(q, "device", "cpu") != "cuda":
+        return False
+    if getattr(k, "device", "cpu") != "cuda" or getattr(v, "device", "cpu") != "cuda":
+        return False
+    if q.ndim != 3 or tuple(k.shape) != tuple(q.shape) or tuple(v.shape) != tuple(q.shape):
+        return False
+    bh, seq, _dh = q.shape
+    return int(bh) > 0 and int(seq) > 0
+
+
+def _sdpa_lowmem(q, k, v, scale):
+    """[BH, S, Dh] -> 显式 permute 成 [S, BH, Dh] 再调内核，结果 permute 回来。
+
+    B=1 时 BH 就是 H，布局正好是内核要的 [S, H, Dh]。B>1 时各头本来就不互相看，
+    把 BH 当成 nh 同样成立。反向不读 P，由 attn_bwd_recompute 重算。
+    """
+    rt = _cuda()
+    rt.ensure_attn_nop()
+    # 走运行时 permute，不把这次拷贝接进 autograd，避免和自定义 VJP 重复反传。
+    q_sk = rt.permute(q._gpu, (1, 0, 2))
+    k_sk = rt.permute(k._gpu, (1, 0, 2))
+    v_sk = rt.permute(v._gpu, (1, 0, 2))
+    o_sk = rt.attn_nop_fwd(q_sk, k_sk, v_sk, scale)
+    o_hs = rt.permute(o_sk, (1, 0, 2))
+    need = bool(q.requires_grad or k.requires_grad or v.requires_grad)
+    out = Tensor._from_gpu(o_hs, requires_grad=need, _parents=(q, k, v) if need else ())
+    if not need:
+        return out
+
+    def bw(g, grads):
+        g_sk = rt.permute(g, (1, 0, 2))
+        dq_sk, dk_sk, dv_sk = rt.attn_nop_bwd(g_sk, q_sk, k_sk, v_sk, scale)
+        if q.requires_grad:
+            _acc(grads, q, rt.permute(dq_sk, (1, 0, 2)))
+        if k.requires_grad:
+            _acc(grads, k, rt.permute(dk_sk, (1, 0, 2)))
+        if v.requires_grad:
+            _acc(grads, v, rt.permute(dv_sk, (1, 0, 2)))
+
+    out._backward = bw
+    return out
 
 
 def _softmax_cuda(x, axis):

@@ -151,7 +151,7 @@ def run_torch(layers, steps, seq):
 
 
 # ─────────────────────────── tgai_go.train ───────────────────────────
-def run_tgai(layers, steps, seq):
+def run_tgai(layers, steps, seq, attn="lowmem"):
     import tgai_go.train as T
 
     F = T.functional
@@ -177,6 +177,9 @@ def run_tgai(layers, steps, seq):
 
     x, y = make_batch(seq)
     B, S, DH = 1, seq, D // NH
+    # 编译不计入 s/step。主模块在 set_device 里已经编过；nop 内核只在 lowmem 时加载。
+    if attn == "lowmem":
+        F.sdpa_lowmem_ready()
     losses = []
     t0 = time.perf_counter()
     for _ in range(steps):
@@ -186,7 +189,10 @@ def run_tgai(layers, steps, seq):
             q = b["q"](n.reshape(B * S, D)).reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
             k = b["k"](n.reshape(B * S, D)).reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
             v = b["v"](n.reshape(B * S, D)).reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
-            o = F.scaled_dot_product_attention(q, k, v, causal=True)
+            if attn == "lowmem":
+                o = F.scaled_dot_product_attention(q, k, v, causal=True, lowmem=True)
+            else:
+                o = F.scaled_dot_product_attention(q, k, v, causal=True)
             o = o.reshape(B, NH, S, DH).permute(0, 2, 1, 3).reshape(B * S, D)
             h = h + b["o"](o).reshape(B, S, D)
             h = h + b["moe"](b["n2"](h)).reshape(B, S, D)
@@ -211,13 +217,16 @@ def main():
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--steps", type=int, default=3)
     ap.add_argument("--seq", type=int, default=2048)
+    ap.add_argument("--attn", choices=["lowmem", "legacy"], default="lowmem",
+                    help="仅 tgai：lowmem 不物化 P（默认）；legacy 是原来的 bmm+softmax")
     a = ap.parse_args()
-    print("配置: d=%d nh=%d ff=%d E=%d top%d V=%d seq=%d layers=%d steps=%d（MoE）"
-          % (D, NH, FF, E, TOPK, V, a.seq, a.layers, a.steps))
+    print("配置: d=%d nh=%d ff=%d E=%d top%d V=%d seq=%d layers=%d steps=%d（MoE） attn=%s"
+          % (D, NH, FF, E, TOPK, V, a.seq, a.layers, a.steps,
+             a.attn if a.backend == "tgai" else "torch"))
     if a.backend == "torch":
         run_torch(a.layers, a.steps, a.seq)
     else:
-        run_tgai(a.layers, a.steps, a.seq)
+        run_tgai(a.layers, a.steps, a.seq, attn=a.attn)
     return 0
 
 
