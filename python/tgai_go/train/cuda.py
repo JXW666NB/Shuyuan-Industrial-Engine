@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
-"""tgai_go.train 的 CUDA 运行时（M1）。
+"""tgai_go.train 的 CUDA 运行时（M1 + Linux + M2 算子）。
 
-不 import torch。只通过 ctypes 调用：
-    * nvcuda.dll          显存 / 上下文 / 模块加载
-    * cublas64_*.dll      cublasSgemm（行优先 fp32）
-    * nvrtc64_*.dll       编译本文件内嵌的 device 源码
+不 import torch。只通过 ctypes 调用驱动、cuBLAS、NVRTC：
 
-内嵌的 cross_entropy 来自仓库 training/kernels/tgai_ce.cu（行为保持一致），
-编译进本包，训练包不 import training 目录。
+    Windows: nvcuda.dll / cublas64_*.dll / nvrtc64_*.dll
+    Linux:   libcuda.so.1 / libcublas.so.12 / libnvrtc.so.12
+             （cuBLAS、NVRTC 用完整路径 CDLL，不改 LD_LIBRARY_PATH）
+
+内嵌 device 源码来自 training/kernels/tgai_ce.cu、tgai_fwd.cu、tgai_bwd.cu，
+编译进本包，训练包不 import training 目录。算子公式不在这里重写。
 
 cuBLAS 句柄设为 CUBLAS_PEDANTIC_MATH，让 cublasSgemm 走
 CUBLAS_COMPUTE_32F_PEDANTIC，避免 Ampere+ 默认 TF32 把 fp32 GEMM 拉到 ~1e-3。
@@ -102,7 +103,161 @@ extern "C" __global__ void ewise_scale(const float* a, float s, float* c, int n)
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) c[i] = a[i] * s;
 }
+
+extern "C" __global__ void ewise_mul(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = a[i] * b[i];
+}
+
+/* One block, 256 threads. The launch site must use that block size. */
+extern "C" __global__ void reduce_sum(const float* a, float* out, int n) {
+    __shared__ float smem[256];
+    float local = 0.f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        local += a[i];
+    }
+    smem[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = smem[0];
+}
 """
+
+# 下面几段从 training/kernels/tgai_fwd.cu、tgai_bwd.cu 原样摘出来。
+# 不改公式。silu_mul_fwd 是原地的，Python 侧先 clone 再调。
+_M2_KERNELS = r"""
+extern "C" __global__ void rmsnorm_fwd(float* out, const float* x, const float* w,
+                                       int seq, int d, float eps) {
+    const int t = (int)blockIdx.x;
+    if (t >= seq || d <= 0) return;
+
+    const float* row = x + (long long)t * d;
+    float* orow = out + (long long)t * d;
+
+    float local = 0.f;
+    for (int i = (int)threadIdx.x; i < d; i += (int)blockDim.x) {
+        float v = row[i];
+        local += v * v;
+    }
+
+    extern __shared__ float red[];
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = (int)blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) red[threadIdx.x] += red[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    float inv = rsqrtf(red[0] / (float)d + eps);
+    for (int i = (int)threadIdx.x; i < d; i += (int)blockDim.x) {
+        orow[i] = row[i] * inv * w[i];
+    }
+}
+
+__device__ __forceinline__ float silu_f(float v) {
+    if (v >= 0.f) return v / (1.f + expf(-v));
+    float e = expf(v);
+    return v * (e / (1.f + e));
+}
+
+extern "C" __global__ void silu_mul_fwd(float* a, const float* b, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) a[i] = silu_f(a[i]) * b[i];
+}
+
+extern "C" __global__ void emb_gather_fwd(float* out, const float* emb, const int* ids,
+                                          int seq, int d, int vocab, int unk) {
+    int t = (int)blockIdx.x;
+    if (t >= seq) return;
+    int id = ids[t];
+    if (id < 0 || id >= vocab) id = unk;
+    const float* src = emb + (long long)id * d;
+    float* dst = out + (long long)t * d;
+    for (int i = (int)threadIdx.x; i < d; i += (int)blockDim.x) dst[i] = src[i];
+}
+
+__device__ __forceinline__ float blk_sum(float v, float* smem) {
+    const int tid = threadIdx.x;
+    smem[tid] = v;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s)
+            smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    const float out = smem[0];
+    __syncthreads();
+    return out;
+}
+
+extern "C" __global__ void rmsnorm_bwd(const float* dy, const float* x, const float* w,
+                                       float* dx, float* dw, int seq, int d, float eps) {
+    __shared__ float smem[256];
+    const int t = (int)blockIdx.x;
+    if (t >= seq)
+        return;
+
+    const int tid = (int)threadIdx.x;
+    const int stride = (int)blockDim.x;
+    const float* xrow = x + t * d;
+    const float* dyrow = dy + t * d;
+    float* dxrow = dx + t * d;
+
+    float sumsq = 0.f;
+    float dot = 0.f;
+    for (int i = tid; i < d; i += stride) {
+        const float xi = xrow[i];
+        sumsq += xi * xi;
+        dot += dyrow[i] * xi * w[i];
+    }
+    sumsq = blk_sum(sumsq, smem);
+    dot = blk_sum(dot, smem);
+
+    const float inv_d = 1.f / (float)d;
+    const float rstd = rsqrtf(sumsq * inv_d + eps);
+    const float scale = rstd * rstd * rstd * inv_d;
+
+    for (int i = tid; i < d; i += stride) {
+        const float xi = xrow[i];
+        const float dyi = dyrow[i];
+        dxrow[i] = rstd * dyi * w[i] - scale * xi * dot;
+        atomicAdd(dw + i, dyi * xi * rstd);
+    }
+}
+
+extern "C" __global__ void silu_mul_bwd(const float* g, const float* a, const float* b,
+                                        float* da, float* db, int n) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n)
+        return;
+    const float av = a[i];
+    const float sig = 1.f / (1.f + expf(-av));
+    const float silu = av * sig;
+    const float dsilu = sig * (1.f + av * (1.f - sig));
+    const float gv = g[i];
+    da[i] = gv * b[i] * dsilu;
+    db[i] = gv * silu;
+}
+
+extern "C" __global__ void emb_gather_bwd(const float* g, const int* ids, float* demb,
+                                         int seq, int d) {
+    const int t = (int)blockIdx.x;
+    if (t >= seq)
+        return;
+    const int id = ids[t];
+    const float* grow = g + t * d;
+    float* erow = demb + id * d;
+    for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x)
+        atomicAdd(erow + j, grow[j]);
+}
+"""
+
+
+def _device_source():
+    return _CE_AND_HELPERS + "\n" + _M2_KERNELS
 
 
 class CudaError(RuntimeError):
@@ -219,6 +374,72 @@ def _is_cublas_main(name):
     return low.startswith("cublas64_") and low.endswith(".dll") and "lt" not in low
 
 
+def _dedupe_dirs(dirs):
+    out = []
+    seen = set()
+    for d in dirs:
+        if not d or d in seen or not os.path.isdir(d):
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
+def _linux_lib_dirs():
+    """Linux 上找 libcuda / libcublas / libnvrtc 的目录。不写 LD_LIBRARY_PATH。"""
+    dirs = []
+    extra = os.environ.get("TGAI_CUDA_BIN")
+    if extra:
+        dirs.append(extra)
+    for key in ("CUDA_PATH", "CUDA_HOME"):
+        root = os.environ.get(key)
+        if root:
+            dirs.append(os.path.join(root, "lib64"))
+            dirs.append(os.path.join(root, "lib"))
+    try:
+        import sysconfig
+        pure = sysconfig.get_path("purelib")
+    except Exception:
+        pure = None
+    if pure:
+        nvidia = os.path.join(pure, "nvidia")
+        if os.path.isdir(nvidia):
+            try:
+                pkgs = sorted(os.listdir(nvidia))
+            except OSError:
+                pkgs = []
+            for pkg in pkgs:
+                lib = os.path.join(nvidia, pkg, "lib")
+                if os.path.isdir(lib):
+                    dirs.append(lib)
+    dirs.append("/usr/lib/x86_64-linux-gnu")
+    dirs.append("/usr/lib64")
+    return _dedupe_dirs(dirs)
+
+
+def _preload(path):
+    if path and os.path.isfile(path):
+        ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+
+
+def _alias_driver_symbol(cu, name):
+    """优先 _v2。Windows 上不带后缀的是旧 32 位 ABI，缺 _v2 就报错。
+
+    Linux 驱动 610.57 上实测：cuMemAlloc 与 cuMemAlloc_v2 地址不同，
+    不带后缀的 cuMemAlloc 在 primary context 上返回 201。所以这里也优先 _v2。
+    只有 Linux 且库里根本没有 _v2 时，才退回不带后缀的符号。
+    """
+    v2 = getattr(cu, name + "_v2", None)
+    if v2 is not None:
+        setattr(cu, name, v2)
+        return
+    if sys.platform != "win32" and getattr(cu, name, None) is not None:
+        return
+    raise CudaError(
+        "驱动库没有 %s_v2。不能用旧入口：primary context 上会 rc=201。" % name
+    )
+
+
 class CudaRuntime:
     def __init__(self):
         self.ready = False
@@ -244,17 +465,31 @@ class CudaRuntime:
         return self
 
     def _init_driver(self):
-        self._dirs = _dll_dirs()
-        for d in self._dirs:
-            _prepare_dir(d)
-        try:
-            self.cu = ctypes.WinDLL("nvcuda.dll")
-        except OSError as ex:
-            raise CudaError(
-                "找不到 nvcuda.dll（NVIDIA 驱动没加载）。"
-                "当前进程建不了 CUDA 上下文。需要一台已装驱动的 NVIDIA GPU。"
-                " 原始错误: %s" % (ex,)
-            ) from ex
+        if sys.platform == "win32":
+            self._dirs = _dll_dirs()
+            for d in self._dirs:
+                _prepare_dir(d)
+            try:
+                self.cu = ctypes.WinDLL("nvcuda.dll")
+            except OSError as ex:
+                raise CudaError(
+                    "找不到 nvcuda.dll（NVIDIA 驱动没加载）。"
+                    "当前进程建不了 CUDA 上下文。需要一台已装驱动的 NVIDIA GPU。"
+                    " 原始错误: %s" % (ex,)
+                ) from ex
+        else:
+            self._dirs = _linux_lib_dirs()
+            path = _find_file(["libcuda.so.1", "libcuda.so"], self._dirs)
+            try:
+                if path:
+                    self.cu = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                else:
+                    self.cu = ctypes.CDLL("libcuda.so.1", mode=ctypes.RTLD_GLOBAL)
+            except OSError as ex:
+                raise CudaError(
+                    "找不到 libcuda.so.1（NVIDIA 驱动没加载）。已查目录: %s。"
+                    " 原始错误: %s" % (self._dirs or ["<空>"], ex)
+                ) from ex
         self._bind_driver()
         self._chk(self.cu.cuInit(0), "cuInit")
         dev = ctypes.c_int()
@@ -276,13 +511,7 @@ class CudaRuntime:
         # cuDevicePrimaryCtxRetain 的 context 会直接返回
         # CUDA_ERROR_INVALID_CONTEXT (201)，尽管 cuCtxGetCurrent 对得上。
         for name in ("cuMemAlloc", "cuMemFree", "cuMemcpyHtoD", "cuMemcpyDtoH", "cuMemcpyDtoD"):
-            v2 = getattr(cu, name + "_v2", None)
-            if v2 is None:
-                raise CudaError(
-                    "nvcuda.dll 没有 %s_v2。不能用旧的 32 位入口，否则 primary context 上会 rc=201。"
-                    % name
-                )
-            setattr(cu, name, v2)
+            _alias_driver_symbol(cu, name)
         cu.cuInit.argtypes = [ctypes.c_uint]
         cu.cuInit.restype = ctypes.c_int
         cu.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
@@ -338,18 +567,40 @@ class CudaRuntime:
                 extra = " " + msg.value.decode("utf-8", "replace")
         raise CudaError("%s 失败 rc=%d%s" % (what, int(rc), extra))
 
-    def _init_cublas(self):
-        path = _find_glob(_is_cublas_main, self._dirs)
-        if path is None:
-            path = _find_file(["cublas64_12.dll", "cublas64_11.dll"], self._dirs)
+    def _cublas_path(self):
+        if sys.platform == "win32":
+            path = _find_glob(_is_cublas_main, self._dirs)
+            if path is None:
+                path = _find_file(["cublas64_12.dll", "cublas64_11.dll"], self._dirs)
+            if path is None:
+                raise CudaError(
+                    "找不到 cublas64_*.dll。已查目录: %s" % (self._dirs or ["<空>"])
+                )
+            return path
+        path = _find_file(["libcublas.so.12", "libcublas.so"], self._dirs)
         if path is None:
             raise CudaError(
-                "找不到 cublas64_*.dll。已查目录: %s" % (self._dirs or ["<空>"])
+                "找不到 libcublas.so.12。已查目录: %s" % (self._dirs or ["<空>"])
             )
+        return path
+
+    def _init_cublas(self):
+        path = self._cublas_path()
         folder = os.path.dirname(path)
         _prepare_dir(folder)
+        if sys.platform != "win32":
+            # 同目录预加载 cublasLt。这台机器的 libcublas 自带 $ORIGIN，
+            # 直接 CDLL 也能开；预加载是为了不依赖 LD_LIBRARY_PATH。
+            for name in ("libcublasLt.so.12", "libcublasLt.so"):
+                try:
+                    _preload(os.path.join(folder, name))
+                except OSError:
+                    pass
         try:
-            self.cublas = ctypes.CDLL(path)
+            if sys.platform == "win32":
+                self.cublas = ctypes.CDLL(path)
+            else:
+                self.cublas = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
         except OSError as ex:
             raise CudaError("加载 %s 失败: %s" % (path, ex)) from ex
         self._cublas_path = path
@@ -414,16 +665,41 @@ class CudaRuntime:
             "compute capability minor")
         return "compute_%d%d" % (int(major.value), int(minor.value))
 
-    def _init_kernels(self):
-        path = _find_glob(_is_nvrtc_main, self._dirs)
+    def _nvrtc_path(self):
+        if sys.platform == "win32":
+            path = _find_glob(_is_nvrtc_main, self._dirs)
+            if path is None:
+                raise CudaError(
+                    "找不到 nvrtc64_*.dll（NVRTC）。已查目录: %s" % (self._dirs or ["<空>"])
+                )
+            return path
+        path = _find_file(["libnvrtc.so.12", "libnvrtc.so"], self._dirs)
         if path is None:
             raise CudaError(
-                "找不到 nvrtc64_*.dll（NVRTC）。cross_entropy 要用它编译 tgai_ce.cu。"
-                " 已查目录: %s" % (self._dirs or ["<空>"])
+                "找不到 libnvrtc.so.12（NVRTC）。已查目录: %s" % (self._dirs or ["<空>"])
             )
-        _prepare_dir(os.path.dirname(path))
+        return path
+
+    def _init_kernels(self):
+        path = self._nvrtc_path()
+        folder = os.path.dirname(path)
+        _prepare_dir(folder)
+        if sys.platform != "win32":
+            try:
+                names = os.listdir(folder)
+            except OSError:
+                names = []
+            for name in names:
+                if name.startswith("libnvrtc-builtins.so"):
+                    try:
+                        _preload(os.path.join(folder, name))
+                    except OSError:
+                        pass
         try:
-            self.nvrtc = ctypes.WinDLL(path)
+            if sys.platform == "win32":
+                self.nvrtc = ctypes.WinDLL(path)
+            else:
+                self.nvrtc = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
         except OSError as ex:
             raise CudaError("加载 %s 失败: %s" % (path, ex)) from ex
         self._bind_nvrtc()
@@ -468,7 +744,7 @@ class CudaRuntime:
         arr = (ctypes.c_char_p * len(opts_b))(*opts_b)
         prog = ctypes.c_void_p()
         rc = self.nvrtc.nvrtcCreateProgram(
-            ctypes.byref(prog), _CE_AND_HELPERS.encode("utf-8"), b"tgai_m1.cu", 0, None, None)
+            ctypes.byref(prog), _device_source().encode("utf-8"), b"tgai_train.cu", 0, None, None)
         self._chk_nvrtc(rc, "nvrtcCreateProgram", prog)
         rc = self.nvrtc.nvrtcCompileProgram(prog, len(opts_b), arr)
         log = self._nvrtc_log(prog)
@@ -584,7 +860,7 @@ class CudaRuntime:
         self._fns[name] = out
         return out
 
-    def launch(self, name, grid, block, args):
+    def launch(self, name, grid, block, args, shared=0):
         self._activate()
         fn = self._fn(name)
         holders = []
@@ -597,7 +873,7 @@ class CudaRuntime:
             fn,
             int(grid[0]), int(grid[1]), int(grid[2]),
             int(block[0]), int(block[1]), int(block[2]),
-            0, ctypes.c_void_p(0), ptrs, None)
+            int(shared), ctypes.c_void_p(0), ptrs, None)
         self._chk(rc, "cuLaunchKernel(%s)" % name)
         return holders
 
@@ -722,6 +998,103 @@ class CudaRuntime:
             (int(n), ctypes.c_int), (int(v), ctypes.c_int),
         ])
         return dl
+
+    def zeros(self, shape, dtype=np.float32):
+        return self.h2d(np.zeros(tuple(shape), dtype=dtype), dtype=dtype)
+
+    def mul(self, a, b):
+        if a.shape != b.shape or a.n != b.n:
+            raise CudaError("ewise_mul 形状不同: %s vs %s" % (a.shape, b.shape))
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_mul", grid, block, [
+                self._ptr(a), self._ptr(b), self._ptr(out),
+                (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def sum_all(self, buf):
+        """全归约。一个 256 线程的 block，M2 的张量都很小。"""
+        out = self.empty((), dtype=np.float32)
+        n = int(buf.n)
+        if n <= 0:
+            zero = np.zeros((), dtype=np.float32)
+            self._chk(self.cu.cuMemcpyHtoD(
+                ctypes.c_uint64(out.ptr),
+                zero.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_size_t(4)), "cuMemcpyHtoD(sum0)")
+            return out
+        self.launch("reduce_sum", (1, 1, 1), (256, 1, 1), [
+            self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
+        ])
+        return out
+
+    def rmsnorm_fwd(self, x, w, seq, d, eps):
+        out = self.empty(x.shape, dtype=np.float32)
+        if seq and d:
+            # 动态共享内存按 256 个 float。block 必须是 256，和 kernel 里的树归约一致。
+            self.launch("rmsnorm_fwd", (int(seq), 1, 1), (256, 1, 1), [
+                self._ptr(out), self._ptr(x), self._ptr(w),
+                (int(seq), ctypes.c_int), (int(d), ctypes.c_int),
+                (float(eps), ctypes.c_float),
+            ], shared=256 * 4)
+        return out
+
+    def rmsnorm_bwd(self, dy, x, w, seq, d, eps):
+        dx = self.empty(x.shape, dtype=np.float32)
+        dw = self.zeros(w.shape, dtype=np.float32)
+        if seq and d:
+            # rmsnorm_bwd 的静态 smem 是 256，block 不能改。
+            self.launch("rmsnorm_bwd", (int(seq), 1, 1), (256, 1, 1), [
+                self._ptr(dy), self._ptr(x), self._ptr(w),
+                self._ptr(dx), self._ptr(dw),
+                (int(seq), ctypes.c_int), (int(d), ctypes.c_int),
+                (float(eps), ctypes.c_float),
+            ])
+        return dx, dw
+
+    def silu_mul_fwd(self, a, b):
+        """原地：a[i] = silu(a[i]) * b[i]。调用方要先 clone。"""
+        if a.n != b.n:
+            raise CudaError("silu_mul 长度不同: %s vs %s" % (a.n, b.n))
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("silu_mul_fwd", grid, block, [
+                self._ptr(a), self._ptr(b), (int(a.n), ctypes.c_int),
+            ])
+        return a
+
+    def silu_mul_bwd(self, g, a, b):
+        da = self.empty(a.shape, dtype=np.float32)
+        db = self.empty(b.shape, dtype=np.float32)
+        n = int(a.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("silu_mul_bwd", grid, block, [
+                self._ptr(g), self._ptr(a), self._ptr(b),
+                self._ptr(da), self._ptr(db), (n, ctypes.c_int),
+            ])
+        return da, db
+
+    def emb_fwd(self, table, ids, seq, d, vocab, out_shape):
+        out = self.empty(out_shape, dtype=np.float32)
+        if seq and d:
+            self.launch("emb_gather_fwd", (int(seq), 1, 1), (256, 1, 1), [
+                self._ptr(out), self._ptr(table), self._ptr(ids),
+                (int(seq), ctypes.c_int), (int(d), ctypes.c_int),
+                (int(vocab), ctypes.c_int), (0, ctypes.c_int),
+            ])
+        return out
+
+    def emb_bwd(self, grad, ids, seq, d, table_shape):
+        dw = self.zeros(table_shape, dtype=np.float32)
+        if seq and d:
+            self.launch("emb_gather_bwd", (int(seq), 1, 1), (256, 1, 1), [
+                self._ptr(grad), self._ptr(ids), self._ptr(dw),
+                (int(seq), ctypes.c_int), (int(d), ctypes.c_int),
+            ])
+        return dw
 
 
 _RT = None

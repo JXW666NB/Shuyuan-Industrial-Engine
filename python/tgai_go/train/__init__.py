@@ -15,10 +15,16 @@
 M1 CUDA（见 train/cuda.py，set_device("cuda") 之后新建的张量在 GPU 上）：
     * 显存 + cublasSgemm 的 2D matmul（前向和两个反向）
     * functional.cross_entropy（NVRTC 编译内嵌的 tgai_ce.cu；ignore_index 仍走 CPU）
-    * 其余算子（逐元素、attention、Embedding、RMSNorm、AdamW、Muon）仍是 CPU
 
-尚未做（下一阶段）：
-    * attention / MoE / 优化器的 CUDA 路径
+M2 CUDA（同一份公共 API，不改判分台）：
+    * nn.RMSNorm：rmsnorm_fwd / rmsnorm_bwd
+    * functional.silu 以及同形状 mul：silu_mul_* 与 ewise_mul
+    * nn.Embedding（重复下标走 kernel 里的 atomicAdd）
+    * 判分台用来反传的全归约 sum
+
+尚未做：
+    * attention / MoE / AdamW / Muon 的 CUDA 路径
+    * 带 axis 的 sum、mean、pow、exp、下标
     * 默认重算（activation checkpoint）
 """
 from __future__ import annotations
@@ -220,7 +226,9 @@ class Tensor:
     __radd__ = __add__
 
     def __mul__(self, other):
-        self._cpu_only("mul")
+        if self.device == "cuda" or (
+                isinstance(other, Tensor) and getattr(other, "device", None) == "cuda"):
+            return self._mul_cuda(other)
         other = _as_tensor(other)
         out = Tensor(self.data * other.data,
                      requires_grad=(self.requires_grad or other.requires_grad),
@@ -231,6 +239,41 @@ class Tensor:
                 _acc(grads, self, _unbroadcast(g * other.data, self.shape))
             if other.requires_grad:
                 _acc(grads, other, _unbroadcast(g * self.data, other.shape))
+        out._backward = bw
+        return out
+
+    def _scale_cuda(self, scalar):
+        rt = _cuda()
+        buf = rt.scale(self._gpu, float(scalar))
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.scale(g, float(scalar)))
+        out._backward = bw
+        return out
+
+    def _mul_cuda(self, other):
+        rt = _cuda()
+        if not isinstance(other, Tensor):
+            if isinstance(other, (int, float, np.floating, np.integer)) and not isinstance(other, bool):
+                return self._scale_cuda(float(other))
+            other = _as_tensor(other)
+        if self.device != "cuda" or other.device != "cuda":
+            raise RuntimeError("mul 不能混用 CPU 和 CUDA 张量")
+        if self.shape != other.shape:
+            raise NotImplementedError(
+                "CUDA mul 目前只支持同形状，收到 %s * %s" % (self.shape, other.shape))
+        buf = rt.mul(self._gpu, other._gpu)
+        rg = self.requires_grad or other.requires_grad
+        out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
+        a, b = self._gpu, other._gpu
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.mul(g, b))
+            if other.requires_grad:
+                _acc(grads, other, rt.mul(g, a))
         out._backward = bw
         return out
 
@@ -396,6 +439,10 @@ class Tensor:
         return out
 
     def sum(self, axis=None, keepdims=False):
+        if self.device == "cuda":
+            if axis is not None or keepdims:
+                raise NotImplementedError("CUDA sum 目前只支持全归约")
+            return self._sum_cuda()
         out = Tensor(self.data.sum(axis=axis, keepdims=keepdims),
                      requires_grad=self.requires_grad, _parents=(self,))
         shape = self.shape
@@ -408,7 +455,21 @@ class Tensor:
         out._backward = bw
         return out
 
+    def _sum_cuda(self):
+        rt = _cuda()
+        buf = rt.sum_all(self._gpu)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+        in_shape = self.shape
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.full(in_shape, rt.read_scalar(g)))
+        out._backward = bw
+        return out
+
     def mean(self, axis=None, keepdims=False):
+        if self.device == "cuda":
+            self._cpu_only("mean")
         n = self.data.size if axis is None else self.data.shape[axis]
         return self.sum(axis=axis, keepdims=keepdims) * (1.0 / n)
 
@@ -506,6 +567,8 @@ def _has_array_index(idx):
 class _Functional:
     @staticmethod
     def silu(x: Tensor) -> Tensor:
+        if getattr(x, "device", "cpu") == "cuda":
+            return _silu_cuda(x)
         s = (x * -1.0).exp()
         return x * ((s + 1.0) ** -1.0)
 
@@ -555,6 +618,24 @@ class _Functional:
 
 
 functional = _Functional()
+
+
+def _silu_cuda(x):
+    """silu(x) = silu_mul(clone(x), 1)。反向复用 silu_mul_bwd，b 是全 1。"""
+    rt = _cuda()
+    ones = rt.full(x.shape, 1.0)
+    y = rt.clone(x._gpu)
+    rt.silu_mul_fwd(y, ones)
+    out = Tensor._from_gpu(y, requires_grad=x.requires_grad, _parents=(x,))
+
+    def bw(g, grads):
+        if not x.requires_grad:
+            return
+        da, _db = rt.silu_mul_bwd(g, x._gpu, ones)
+        _acc(grads, x, da)
+
+    out._backward = bw
+    return out
 
 
 def _cross_entropy_cuda(logits, target, ignore_index):
@@ -702,7 +783,31 @@ class Embedding(Module):
 
     def forward(self, idx) -> Tensor:
         idx = np.asarray(idx, dtype=np.int64)
+        if getattr(self.weight, "device", "cpu") == "cuda":
+            return self._forward_cuda(idx)
         return self.weight[idx.reshape(-1)].reshape(idx.shape + (self.weight.shape[1],))
+
+    def _forward_cuda(self, idx):
+        rt = _cuda()
+        flat = np.ascontiguousarray(idx, dtype=np.int64).reshape(-1)
+        vocab = int(self.weight.shape[0])
+        d = int(self.weight.shape[1])
+        if flat.size and ((flat < 0) | (flat >= vocab)).any():
+            raise IndexError("Embedding 下标越界，合法范围是 [0, %d)" % vocab)
+        seq = int(flat.shape[0])
+        ids = rt.h2d(flat.astype(np.int32), dtype=np.int32)
+        out_shape = tuple(int(s) for s in idx.shape) + (d,)
+        y = rt.emb_fwd(self.weight._gpu, ids, seq, d, vocab, out_shape)
+        w = self.weight
+        out = Tensor._from_gpu(y, requires_grad=w.requires_grad, _parents=(w,))
+
+        def bw(g, grads):
+            if not w.requires_grad:
+                return
+            _acc(grads, w, rt.emb_bwd(g, ids, seq, d, w.shape))
+
+        out._backward = bw
+        return out
 
 
 class RMSNorm(Module):
@@ -712,9 +817,35 @@ class RMSNorm(Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
+        if getattr(x, "device", "cpu") == "cuda":
+            return self._forward_cuda(x)
         var = (x * x).mean(axis=-1, keepdims=True)
         inv = (var + Tensor(np.array([self.eps], np.float32))) ** -0.5
         return x * inv * self.weight
+
+    def _forward_cuda(self, x):
+        rt = _cuda()
+        if x.ndim < 1:
+            raise ValueError("RMSNorm 需要至少 1 维")
+        d = int(x.shape[-1])
+        if int(self.weight.numel()) != d:
+            raise ValueError("RMSNorm weight 长度 %d != 最后一维 %d" % (self.weight.numel(), d))
+        seq = int(x.numel() // d) if d else 0
+        eps = float(self.eps)
+        y = rt.rmsnorm_fwd(x._gpu, self.weight._gpu, seq, d, eps)
+        w = self.weight
+        out = Tensor._from_gpu(
+            y, requires_grad=(x.requires_grad or w.requires_grad), _parents=(x, w))
+
+        def bw(g, grads):
+            dx, dw = rt.rmsnorm_bwd(g, x._gpu, w._gpu, seq, d, eps)
+            if x.requires_grad:
+                _acc(grads, x, dx)
+            if w.requires_grad:
+                _acc(grads, w, dw)
+
+        out._backward = bw
+        return out
 
 
 class CausalSelfAttention(Module):
