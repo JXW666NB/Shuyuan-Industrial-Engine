@@ -13,16 +13,18 @@
 
 | 文件 | 覆盖 | 行数 | 对拍结果 |
 |---|---|---|---|
-| `tgai_bwd.cu` | rmsnorm / silu_mul / moe_add / emb_gather / rope / residual / moe_route 的**反向** | 196 | 7/7 PASS |
-| `tgai_opt.cu` | **Muon**（Newton-Schulz 正交化）+ **AdamW** | 132 | 2.4e-07 |
-| `tgai_attn.cu` | causal MHA 前向 + 反向（小 seq 版） | 122 | 2.4e-07 |
-| `tgai_attn_tiled.cu` | tiled MHA 前向 + 反向（seq≥512 的早期版） | 479 | 4.3e-07 |
-| `tgai_attn_flash.cu` | **flash 前向**（online softmax，不落地完整 P） | 559 | 4.5e-07 |
-| `tgai_mm.cu` | matmul 前向 + 反向 | 62 | 1.1e-05 |
-| `tgai_moeblk.cu` | MoE FFN 块（rmsnorm → top-1 路由 → 专家 SwiGLU → 残差） | 151 | 6.9e-07 |
-| `tgai_layer.cu` | **整层**（attention + MoE，11 个梯度） | 329 | 9.0e-07 |
-| `tgai_ce.cu` | softmax 交叉熵（loss + dlogits） | 57 | 2.4e-07 |
-| `tgai_fwd.cu` | 6 个前向算子（并行版） | 148 | 全 PASS |
+| `tgai_bwd.cu` | rmsnorm / silu_mul / moe_add / emb_gather / rope / residual / moe_route 的**反向** | 185 | 7/7 PASS |
+| `tgai_opt.cu` | **Muon**（Newton-Schulz 正交化）+ **AdamW** | 116 | ok=True |
+| `tgai_attn.cu` | causal MHA 前向 + 反向（小 seq 版） | 108 | 2.4e-07 |
+| `tgai_attn_tiled.cu` | tiled MHA 前向 + 反向（seq≥512 的早期版） | 452 | 4.3e-07 |
+| `tgai_attn_flash.cu` | **flash 前向**（online softmax，不落地完整 P） | 569 | 4.46e-07 |
+| `tgai_mm.cu` | matmul 前向 + 反向 | 58 | 1.14e-05 |
+| `tgai_moeblk.cu` | MoE FFN 块（rmsnorm → top-1 路由 → 专家 SwiGLU → 残差） | 137 | 6.91e-07 |
+| `tgai_layer.cu` | **整层**（attention + MoE，11 个梯度） | 305 | 8.96e-07 |
+| `tgai_ce.cu` | softmax 交叉熵（loss + dlogits） | 53 | 2.38e-07 |
+| `tgai_fwd.cu` | 6 个前向算子（并行版） | 134 | 全 PASS |
+
+> 行数与对拍数值均为 **2026-10-28 实测**（`Measure-Object -Line` + 对应 suite 输出）。
 
 ### 2. 判分台（`training/harness/`）
 
