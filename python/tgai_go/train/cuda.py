@@ -1689,7 +1689,14 @@ class CudaRuntime:
         self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(empty_cache)")
         for size, chain in list(self._pool_free.items()):
             while chain:
-                ptr = chain[-1]
+                node = chain[-1]
+                # 池里的节点可能是 (ptr, event) 二元组，也可能是裸 ptr
+                if isinstance(node, tuple):
+                    ptr, ev = node
+                    if ev is not None:
+                        self.cu.cuEventDestroy(ev)
+                else:
+                    ptr = node
                 self._chk(self.cu.cuMemFree(ctypes.c_uint64(int(ptr))), "cuMemFree(empty_cache)")
                 chain.pop()
                 self._pool_cached_bytes -= size
