@@ -12,9 +12,13 @@
     * functional.cross_entropy / softmax / silu
     * state_dict() / load_state_dict()
 
+M1 CUDA（见 train/cuda.py，set_device("cuda") 之后新建的张量在 GPU 上）：
+    * 显存 + cublasSgemm 的 2D matmul（前向和两个反向）
+    * functional.cross_entropy（NVRTC 编译内嵌的 tgai_ce.cu；ignore_index 仍走 CPU）
+    * 其余算子（逐元素、attention、Embedding、RMSNorm、AdamW、Muon）仍是 CPU
+
 尚未做（下一阶段）：
-    * CUDA 后端（接我们自己的 kernel + cuBLAS）
-    * attention / MoE 模块
+    * attention / MoE / 优化器的 CUDA 路径
     * 默认重算（activation checkpoint）
 """
 from __future__ import annotations
@@ -22,11 +26,39 @@ from __future__ import annotations
 import numpy as np
 
 __all__ = [
-    "Tensor", "Parameter", "no_grad",
+    "Tensor", "Parameter", "no_grad", "set_device", "get_device",
     "Module", "Linear", "Embedding", "RMSNorm", "Sequential", "ModuleList",
     "CausalSelfAttention",
     "functional", "nn", "optim",
 ]
+
+# 默认 cpu。只有 set_device("cuda") 成功之后，新建张量才走 GPU。
+# CPU 路径不加载 cuda.py。
+_DEVICE = "cpu"
+
+
+def get_device():
+    return _DEVICE
+
+
+def set_device(device):
+    """'cpu' 或 'cuda'。cuda 会立刻初始化驱动 / cuBLAS / NVRTC，失败则保持 cpu。"""
+    global _DEVICE
+    if not isinstance(device, str):
+        raise TypeError("set_device 需要字符串，收到 %r" % (device,))
+    name = device.lower()
+    if name == "cpu":
+        _DEVICE = "cpu"
+        return
+    if name != "cuda":
+        raise ValueError("set_device 只接受 'cpu' 或 'cuda'，收到 %r" % (device,))
+    _cuda()
+    _DEVICE = "cuda"
+
+
+def _cuda():
+    from .cuda import runtime
+    return runtime()
 
 # ─────────────────────────── 自动微分 ───────────────────────────
 _GRAD_ENABLED = [True]
@@ -62,36 +94,78 @@ def _unbroadcast(grad, shape):
 class Tensor:
     """最小可用的张量：数据 + 梯度 + 反向闭包。"""
 
-    __slots__ = ("data", "grad", "requires_grad", "_parents", "_backward")
+    __slots__ = ("data", "grad", "requires_grad", "_parents", "_backward", "device", "_gpu")
     __array_priority__ = 1000        # 让 ndarray <op> Tensor 走我们的 __r*__
 
-    def __init__(self, data, requires_grad=False, _parents=(), _backward=None):
-        self.data = np.asarray(data, dtype=np.float32)
+    def __init__(self, data, requires_grad=False, _parents=(), _backward=None, device=None):
+        dev = _DEVICE if device is None else device
+        self.device = dev
+        self._gpu = None
         self.grad = None
         self.requires_grad = bool(requires_grad)
         self._parents = _parents
         self._backward = _backward
+        if dev == "cpu":
+            self.data = np.asarray(data, dtype=np.float32)
+            return
+        if dev != "cuda":
+            raise ValueError("Tensor device 只接受 cpu/cuda，收到 %r" % (dev,))
+        arr = np.ascontiguousarray(np.asarray(data, dtype=np.float32))
+        self.data = None
+        self._gpu = _cuda().h2d(arr)
+
+    @classmethod
+    def _from_gpu(cls, gpu, requires_grad=False, _parents=(), _backward=None):
+        obj = cls.__new__(cls)
+        obj.device = "cuda"
+        obj._gpu = gpu
+        obj.data = None
+        obj.grad = None
+        obj.requires_grad = bool(requires_grad)
+        obj._parents = _parents
+        obj._backward = _backward
+        return obj
+
+    def _cpu_only(self, op):
+        if self.device == "cuda":
+            raise NotImplementedError(
+                "CUDA 后端 M1 还没有 %s（已实现 matmul / transpose / cross_entropy）" % op)
 
     # ---- 属性 ----
     @property
     def shape(self):
+        if self.device == "cuda":
+            return self._gpu.shape
         return self.data.shape
 
     @property
     def ndim(self):
+        if self.device == "cuda":
+            return len(self.shape)
         return self.data.ndim
 
     def numel(self):
+        if self.device == "cuda":
+            n = 1
+            for s in self.shape:
+                n *= int(s)
+            return int(n)
         return self.data.size
 
     def numpy(self):
+        if self.device == "cuda":
+            return self.to_numpy()
         return self.data
 
     def __repr__(self):
+        if self.device == "cuda":
+            return "Tensor(shape=%s, device=cuda, requires_grad=%s)" % (self.shape, self.requires_grad)
         return "Tensor(shape=%s, requires_grad=%s)" % (self.data.shape, self.requires_grad)
 
     # ---- 反向 ----
     def backward(self, grad=None):
+        if self.device == "cuda":
+            return self._backward_cuda(grad)
         if not self.requires_grad:
             raise RuntimeError("调用 backward 的张量不参与求导")
         if grad is None:
@@ -129,6 +203,7 @@ class Tensor:
 
     # ---- 算子 ----
     def __add__(self, other):
+        self._cpu_only("add")
         other = _as_tensor(other)
         out = Tensor(self.data + other.data,
                      requires_grad=(self.requires_grad or other.requires_grad),
@@ -145,6 +220,7 @@ class Tensor:
     __radd__ = __add__
 
     def __mul__(self, other):
+        self._cpu_only("mul")
         other = _as_tensor(other)
         out = Tensor(self.data * other.data,
                      requires_grad=(self.requires_grad or other.requires_grad),
@@ -175,6 +251,10 @@ class Tensor:
 
     def __matmul__(self, other):
         other = _as_tensor(other)
+        if self.device == "cuda" or other.device == "cuda":
+            if self.device != "cuda" or other.device != "cuda":
+                raise RuntimeError("matmul 不能混用 CPU 和 CUDA 张量")
+            return self._matmul_cuda(other)
         rg = self.requires_grad or other.requires_grad
         if self.ndim == 2 and other.ndim == 2:
             out = Tensor(self.data @ other.data, requires_grad=rg, _parents=(self, other))
@@ -204,8 +284,84 @@ class Tensor:
         raise NotImplementedError("matmul 支持 2D/3D，收到 %dD x %dD"
                                   % (self.ndim, other.ndim))
 
+    def _matmul_cuda(self, other):
+        if self.ndim != 2 or other.ndim != 2:
+            raise NotImplementedError("CUDA matmul 目前只支持 2D，收到 %dD x %dD"
+                                      % (self.ndim, other.ndim))
+        rt = _cuda()
+        buf = rt.sgemm(self._gpu, other._gpu)
+        rg = self.requires_grad or other.requires_grad
+        out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
+        a, b = self._gpu, other._gpu
+
+        def bw(g, grads):
+            # dA = g @ B^T ，dB = A^T @ g。和 CPU 的 g @ b.T / a.T @ g 同一套形状。
+            if self.requires_grad:
+                _acc(grads, self, rt.gemm_nt(g, b))
+            if other.requires_grad:
+                _acc(grads, other, rt.gemm_tn(a, g))
+        out._backward = bw
+        return out
+
+    def _transpose_cuda(self):
+        if self.ndim != 2:
+            raise NotImplementedError("CUDA transpose 目前只支持 2D，收到 %dD" % self.ndim)
+        rt = _cuda()
+        buf = rt.transpose2d(self._gpu)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.transpose2d(g))
+        out._backward = bw
+        return out
+
+    def _backward_cuda(self, grad):
+        if not self.requires_grad:
+            raise RuntimeError("调用 backward 的张量不参与求导")
+        rt = _cuda()
+        if grad is None:
+            g0 = rt.full(self.shape, 1.0)
+        elif isinstance(grad, Tensor):
+            if grad.device != "cuda":
+                g0 = rt.h2d(np.asarray(grad.to_numpy(), dtype=np.float32).reshape(self.shape))
+            else:
+                g0 = grad._gpu
+        else:
+            g0 = rt.h2d(np.asarray(grad, dtype=np.float32).reshape(self.shape))
+        topo, seen, stack = [], set(), [(self, False)]
+        while stack:
+            node, done = stack.pop()
+            if done:
+                topo.append(node)
+                continue
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            stack.append((node, True))
+            for p in node._parents:
+                if id(p) not in seen:
+                    stack.append((p, False))
+        grads = {id(self): g0}
+        for node in reversed(topo):
+            g = grads.get(id(node))
+            if g is None:
+                continue
+            if getattr(node, "device", "cpu") != "cuda":
+                raise RuntimeError("CUDA 反传遇到 CPU 张量")
+            if node.grad is None:
+                node.grad = Tensor._from_gpu(rt.clone(g), requires_grad=False)
+            else:
+                if not isinstance(node.grad, Tensor) or getattr(node.grad, "device", "cpu") != "cuda":
+                    raise RuntimeError("CUDA 张量的 .grad 必须是 CUDA Tensor")
+                node.grad = Tensor._from_gpu(rt.add(node.grad._gpu, g), requires_grad=False)
+            if node._backward is not None and _GRAD_ENABLED[0]:
+                node._backward(g, grads)
+        rt.sync()
+
     def swap_last2(self):
         """交换最后两维（attention 里对 k 用）。"""
+        self._cpu_only("swap_last2")
         out = Tensor(np.swapaxes(self.data, -1, -2),
                      requires_grad=self.requires_grad, _parents=(self,))
 
@@ -268,6 +424,8 @@ class Tensor:
         return out
 
     def transpose(self):
+        if self.device == "cuda":
+            return self._transpose_cuda()
         out = Tensor(self.data.T, requires_grad=self.requires_grad, _parents=(self,))
 
         def bw(g, grads):
@@ -313,10 +471,17 @@ class Tensor:
         return self * c
 
     def to_numpy(self):
+        if self.device == "cuda":
+            return _cuda().d2h(self._gpu)
         return self.data
 
 
 def _acc(grads, node, g):
+    if getattr(node, "device", "cpu") == "cuda":
+        rt = _cuda()
+        old = grads.get(id(node))
+        grads[id(node)] = g if old is None else rt.add(old, g)
+        return
     g = np.asarray(g, dtype=np.float32)
     old = grads.get(id(node))
     grads[id(node)] = g if old is None else old + g
@@ -374,6 +539,12 @@ class _Functional:
     @staticmethod
     def cross_entropy(logits: Tensor, target, ignore_index=-100):
         """logits [N,V]，target [N]（int）。返回标量 loss（mean）。"""
+        if getattr(logits, "device", "cpu") == "cuda":
+            return _cross_entropy_cuda(logits, target, ignore_index)
+        return _Functional._cross_entropy_cpu(logits, target, ignore_index)
+
+    @staticmethod
+    def _cross_entropy_cpu(logits, target, ignore_index=-100):
         n, v = logits.shape
         lp = _Functional.log_softmax(logits, axis=-1)
         tgt = np.asarray(target, dtype=np.int64).reshape(-1)
@@ -384,6 +555,59 @@ class _Functional:
 
 
 functional = _Functional()
+
+
+def _cross_entropy_cuda(logits, target, ignore_index):
+    """GPU 上的 mean CE。语义与 ce_fwd/ce_bwd 一致，不含 ignore_index。"""
+    tgt = np.asarray(target, dtype=np.int64).reshape(-1)
+    n, v = logits.shape
+    if tgt.shape != (n,):
+        raise ValueError("cross_entropy 目标长度 %s != N=%d" % (tgt.shape, n))
+    if np.any(tgt == ignore_index):
+        return _cross_entropy_cuda_ignore(logits, tgt, ignore_index)
+    if np.any((tgt < 0) | (tgt >= v)):
+        raise ValueError("cross_entropy 目标越界，合法范围是 [0, %d)" % v)
+    rt = _cuda()
+    tgt_buf = rt.h2d(tgt, dtype=np.int32)
+    loss_buf = rt.ce_fwd(logits._gpu, tgt_buf, n, v)
+    out = Tensor._from_gpu(loss_buf, requires_grad=logits.requires_grad, _parents=(logits,))
+
+    def bw(g, grads):
+        if not logits.requires_grad:
+            return
+        dl = rt.ce_bwd(logits._gpu, tgt_buf, n, v)
+        scale = rt.read_scalar(g)
+        if scale != 1.0:
+            dl = rt.scale(dl, scale)
+        _acc(grads, logits, dl)
+
+    out._backward = bw
+    return out
+
+
+def _cross_entropy_cuda_ignore(logits, tgt, ignore_index):
+    """kernel 没有 mask。带 ignore_index 时整段 CE 在 CPU 上算，dlogits 再拷回 GPU。"""
+    global _DEVICE
+    prev = _DEVICE
+    _DEVICE = "cpu"
+    try:
+        host = Tensor(logits.to_numpy(), requires_grad=True)
+        loss_cpu = _Functional._cross_entropy_cpu(host, tgt, ignore_index)
+        loss_host = np.asarray(loss_cpu.data, dtype=np.float32).copy()
+    finally:
+        _DEVICE = prev
+    rt = _cuda()
+    out = Tensor._from_gpu(rt.h2d(loss_host), requires_grad=logits.requires_grad, _parents=(logits,))
+
+    def bw(g, grads):
+        if not logits.requires_grad:
+            return
+        scale = rt.read_scalar(g)
+        loss_cpu.backward(np.asarray(scale, dtype=np.float32))
+        _acc(grads, logits, rt.h2d(host.grad))
+
+    out._backward = bw
+    return out
 
 
 # ─────────────────────────── nn ───────────────────────────
@@ -425,7 +649,12 @@ class Module:
         return [p for _, p in self.named_parameters()]
 
     def state_dict(self, prefix=""):
-        out = {prefix + k: p.data.copy() for k, p in self._params.items()}
+        out = {}
+        for k, p in self._params.items():
+            if getattr(p, "device", "cpu") == "cuda":
+                out[prefix + k] = p.to_numpy().copy()
+            else:
+                out[prefix + k] = p.data.copy()
         for k, m in self._mods.items():
             out.update(m.state_dict(prefix + k + "."))
         return out
@@ -434,7 +663,11 @@ class Module:
         for name, p in self.named_parameters():
             if name not in sd:
                 raise KeyError("缺少参数: %s" % name)
-            p.data = np.asarray(sd[name], dtype=np.float32).reshape(p.data.shape)
+            if getattr(p, "device", "cpu") == "cuda":
+                arr = np.asarray(sd[name], dtype=np.float32).reshape(p.shape)
+                p._gpu = _cuda().h2d(arr)
+            else:
+                p.data = np.asarray(sd[name], dtype=np.float32).reshape(p.data.shape)
         return self
 
     def zero_grad(self):
