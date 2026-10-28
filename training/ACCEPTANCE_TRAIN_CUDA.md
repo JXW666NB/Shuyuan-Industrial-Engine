@@ -77,7 +77,7 @@ CPU 后端的 head 拆分是 `reshape(B,S,H,Dh).reshape(B*H,S,Dh)`，即 **C 顺
 
 ---
 
-## M5 · PyTorch 迁移一致性（进行中：CPU 11/11，CUDA 5/11）
+## M5 · PyTorch 迁移一致性（CPU 11/11，CUDA 11/11 ✅）
 
 **用户硬指标**：把 `import torch` 换成 `import tgai_go.train as torch`，**其余代码一字不改**必须跑通。
 
@@ -88,7 +88,7 @@ optimizer_step / state_dict / reshape_permute / seed_repeat / rmsnorm_attn`
 | 后端 | 结果 |
 |---|---|
 | **CPU**（本机 Windows 与 V100 各跑一次） | **11/11 PASS** |
-| **CUDA**（V100 独立复跑） | **5/11 PASS** |
+| **CUDA**（V100 独立复跑） | **11/11 PASS** ✅ |
 
 ### CUDA 侧未通过的 6 项与真实原因（这是下一步的工作清单）
 
@@ -113,6 +113,26 @@ matmul / bmm / einsum / permute` 等，并把 `nn.Linear` 从"只吃 2D"改成�
 - `manual_seed` 只保证**我们自己的**两次 `randn` 一致，**不保证与 PyTorch 逐位相同**
 - `save` / `load` **不是** `torch.save` 的 zip 格式
 - 比较运算 `>` `<` **未实现**
+
+
+### M5-CUDA 六项修复（2026-10-28 晚，V100 实测 11/11）
+
+| 用例 | 根因 | 修法 |
+|---|---|---|
+| `tensor_basic` | CUDA 侧没有标量/广播加法 | GPU 上做广播加，反向按轴求和（也在设备上） |
+| `linear_nd` | CUDA matmul 只吃 2D | 最后两维 matmul、前导维当 batch，仍走 `cublasSgemm`，反向 unbroadcast |
+| `functional_names` | 缺 `silu_mul_fwd`、缺最后一维 `log_softmax` | 接上已验收的 silu_mul 内核，补 log_softmax |
+| `optimizer_step` | **不是缺梯度**：`nn.Linear` 默认无 bias，`weight.grad` 正常；崩在 weight decay 读 `p.data`，而 CUDA 张量的值在 `_gpu`、`data` 是 `None` | AdamW 的更新改在 GPU 上做；`grad is None` 仍按 PyTorch 语义跳过 |
+| `reshape_permute` | CUDA 后端没有 permute | permute 前向 + 逆置换反向都在 GPU；3D transpose 走 permute |
+| `rmsnorm_attn` | 缺 `rmsnorm_fwd` | 接上已验收的 rmsnorm 内核，**eps=1e-6** |
+
+**回归**（同一轮 V100 复跑）：CPU 一致性 11/11；四个 `--selftest` 全 0；A–H 全 PASS；
+M1 `--cuda` ok=True；M2 四项最差 1.67e-07；M3 最差 7.997e-07。
+
+> **口径说明（必须保留）**：11/11 只证明**这 11 种 PyTorch 写法**可以零改动迁移，
+> **不等于**"任意 PyTorch 代码都能跑"。反例仍然存在（比较运算、`torch.save` zip 格式、
+> dtype 只支持 float32/int64、`manual_seed` 不保证与 PyTorch 逐位一致）。
+> 对外表述应为"常用写法可直接迁移，边界见文档"，而不是"完全兼容"。
 
 ### 我在判分台里发现自己一个错
 

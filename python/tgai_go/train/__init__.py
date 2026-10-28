@@ -36,9 +36,17 @@ M5 CPU（同一份公共 API，浮点一律 fp32）：
       / max / min / topk / where / save / load
     * matmul 支持任意前导维，因此 nn.Linear 接受 ND 输入
 
+M5 CUDA（判分台 `--cuda` 那 6 个洞；值在 GPU 上算，主机只算形状/步长/偏差校正这几个标量）：
+    * 广播 add 的反向：按轴求和，不再把梯度拉回主机
+    * 最后两维 matmul + 前导维广播（3D x 2D 的 Linear）。2D、同 batch 的 3D 仍走原来的 sgemm/bmm
+    * permute，以及 transpose(dim0, dim1) 的非 2D 路径（反向是逆置换）
+    * 最后一维 log_softmax
+    * AdamW.step：参数和动量都在设备上。CUDA 张量的 data 是 None，不是「没有梯度」
+
 尚未做：
-    * 上面这批 M5 算子的 CUDA 内核（CPU 可用；CUDA 上显式 NotImplementedError）
-    * MoE / AdamW / Muon 的 CUDA 路径
+    * M5 里仍只在 CPU 上的算子：exp / log / abs / clamp / cat / stack / einsum
+      / max / min / topk / where（CUDA 上仍是 NotImplementedError）
+    * Muon 的 CUDA 路径（AdamW 已在 GPU 上）
     * 默认重算（activation checkpoint）
     * dh=64 的 flash / tiled attention kernel（判分台 Dh=8，那些 kernel 直接 return）
     * 与 PyTorch 逐位相同的随机数、float64 存储、torch.save 的 zip 格式
@@ -576,7 +584,9 @@ class Tensor:
             out._backward = bw
             return out
         if self.ndim != 2 or other.ndim != 2:
-            raise NotImplementedError("CUDA matmul 目前只支持 2D/3D，收到 %dD x %dD"
+            if self.ndim >= 2 and other.ndim >= 2:
+                return self._matmul_cuda_nd(other)
+            raise NotImplementedError("CUDA matmul 目前只支持至少 2D，收到 %dD x %dD"
                                       % (self.ndim, other.ndim))
         buf = rt.sgemm(self._gpu, other._gpu)
         rg = self.requires_grad or other.requires_grad
@@ -589,6 +599,30 @@ class Tensor:
                 _acc(grads, self, rt.gemm_nt(g, b))
             if other.requires_grad:
                 _acc(grads, other, rt.gemm_tn(a, g))
+        out._backward = bw
+        return out
+
+    def _matmul_cuda_nd(self, other):
+        """最后两维 matmul，前导维广播。反向先乘再 unbroadcast 回原形状。"""
+        rt = _cuda()
+        buf = rt.matmul_general(self._gpu, other._gpu)
+        rg = self.requires_grad or other.requires_grad
+        out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
+        a, b = self._gpu, other._gpu
+        a_shape = tuple(int(s) for s in self.shape)
+        b_shape = tuple(int(s) for s in other.shape)
+
+        def bw(g, grads):
+            if self.requires_grad:
+                da = rt.matmul_general(g, rt.swap_last2(b))
+                if tuple(int(s) for s in da.shape) != a_shape:
+                    da = rt.unbroadcast(da, a_shape)
+                _acc(grads, self, da)
+            if other.requires_grad:
+                db = rt.matmul_general(rt.swap_last2(a), g)
+                if tuple(int(s) for s in db.shape) != b_shape:
+                    db = rt.unbroadcast(db, b_shape)
+                _acc(grads, other, db)
         out._backward = bw
         return out
 
@@ -782,7 +816,7 @@ class Tensor:
             b = int(dim1) + (nd if int(dim1) < 0 else 0)
             if nd == 2 and {a, b} == {0, 1}:
                 return self._transpose_cuda()
-            self._cpu_only("transpose(dim0, dim1)")
+            # 更高维走 permute。下面和 CPU 共用轴交换。
         nd = self.ndim
         a = int(dim0)
         b = int(dim1)
@@ -797,8 +831,6 @@ class Tensor:
     def permute(self, *dims):
         if len(dims) == 1 and isinstance(dims[0], (tuple, list)):
             dims = tuple(dims[0])
-        if self.device == "cuda":
-            self._cpu_only("permute")
         nd = self.ndim
         axes = []
         for d in dims:
@@ -808,6 +840,8 @@ class Tensor:
             axes.append(d)
         if sorted(axes) != list(range(nd)):
             raise ValueError("permute 必须是 0..%d 的一个排列，收到 %s" % (nd - 1, axes))
+        if self.device == "cuda":
+            return self._permute_cuda(tuple(axes))
         moved = np.transpose(self.data, axes)
         if not np.issubdtype(self.data.dtype, np.floating):
             return Tensor(moved, dtype=self.dtype, requires_grad=False)
@@ -816,6 +850,21 @@ class Tensor:
 
         def bw(g, grads):
             _acc(grads, self, np.transpose(g, inv))
+        out._backward = bw
+        return out
+
+    def _permute_cuda(self, axes):
+        rt = _cuda()
+        buf = rt.permute(self._gpu, axes)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+        inv = [0] * len(axes)
+        for i, src in enumerate(axes):
+            inv[src] = i
+        inv = tuple(inv)
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.permute(g, inv))
         out._backward = bw
         return out
 
@@ -1561,7 +1610,7 @@ class _Functional:
         if dim is not None:
             axis = dim
         if getattr(x, "device", "cpu") == "cuda":
-            raise NotImplementedError("CUDA log_softmax 尚未实现")
+            return _log_softmax_cuda(x, axis)
         m = x.data.max(axis=axis, keepdims=True)
         z = x - Tensor(m)
         e = z.exp()
@@ -1637,6 +1686,23 @@ def _silu_cuda(x):
         da, _db = rt.silu_mul_bwd(g, x._gpu, ones)
         _acc(grads, x, da)
 
+    out._backward = bw
+    return out
+
+
+def _log_softmax_cuda(x, axis):
+    """最后一维 log_softmax。反向是 g - softmax(x) * sum(g)。"""
+    if axis != -1 and axis != x.ndim - 1:
+        raise NotImplementedError("CUDA log_softmax 目前只支持最后一维，收到 axis=%r" % (axis,))
+    if x.ndim < 1:
+        raise NotImplementedError("CUDA log_softmax 需要至少 1 维")
+    rt = _cuda()
+    y = rt.log_softmax_lastdim(x._gpu)
+    out = Tensor._from_gpu(y, requires_grad=x.requires_grad, _parents=(x,))
+
+    def bw(g, grads):
+        if x.requires_grad:
+            _acc(grads, x, rt.log_softmax_lastdim_bwd(g, y))
     out._backward = bw
     return out
 
@@ -1939,8 +2005,17 @@ class AdamW(_Optim):
         self.b1, self.b2 = betas
         self.eps = eps
         self.wd = weight_decay
-        self.m = [np.zeros_like(p.data) for p in self.params]
-        self.v = [np.zeros_like(p.data) for p in self.params]
+        self.m = []
+        self.v = []
+        for p in self.params:
+            if getattr(p, "device", "cpu") == "cuda":
+                # 值在 _gpu 上，p.data 是 None。动量也放设备上，别 zeros_like(None)。
+                rt = _cuda()
+                self.m.append(rt.zeros(tuple(int(s) for s in p.shape)))
+                self.v.append(rt.zeros(tuple(int(s) for s in p.shape)))
+            else:
+                self.m.append(np.zeros_like(p.data))
+                self.v.append(np.zeros_like(p.data))
 
     def step(self):
         self.t += 1
@@ -1948,6 +2023,18 @@ class AdamW(_Optim):
         bc2 = 1.0 - self.b2 ** self.t
         for i, p in enumerate(self.params):
             if p.grad is None:
+                continue
+            if getattr(p, "device", "cpu") == "cuda":
+                # 崩在 float * p.data：data 是 None，不是梯度缺失。
+                # Linear 的 weight 参加了前向，grad 是 CUDA Tensor。
+                # PyTorch 的 AdamW 跳过 grad is None；这里同样跳过，更新本身在 GPU 上做。
+                g = p.grad
+                if not isinstance(g, Tensor) or getattr(g, "device", "cpu") != "cuda":
+                    raise TypeError("CUDA AdamW 需要 CUDA Tensor 梯度，收到 %s" % type(g).__name__)
+                _cuda().adamw(
+                    p._gpu, g._gpu, self.m[i], self.v[i],
+                    self.lr, self.b1, self.b2, self.eps, self.wd, bc1, bc2,
+                )
                 continue
             g = p.grad
             if self.wd:

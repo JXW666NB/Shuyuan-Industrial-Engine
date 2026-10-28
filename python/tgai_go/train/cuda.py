@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""tgai_go.train 的 CUDA 运行时（M1 + Linux + M2 + M3 算子）。
+"""tgai_go.train 的 CUDA 运行时（M1 + Linux + M2 + M3 + M5 算子）。
 
 不 import torch。只通过 ctypes 调用驱动、cuBLAS、NVRTC：
 
@@ -321,8 +321,122 @@ extern "C" __global__ void softmax_lastdim_bwd(const float* g, const float* y, f
 """
 
 
+# M5：permute / 按轴求和（广播的反向）/ 广播成目标形状 / 最后一维 log_softmax / AdamW。
+# 形状和步长在主机上算（纯标量）。张量值不回主机。
+_M5_KERNELS = r"""
+extern "C" __global__ void permute8(
+    const float* in, float* out, int n,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+    int st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    int rem = i;
+    int src = 0;
+    for (int d = 7; d >= 0; --d) {
+        int sd = shp[d];
+        int coord = rem % sd;
+        rem /= sd;
+        src += coord * st[d];
+    }
+    out[i] = in[src];
+}
+
+extern "C" __global__ void broadcast_to8(
+    const float* in, float* out, int n,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+    int st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    int rem = i;
+    int src = 0;
+    for (int d = 7; d >= 0; --d) {
+        int sd = shp[d];
+        int coord = rem % sd;
+        rem /= sd;
+        src += coord * st[d];
+    }
+    out[i] = in[src];
+}
+
+/* 沿 axis 求和，输出按该维长度视为 1 的行主序写下（keepdims 布局）。 */
+extern "C" __global__ void sum_axis8(
+    const float* in, float* out, int n_out, int axis, int extent,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int t = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (t >= n_out || extent <= 0) return;
+    int shp[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    int ost[8];
+    int stride = 1;
+    for (int d = 7; d >= 0; --d) {
+        ost[d] = stride;
+        stride *= shp[d];
+    }
+    int coords[8];
+    int rem = t;
+    for (int d = 7; d >= 0; --d) {
+        int sd = (d == axis) ? 1 : shp[d];
+        coords[d] = rem % sd;
+        rem /= sd;
+    }
+    float acc = 0.f;
+    for (int k = 0; k < extent; ++k) {
+        coords[axis] = k;
+        int idx = 0;
+        for (int d = 0; d < 8; ++d) idx += coords[d] * ost[d];
+        acc += in[idx];
+    }
+    out[t] = acc;
+}
+
+extern "C" __global__ void log_softmax_lastdim(const float* x, float* y, int rows, int k) {
+    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (r >= rows || k <= 0) return;
+    const float* row = x + (long long)r * k;
+    float* orow = y + (long long)r * k;
+    float m = row[0];
+    for (int j = 1; j < k; ++j) m = fmaxf(m, row[j]);
+    float sum = 0.f;
+    for (int j = 0; j < k; ++j) sum += expf(row[j] - m);
+    float lse = m + logf(sum);
+    for (int j = 0; j < k; ++j) orow[j] = row[j] - lse;
+}
+
+extern "C" __global__ void log_softmax_lastdim_bwd(const float* g, const float* y, float* dx,
+                                                  int rows, int k) {
+    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (r >= rows || k <= 0) return;
+    const float* grow = g + (long long)r * k;
+    const float* yrow = y + (long long)r * k;
+    float* drow = dx + (long long)r * k;
+    float sg = 0.f;
+    for (int j = 0; j < k; ++j) sg += grow[j];
+    for (int j = 0; j < k; ++j) drow[j] = grow[j] - expf(yrow[j]) * sg;
+}
+
+/* 与 CPU AdamW.step 同一顺序：先 decoupled weight decay，再一阶/二阶动量。原地写 p/m/v。 */
+extern "C" __global__ void adamw_update(
+    float* p, const float* g, float* m, float* v, int n,
+    float b1, float b2, float lr, float eps, float wd, float bc1, float bc2) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    float gi = g[i];
+    float pi = p[i];
+    if (wd != 0.f) pi = pi - lr * wd * pi;
+    float mi = b1 * m[i] + (1.f - b1) * gi;
+    float vi = b2 * v[i] + (1.f - b2) * gi * gi;
+    m[i] = mi;
+    v[i] = vi;
+    p[i] = pi - lr * (mi / bc1) / (sqrtf(vi / bc2) + eps);
+}
+"""
+
+
 def _device_source():
-    return _CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS
+    return _CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS + "\n" + _M5_KERNELS
 
 
 class CudaError(RuntimeError):
@@ -1037,19 +1151,176 @@ class CudaRuntime:
         ])
         return out
 
-    def unbroadcast(self, g, shape):
-        """把广播后的梯度加回原形状。和主机 _unbroadcast 同一套规则。"""
+    def _left_pad8(self, values, fill):
+        values = tuple(int(v) for v in values)
+        if len(values) > 8:
+            raise CudaError("rank %d > 8" % len(values))
+        return (int(fill),) * (8 - len(values)) + values
+
+    def _row_strides(self, shape):
         shape = tuple(int(s) for s in shape)
-        if tuple(int(s) for s in g.shape) == shape:
-            return g
-        host = np.asarray(self.d2h(g), dtype=np.float32)
-        while host.ndim > len(shape):
-            host = host.sum(axis=0)
+        raw = [0] * len(shape)
+        stride = 1
+        for i in range(len(shape) - 1, -1, -1):
+            raw[i] = stride
+            stride *= shape[i]
+        return raw
+
+    def sum_axis(self, buf, axis, keepdims=False):
+        """沿一轴求和。keepdims=False 时丢掉这一维。值留在 GPU。"""
+        shape = tuple(int(s) for s in buf.shape)
+        nd = len(shape)
+        if nd == 0:
+            raise CudaError("sum_axis 不能用于标量")
+        if nd > 8:
+            raise CudaError("sum_axis 最高 8 维，收到 %s" % (shape,))
+        axis = int(axis)
+        if axis < 0:
+            axis += nd
+        if axis < 0 or axis >= nd:
+            raise CudaError("sum_axis 轴 %d 越界（ndim=%d）" % (axis, nd))
+        extent = int(shape[axis])
+        out_keep = list(shape)
+        out_keep[axis] = 1
+        if extent == 0:
+            out = self.zeros(tuple(out_keep), dtype=np.float32)
+        else:
+            out = self.empty(tuple(out_keep), dtype=np.float32)
+            n_out = int(out.n)
+            if n_out:
+                shp8 = self._left_pad8(shape, 1)
+                axis8 = axis + (8 - nd)
+                grid, block = self._ewise_grid(n_out)
+                self.launch("sum_axis8", grid, block, [
+                    self._ptr(buf), self._ptr(out),
+                    (n_out, ctypes.c_int), (axis8, ctypes.c_int), (extent, ctypes.c_int),
+                ] + [(int(s), ctypes.c_int) for s in shp8])
+        if keepdims:
+            return out
+        dropped = shape[:axis] + shape[axis + 1:]
+        return self.reshape(out, dropped)
+
+    def unbroadcast(self, g, shape):
+        """把广播后的梯度加回原形状。规则与主机 _unbroadcast 相同，求和在 GPU 上做。"""
+        shape = tuple(int(s) for s in shape)
+        cur = g
+        if tuple(int(s) for s in cur.shape) == shape:
+            return cur
+        while len(cur.shape) > len(shape):
+            cur = self.sum_axis(cur, 0, keepdims=False)
         for axis, n in enumerate(shape):
-            if n == 1 and host.shape[axis] != 1:
-                host = host.sum(axis=axis, keepdims=True)
-        host = np.ascontiguousarray(host, dtype=np.float32).reshape(shape)
-        return self.h2d(host)
+            if n == 1 and int(cur.shape[axis]) != 1:
+                cur = self.sum_axis(cur, axis, keepdims=True)
+        if tuple(int(s) for s in cur.shape) != shape:
+            cur = self.reshape(cur, shape)
+        return cur
+
+    def broadcast_to(self, buf, shape):
+        """右对齐广播到 shape。已经同形就返回原缓冲。"""
+        shape = tuple(int(s) for s in shape)
+        src = tuple(int(s) for s in buf.shape)
+        if src == shape:
+            return buf
+        if len(shape) > 8 or len(src) > len(shape):
+            raise CudaError("broadcast_to %s -> %s" % (src, shape))
+        if any(s < 0 for s in shape):
+            raise CudaError("broadcast_to 目标形状非法 %s" % (shape,))
+        ndim = len(shape)
+        aligned = (1,) * (ndim - len(src)) + src
+        for a, b in zip(aligned, shape):
+            if a != b and a != 1:
+                raise CudaError("不能广播 %s -> %s" % (src, shape))
+        raw = self._row_strides(src)
+        strides = []
+        base = ndim - len(src)
+        for i, a in enumerate(aligned):
+            if i < base or a == 1:
+                strides.append(0)
+            else:
+                strides.append(int(raw[i - base]))
+        out = self.empty(shape, dtype=np.float32)
+        n = int(out.n)
+        if n:
+            if n > 2147483647:
+                raise CudaError("broadcast_to 元素个数超过 int32")
+            grid, block = self._ewise_grid(n)
+            self.launch("broadcast_to8", grid, block, [
+                self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
+            ] + [(int(s), ctypes.c_int) for s in self._left_pad8(shape, 1)]
+              + [(int(s), ctypes.c_int) for s in self._left_pad8(strides, 0)])
+        return out
+
+    def permute(self, buf, axes):
+        """按轴排列。输出是新的连续缓冲。axes 是输入轴的一个排列。"""
+        axes = tuple(int(a) for a in axes)
+        in_shape = tuple(int(s) for s in buf.shape)
+        nd = len(in_shape)
+        if nd > 8:
+            raise CudaError("permute 最高 8 维，收到 %s" % (in_shape,))
+        if sorted(axes) != list(range(nd)):
+            raise CudaError("permute 不是排列: %s" % (axes,))
+        out_shape = tuple(in_shape[a] for a in axes)
+        in_stride = self._row_strides(in_shape)
+        src_stride = [int(in_stride[a]) for a in axes]
+        out = self.empty(out_shape, dtype=np.float32)
+        n = int(out.n)
+        if n:
+            if n > 2147483647:
+                raise CudaError("permute 元素个数超过 int32")
+            grid, block = self._ewise_grid(n)
+            self.launch("permute8", grid, block, [
+                self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
+            ] + [(int(s), ctypes.c_int) for s in self._left_pad8(out_shape, 1)]
+              + [(int(s), ctypes.c_int) for s in self._left_pad8(src_stride, 0)])
+        return out
+
+    def _broadcast_lead(self, sa, sb):
+        sa = tuple(int(s) for s in sa)
+        sb = tuple(int(s) for s in sb)
+        ndim = max(len(sa), len(sb))
+        if ndim == 0:
+            return ()
+        if ndim > 6:
+            raise CudaError("matmul 前导维 %d 超过 6" % ndim)
+        pa = (1,) * (ndim - len(sa)) + sa
+        pb = (1,) * (ndim - len(sb)) + sb
+        out = []
+        for x, y in zip(pa, pb):
+            if x == y:
+                out.append(x)
+            elif x == 1:
+                out.append(y)
+            elif y == 1:
+                out.append(x)
+            else:
+                raise CudaError("matmul 前导维不能广播: %s vs %s" % (sa, sb))
+        return tuple(out)
+
+    def matmul_general(self, A, B):
+        """最后两维做矩阵乘，前导维按 PyTorch 右对齐广播。没有前导维时就是 sgemm。"""
+        if len(A.shape) < 2 or len(B.shape) < 2:
+            raise CudaError("matmul 至少 2D，收到 %s @ %s" % (A.shape, B.shape))
+        if len(A.shape) > 8 or len(B.shape) > 8:
+            raise CudaError("matmul 最高 8 维，收到 %s @ %s" % (A.shape, B.shape))
+        M, K = int(A.shape[-2]), int(A.shape[-1])
+        K2, N = int(B.shape[-2]), int(B.shape[-1])
+        if K != K2:
+            raise CudaError("matmul K 不匹配: %s @ %s" % (A.shape, B.shape))
+        a_lead = tuple(int(s) for s in A.shape[:-2])
+        b_lead = tuple(int(s) for s in B.shape[:-2])
+        if not a_lead and not b_lead:
+            return self.sgemm(A, B)
+        out_lead = self._broadcast_lead(a_lead, b_lead)
+        A2 = self.broadcast_to(A, out_lead + (M, K))
+        B2 = self.broadcast_to(B, out_lead + (K, N))
+        batch = 1
+        for s in out_lead:
+            batch *= int(s)
+        C3 = self.bmm(
+            self.reshape(A2, (batch, M, K)),
+            self.reshape(B2, (batch, K, N)),
+        )
+        return self.reshape(C3, out_lead + (M, N))
 
     def reshape(self, buf, shape):
         """C 顺序重解释。字节序不变，所以反向也只是再解释一次。"""
@@ -1127,6 +1398,34 @@ class CudaRuntime:
             grid, block = self._ewise_grid(rows)
             self.launch("softmax_lastdim", grid, block, [
                 self._ptr(x), self._ptr(out),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return out
+
+    def log_softmax_lastdim(self, x):
+        if len(x.shape) < 1:
+            raise CudaError("log_softmax 需要至少 1 维，收到 %s" % (x.shape,))
+        k = int(x.shape[-1])
+        if k <= 0:
+            raise CudaError("log_softmax 最后一维是 %d" % k)
+        rows = int(x.n) // k
+        out = self.empty(x.shape, dtype=np.float32)
+        if rows:
+            grid, block = self._ewise_grid(rows)
+            self.launch("log_softmax_lastdim", grid, block, [
+                self._ptr(x), self._ptr(out),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return out
+
+    def log_softmax_lastdim_bwd(self, g, y):
+        k = int(y.shape[-1])
+        rows = int(y.n) // k if k else 0
+        out = self.empty(y.shape, dtype=np.float32)
+        if rows and k:
+            grid, block = self._ewise_grid(rows)
+            self.launch("log_softmax_lastdim_bwd", grid, block, [
+                self._ptr(g), self._ptr(y), self._ptr(out),
                 (rows, ctypes.c_int), (k, ctypes.c_int),
             ])
         return out
@@ -1325,6 +1624,26 @@ class CudaRuntime:
                 (int(seq), ctypes.c_int), (int(d), ctypes.c_int),
             ])
         return dw
+
+    def adamw(self, p, g, m, v, lr, b1, b2, eps, wd, bc1, bc2):
+        """原地更新参数和两份动量。bc1/bc2 是主机上算的偏差校正分母（标量）。"""
+        n = int(p.n)
+        if int(g.n) != n or int(m.n) != n or int(v.n) != n:
+            raise CudaError(
+                "adamw 长度不一致: p=%d g=%d m=%d v=%d" % (n, g.n, m.n, v.n))
+        if n <= 0:
+            return
+        if n > 2147483647:
+            raise CudaError("adamw 元素个数超过 int32")
+        grid, block = self._ewise_grid(n)
+        self.launch("adamw_update", grid, block, [
+            self._ptr(p), self._ptr(g), self._ptr(m), self._ptr(v),
+            (n, ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(b2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(eps), ctypes.c_float),
+            (float(wd), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+        ])
 
 
 _RT = None
