@@ -41,7 +41,7 @@ tied char-LM，4 层 / d=512 / nh=16 / ff=1024 / **10.530 M 参数**（读 check
 
 ### (5) 收尾
 
-- GitHub：25 个提交 + 里程碑 tag **`v1.3.0-training`**；README 全部数字与实测对齐（并修掉旧版里 4 类错值）
+- GitHub：仓库 **22 个提交** + 里程碑 tag **`v1.3.0-training`**；README 全部数字与实测对齐（并修掉旧版里 4 类错值）
 - **PyPI：待上传** —— 产物已就绪（`python/dist/tgai_go-1.3.0-py3-none-any.whl` / `.tar.gz`，
   `twine check` 通过、元数据与已发布的 1.2.2 对等、隔离安装与打包往返冒烟测试通过），
   只差 `PYPI_TOKEN`：见 `python/tools/pypi_upload.py`
