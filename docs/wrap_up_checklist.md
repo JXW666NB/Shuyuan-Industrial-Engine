@@ -173,3 +173,47 @@ OSError: access violation reading 0x0000000000000000
 下一步：导出时额外写一份 `lm_head.weight`（= 词表矩阵）再验。
 
 **不把这条记成"通过"。**
+
+---
+
+## 八、`.TG` 加载 BUG 的定位进展（2026-10-29 晚）
+
+### 先修正一条：**加载本身是通的**
+
+早先"`tg_load` 空指针崩溃"是**偶发**（同一份 `pelican.TG`）：
+- 在 `prod_test.py`（先加载了另一个模型）里 → **load OK**；
+- 在只加载它的 `verify_tg.py` 里 → 崩。
+
+**⇒ 首次加载路径有状态问题**（疑似 CUDA 上下文/懒初始化），不是文件损坏。
+用"失败重试一次"可绕过：重试后 **load OK vocab=10**。
+
+### 崩溃点已从 load 移到 forward
+
+```
+tg_forward → OSError: access violation reading 0x000000000001A000
+```
+
+即：**权重全部读进来了，前向时才崩**。
+
+### 已排除的假设
+
+| 假设 | 结论 |
+|---|---|
+| 缺 `lm_head.weight` | ❌ 引擎源码里**根本没有** `lm_head`，按 tied 用词表矩阵 |
+| 缺 `attn.q_norm/k_norm`（QK-Norm） | ❌ 这两个由 `v3_flags` 探测决定；没有就置 0、走 legacy 路径且只打 `dbg_err` 不崩 |
+| 缺 AttnRes 权重 | ❌ 同上 |
+| 缺 `ffn.w1/w2/w3` | ❌ 只有 `n_experts==0` 才要稠密 FFN；我们是 1 专家 |
+| 产线 DLL 比新构建的更严格 | ❌ 产线 DLL 能加载旧合成模型**和新模型**（都 OK） |
+
+### 当前最可能的根因（下一步验证）
+
+**`n_experts = 1` 的 legacy MoE 路径**。源码里 `ne = min(header.n_experts, 16)`，MoE 分支按 `ne` 分配
+专家指针数组与 top-k 缓冲；单专家是"退化 MoE"，历史模型没有这种配置（V2.7 是 8 专家）。
+
+**验证方法**：把同一份权重导出成 `n_experts=2`（两份专家权重相同、`n_activated=1`），
+再跑 `tg_forward`。若通过 ⇒ 根因确认，训练侧改成"单专家也写两份"或引擎侧加 `ne==1` 的稠密特判。
+
+### 结论
+
+- **导出链路仍判定"未闭环"**（forward 崩）；
+- 但**已从"黑盒崩"缩到"一个具体分支"**，且排除了 5 个假设。
