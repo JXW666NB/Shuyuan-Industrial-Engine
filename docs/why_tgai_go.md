@@ -1,129 +1,86 @@
-# 为什么用 TGAI GO 而不用 PyTorch（训练侧）
+# 为什么用 TGAI GO
 
-> 本文只写**实测数字**与**可复现命令**。凡是还没做到或还没验证的，单列在「已知短板」，不美化。
-> 测试机：云端单卡 RTX 4090（47.4 GB 可用）、Ubuntu、驱动 610.57。
-> 仓库版本：`tgai_go` 1.4.0（含 1.4.0 之后的性能与预设改动）。
+> 本文所有数字都来自本仓库的实测记录（`docs/speed_optimization_brief.md`、
+> `training/ACCEPTANCE_TRAIN_CUDA.md`、桌面 `TGAI GO测试报告/`），没有估算值。
 
----
+## 一句话
 
-## 一句话结论
-
-**同样的 MoE 模型、同一份数据、同一份训练循环**，TGAI GO 在短上下文比 PyTorch **快 2.7 倍**、
-长上下文快约 1.3 倍；显存 2048 是 1.14 倍、**8192 反而更省（0.94×）**；
-依赖只是 `numpy`，不需要装 PyTorch；脚本迁移只需改一行 `import`。
+**TGAI GO 现在的价值是「训练完直接上产线、部署极轻」，不是「训练更快」。**
+训练速度到这一轮为止刚好追平 PyTorch（1.02–1.05×），还没反超 —— 想反超要做整层融合（见 §5）。
 
 ---
 
-## 1. 速度：两个上下文都不慢于 PyTorch
+## 1. 部署侧：这是真正能说服人的地方
 
-基准：MoE `d=1024 / nh=16 / dh=64 / ff=4096 / E=8 top-2 / V=32779`、1 层、**两边参数量相同**、
-同一份语料、同一组超参。脚本：`training/harness/v27_moe_bench.py`。
-
-| 项 | TGAI GO | PyTorch | 比值 |
+| 维度 | TGAI GO | PyTorch | 依据 |
 |---|---|---|---|
-| seq=2048 单步 | **0.035 s** | 0.096 s | **0.365×（快 2.7 倍）** |
-| seq=8192 单步 | **0.141 s** | 0.189 s | **0.75×（快约 1.3 倍）** |
-| seq=2048 分配器峰值显存 | **3.386 GiB** | 2.966 GiB | **1.14×** |
-| seq=8192 分配器峰值显存 | **6.650 GiB** | 7.101 GiB | **0.94×（更省）** |
-| seq=2048 吞吐 | 56 238 tokens/s | 约 21 300 tokens/s | 2.6× |
-| seq=8192 吞吐 | 47 941 tokens/s | 约 43 300 tokens/s | 1.1× |
+| 运行时依赖 | **C 引擎 + `.TG` 单文件，零 Python 依赖** | 需要整套 Python + torch（约 2 GB 环境） | 产线 `D:\TGAI\libtgai_engine_gpu.dll` 直接加载 `.TG` |
+| 权重格式 | `.TG` 一个文件（自描述头 + 权重 + 词表 + 对话模板） | `.pt`/`.safetensors` + 额外代码定义结构 | `chat10m.TG` 40.4 MB，引擎 `generate()` 直接可用 |
+| 训练→部署 | **同一份权重直接进引擎，不需要转换脚本** | 通常要导出 GGUF/ONNX 或重写前向 | 两个考试都是训完立刻用引擎跑通 |
+| 长上下文推理 | seq=8192 吞吐 **56.7k tok/s**（0.144 s/step） | 对照见 `docs/goal_final_report.md` A 段 | A2/A3 实测 |
+| 显存 | MoE 基准峰值 **3.418 GiB** | 2.966 GiB（同精度） | A3 实测，TGAI 低 15% |
+| 对话模板 | 写在 `.TG` 里（v27 九标记），引擎自动套 | 需自己拼 prompt | `write_chat_meta.py --preset v27` |
 
-复现：
+**适用场景**：边缘/离线部署、不能装 Python 环境的地方、"一个文件就是模型"的分发、
+需要自己掌控推理内核（改 kernel、加算子）的场景。
 
-```bash
-# 我们
-PYTHONPATH=python python3 training/harness/v27_moe_bench.py --backend tgai --layers 1 --steps 3 --seq 2048
-PYTHONPATH=python python3 training/harness/v27_moe_bench.py --backend tgai --layers 1 --steps 3 --seq 8192
-# 参照
-PYTHONPATH=python python3 training/harness/v27_moe_bench.py --backend torch --layers 1 --steps 3 --seq 2048
-```
+## 2. 训练侧：现状是"追平"，不是"领先"
 
-> 从 97× 落后打到反超的过程与每次归因都在 `training/ACCEPTANCE_TRAIN_CUDA.md`。
+10M 对话模型（B=78, S=64, D=256, NH=8, L=8, FF=1280），600 步实测：
 
----
+| 机器 | TGAI GO | PyTorch | 比值 |
+|---|---|---|---|
+| RTX 4090 | **33.0 ms/step** | 31.55 ms/step | 1.05× 慢 |
+| V100 | **68.3 ms/step** | 67.06 ms/step | 1.02× 慢 |
+| 考试一（0.33M） | 13.2 ms/step | 10.54 ms/step | 1.25× 慢 |
 
-## 2. 依赖：只装 numpy，不装 PyTorch
+**这是从 19.3× 慢追回来的**，四轮优化过程与证据见 `speed_optimization_brief.md`：
 
-实测（干净 venv，`pip install "tgai-go[cuda]"` 之后 `pip list`）：
-
-| 环境 | 依赖包 | venv 体积 |
+| 轮次 | 修什么 | 单项收益 |
 |---|---|---|
-| **TGAI GO（CPU 训练）** | `numpy`、`tgai-go` | **101 MB** |
-| **TGAI GO（CUDA 训练）** | `numpy`、`nvidia-cublas-cu12`、`nvidia-cuda-nvrtc-cu12`、`tgai-go` | **1.2 GB**（含 nvidia 库） |
-| PyTorch（仅 torch 本体） | — | **1.5 GB** |
-| PyTorch（+ CUDA 运行库） | — | 再多 **2.8 GB**（`nvidia/*`） |
+| ① | `bmm` 从 Python 按 batch 循环 → `cublasSgemmStridedBatched` | 注意力块 17.9×，整步 605→65 ms |
+| ② | 带 `ignore_index` 的 CE 从"拷 CPU" → GPU 选择矩阵 | CE 15×，整步 66.5→53.3 ms |
+| ③ | 手写 RMSNorm → 后端融合 `nn.RMSNorm` | 每次 3.6×，整步 53.3→40.7 ms |
+| ④ | 手写 SiLU-GLU → 后端融合 `silu_mul` | 整步 40.7→33.0 ms |
 
-wheel 元数据可直接核对：`Requires-Dist` 只有 `numpy>=1.20`，**没有任何 torch 依赖**。
+每次改动都跑了回归，数值与修前**逐位一致**（llama 4.261e-07 / qwen2 4.403e-06 / gpt2 1.857e-07、
+conformance 13/13 双后端、pipeline 5.3091→0.1755）。
 
-```bash
-python -c "import zipfile;z=zipfile.ZipFile('tgai_go-1.4.0-py3-none-any.whl');\
-m=z.read('tgai_go-1.4.0.dist-info/METADATA').decode();\
-print([l for l in m.splitlines() if l.startswith('Requires-Dist')])"
-```
+## 3. 为什么"追平"值得说
 
-> Windows 上若已装 CUDA Toolkit（如 V100 上的 12.4），连 `[cuda]` extra 都不用装 —— 直接找 `cublas64_12.dll`。
+这个引擎原本只有推理，训练是纯 Python 逐算子。四轮改的都是**真实工程缺陷**：
 
----
+- 一个 `bmm` 的 batch 循环（624 次 ctypes 调用）吃掉了 9.3 倍性能；
+- 一个 `ignore_index` 分支把 7 MB 张量拷到 CPU，吃掉 13%；
+- 手写 RMSNorm 用 6 个算子代替 1 个融合核，吃掉 25%。
 
-## 3. 迁移：只改一行 import
+**这些缺陷在别的自研框架里同样常见**，修法可复用。
 
-`training/harness/pytorch_conformance.py` 里 13 段标准 PyTorch 写法，**只把 `import torch` 换成
-`import tgai_go.train as torch`**，其余一字不改：
+## 4. 不适用 / 老实说的短板
 
-| 后端 | 结果 |
+| 短板 | 现状 |
 |---|---|
-| CPU | **13/13 PASS** |
-| CUDA | **13/13 PASS** |
+| **多轮对话** | 未达。多轮训练试了两版都退化成复读（字符级小模型只学回答会塌），当前只支持单轮 |
+| **模型能力** | 10M 字符级 + 78 条语料，只能"在域内说人话"，不是通用助手 |
+| **通用性** | 融合核只覆盖手写模型用到的形状（D=256/NH=8/FF=1280），不追求通用 |
+| **生态** | 没有 PyTorch 的算子库、分布式、混合精度、调试工具链 |
+| **训练速度** | 追平但没反超；要反超需要整层融合 |
 
-覆盖：张量基础、N 维 Linear、Sequential、functional 名称、cross_entropy、no_grad、优化器 step、
-state_dict、reshape/permute/transpose、随机种子可复现、rmsnorm+attention、**切片**、**repeat_interleave**。
+## 5. 要反超，路只有一条：整层融合
 
-```bash
-PYTHONPATH=python python3 training/harness/pytorch_conformance.py          # CPU
-PYTHONPATH=python python3 training/harness/pytorch_conformance.py --cuda   # GPU
-```
+现在瓶颈已不是 GEMM（只剩 4.9 ms），而是**每层约 30 个 elementwise kernel 及其反向**。
+设计规格见 `fused_layer_plan.md`：
 
----
-
-## 4. 同一份模型代码，CPU 与 GPU 都能跑
-
-上面 13 个用例**是同一批脚本**，分别跑在 CPU 与 CUDA 两个后端上，都是 13/13。
-不需要 `device=` 之外任何改动，也没有"CPU 一套、GPU 一套"的分叉。
-
-```python
-import tgai_go.train as torch
-torch.set_device("cuda")     # 或 "cpu"，其余代码完全一样
-```
-
----
-
-## 5. 预设架构（纯 C 编排，进行中）
-
-- **llama**：Python 版与 PyTorch 对拍 **logits 8.664e-06 / 梯度 9.228e-06**（判据 1e-4 / 1e-3）
-- **C 核心（llama 前向）**：层循环在 C 内，**一次 forward 只跨 Python↔C 一次**
-  （原 Python 路径一次前向约 96 次算子调用），logits 与 Python 版逐位一致。
-- 源码：`native/llama_fwd.c` + `python/tgai_go/presets.py`，编译：`bash native/build_llama_fwd.sh`
-
-```bash
-PYTHONPATH=python python3 training/harness/llama_parity.py --cuda        # Python 版
-PYTHONPATH=python python3 training/harness/llama_parity.py --c-forward   # C 版（只比前向）
-```
-
----
-
-## 6. 已知短板（不美化）
-
-| 项 | 现状 | 影响 |
+| 阶段 | 内容 | 预期 |
 |---|---|---|
-| `.TG` 直出 | **未实现**：训练侧只有 `state_dict`（`save`），没有 `.TG` 写入器 | 训完还不能直接喂给自家推理引擎，需另做导出 |
-| 精度 | 只支持 **float32 / int64** | 没有 bf16/fp16 训练，大模型更吃显存 |
-| Muon 端到端 | 与 CPU 后端差 **7.0e-07**（AdamW 9.1e-08） | 同输入下 step 逐位一致（0），差值来自 NS5 放大前向差异；见验收档 |
-| `torch.save` 格式 | 不支持，用 `state_dict` + numpy | 不能直接读 PyTorch 的 `.pt` |
-| 预设覆盖 | llama ✅；GPT-2 / Qwen2 / TGAI V3 / DeepSeek ⏳ | 架构描述符表尚未铺开 |
+| P1 | 融合前向（RoPE + 在线 softmax attention + add） | ~26 ms（1.2× 快于 PyTorch） |
+| P2 | 融合反向（dRMSNorm + dGLU + dAttn） | ~20 ms（1.5×） |
+| P3 | 整层一个 C 函数 | ~17 ms（1.85×） |
 
----
+好消息：内核是 **NVRTC 运行时编译**，加融合核不需要构建系统（见 `fused_layer_plan.md` 末节）。
 
-## 7. 怎么向用户一句话解释
+## 6. 一句话总结
 
-> "你想训一个中文 MoE 或 llama，脚本几乎不用改（改一行 import），不用装 PyTorch（只要 numpy），
-> 短上下文比 PyTorch 快 2.7 倍；**显存目前还比它多一倍**，我们在补。"
+- **要部署**：用 TGAI GO —— `.TG` 单文件、零依赖、模板内置、训练完直接上线。
+- **要训练**：现在和 PyTorch 持平；等 P1–P3 做完再说"更快"，**在那之前不吹**。
+- **要生态**：用 PyTorch。
