@@ -103,7 +103,7 @@ def main():
             import tgai_go
             m = tgai_go.load(p)
             print("  load OK: %s" % type(m).__name__)
-            txt = m.generate("ab", max_tokens=6)
+            txt = m.generate("ab", max_tokens=6, temperature=0.0, top_k=1, top_p=1.0)
             print("  generate -> %r" % (txt,))
             ok_all = ok_all and bool(txt)
         except Exception as ex:

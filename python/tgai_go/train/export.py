@@ -32,14 +32,21 @@ def _engine_name(name, n_experts):
         return "final_norm.weight"
     if n.startswith("lm_head"):
         return None                                  # 与词表共享，引擎不接受独立头
-    # MoE 专家：experts.{e}.gate/up/down -> experts.{e}.w1/w2/w3
+    # MoE 专家：experts.{e}.gate/up/down -> **moe.experts.{e}.w1/w2/w3**
+    # ★ 引擎的命名里 `experts` 挂在 `moe.` 下面（`blocks.{i}.moe.experts.{e}.w1.weight`）。
+    #   漏掉 `.moe.` 时 .TG 仍能写、能 load，但引擎按名取权重拿不到 → generate 时 access violation
+    #   （实测 0x1A00）。这是 3 处命名不匹配的根因。
     if ".experts." in n:
         head, tail = n.split(".experts.", 1)
         idx, _, rest = tail.partition(".")
         rest = rest.replace(".weight", "")
         m = {"gate": "w1", "up": "w2", "down": "w3"}
+        if head.endswith(".moe"):
+            block = head[: -len(".moe")]
+        else:
+            block = head
         if rest in m:
-            return "%s.experts.%s.%s.weight" % (head, idx, m[rest])
+            return "%s.moe.experts.%s.%s.weight" % (block, idx, m[rest])
         return None
     if n.endswith(".router.weight"):
         return n

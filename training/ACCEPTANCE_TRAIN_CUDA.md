@@ -944,3 +944,30 @@ forward/generate OK: '<a>ab<a><a>'
 一旦异常发生在赋值之前，`finally` 会抛 `UnboundLocalError` 并**掩盖真正的异常** ——
 实测把一个 `AttributeError` 盖成了"`_stop_trace` 未绑定"，白查一轮。
 已改为 `if locals().get('_stop_trace'):`，并把初始化提到函数早期。
+
+---
+
+## A4-③ 更新：闭环打通了，但**在随机权重下不稳定（3/5）**
+
+### 根因已找到并修掉
+引擎的专家权重名是 `blocks.{i}.**moe.**experts.{e}.w1.weight` —— 比我先前的映射**多一层 `moe.`**。
+漏掉它时 `.TG` 仍能写、能 `load`，但引擎按名取权重拿不到 → `generate` 时
+`access violation reading 0x...`（先 0x1A00，后 0xFFFFFFFFFFFFFFFF）。
+修好后 `generate` **真的跑出了文本**：
+
+```
+load OK: Model
+generate -> '两世丝丶並丒'
+```
+
+### 但仍然不稳
+连跑 5 次：**成功 3 / 失败 2**，失败是引擎内 `access violation reading 0xFFFFFFFFFFFFFFFF`（把 -1 当地址）。
+换贪心（`temperature=0, top_k=1`）**同样是 3/5**，所以**不是采样**的问题 ——
+怀疑是随机权重推出的越界 token id（或引擎内部某个 -1 索引）触发的原生崩溃。
+
+### 当前判定
+- **导出/加载链路成立**：字节确定（sha256 一致）、`load` 100% 成功、`generate` 能产出文本；
+- **端到端「训练完直出 .TG 被引擎跑起来」还不能算稳定达成** —— 需要
+  ① 用**训练过的**权重（而不是随机）再测，② 或在引擎侧加越界防护/在导出侧夹紧 logits。
+
+**不把它记成 A4-③ 完成**，只记"已验证可行、尚不稳定"。
