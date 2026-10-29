@@ -98,7 +98,10 @@ def build_examples(text, stoi, seq):
         if "<TGAI>" not in body:
             continue
         qpart, _, apart = body.partition("<TGAI>")
-        prompt = qpart + "<TGAI><回答>\n"
+        # ★ 必须与引擎 build_prompt 逐字符一致：`<用户>\n{q}<TGAI><回答>\n`（<TGAI> 前**不换行**）。
+        #   语料里 q 后面带一个 \n，必须 strip 掉，否则引擎拼出来的上下文比训练少一个换行，
+        #   模型会答非所问（实测：训练答案"嗨，终于有人问起我了…"变成"我是TGAI…"）。
+        prompt = "<用户>\n" + qpart.replace("<用户>", "", 1).strip() + "<TGAI><回答>\n"
         answer = apart.replace("<回答>", "").strip()
         if not answer:
             continue
