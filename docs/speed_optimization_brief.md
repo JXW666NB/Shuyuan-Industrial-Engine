@@ -98,3 +98,50 @@ for (int i = blockIdx.x*blockDim.x + threadIdx.x; i < n4; i += gridDim.x*blockDi
 
 > 一句话：**TGAI GO 现在的价值是"训练完直接能上产线、部署极轻"，
 > 不是"训练更快"。要把训练也变成卖点，就必须把 P0–P3 做完。**
+
+---
+
+## ★ 已修复（2026-10-30，第 37 轮）
+
+**根因找到了：`bmm` 在 Python 里按 batch 循环调 cuBLAS。**
+
+```python
+# 旧（cuda.py bmm）
+for i in range(batch):
+    self._sgemm(...)          # attention 里 batch = B*NH = 624 ⇒ 624 次 ctypes 调用
+```
+
+每层注意力的 `rope`（2 次 bmm）与 `sdpa`（1 次 bmm）合计 3 次 bmm × 624 = 1872 次调用/层，
+每次约 20 µs ⇒ 单层 28.4 ms，8 层 227 ms，正好是 forward 的 96%。
+
+**修法**：新增 `sgemm_strided_batched()`，用 `cublasSgemmStridedBatched` 一次算完整个 batch
+（行优先→列优先的转换与 `_sgemm` 完全一致）。
+
+### 效果（实测）
+
+| 指标 | 修前 | 修后 | 提升 |
+|---|---|---|---|
+| 注意力块 | 28.43 ms/层 | **1.59 ms/层** | **17.9×** |
+| forward | 237 ms | **21.1 ms** | 11.2× |
+| backward | 357 ms | **33.0 ms** | 10.8× |
+| 整步（10M, B=78 S=64） | 605 ms | **64.9 ms** | **9.3×** |
+| 4090 实跑 600 步 | 609.5 ms/step | **66.5 ms/step** | 9.2× |
+| V100 实跑 600 步 | 588.7 ms/step | **118.7 ms/step** | 5.0× |
+| 对 PyTorch（4090） | 19.3× 慢 | **2.11× 慢** | — |
+| 对 PyTorch（V100） | 8.8× 慢 | **1.77× 慢** | — |
+
+### 数值正确性（回归全绿，且与修前逐位一致）
+
+- bmm 单测：与 numpy `einsum` 最大误差 **2.861e-06**
+- llama CUDA 8.664e-06 / qwen2 4.403e-06 / gpt2 1.857e-07（与修前完全相同）
+- c_arch 三架构 PASS、V3 前向 4.793e-05、pipeline 5.3091→0.1755、性能/显存不变
+- 考试二模型重训后 loss 5.9257 → 0.0885，引擎三问回答**逐字不变**
+
+## 接下来还能做什么（按收益排序）
+
+| 项 | 现状 | 预计 |
+|---|---|---|
+| 反向的 elementwise 融合（RMSNorm/GLU 各 5→1 kernel） | 1014 kernel/步 | 1.3–1.6× |
+| `cross_entropy` 8.6 ms（占整步 13%） | 物化 log_softmax | 1.1× |
+| `broadcast_to8` 物化（117 次/步） | 生成中间张量 | 5–10% |
+| 每层 fused kernel（P3） | — | 再 1.3× |
