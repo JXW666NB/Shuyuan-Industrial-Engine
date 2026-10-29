@@ -92,7 +92,7 @@ run(corpus_dir="我的语料/", out_dir="run/", arch="llama", steps=200)
 
 ### 2.5 B7 打包
 
-wheel `tgai_go-1.4.1`：**C 源码随包**（`_native/src/llama_fwd.c` 41 KB）、README 增「预设架构 + 纯 C」章节。
+wheel `tgai_go-1.4.1`：**C 源码随包**（`python/tgai_go/_native/src/llama_fwd.c` 41 KB）、README 增「预设架构 + 纯 C」章节。
 真实安装态验证：`__version__`=1.4.1 与 metadata 一致、BPE 取自包内 `tgai_go.train.bpe`、`save_tg` 可导入。
 
 ---
