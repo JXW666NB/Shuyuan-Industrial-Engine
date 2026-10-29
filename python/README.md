@@ -1,6 +1,8 @@
 # TGAI GO
 
-**纯 Python 的 TGAI 模型推理库** —— `pip install` 后即可加载 `.TG` 模型推理，无需编译、无需 CUDA、无需 Vulkan SDK。
+**推理 + 训练一体的自研引擎** —— `pip install` 后即可加载 `.TG` 模型推理，无需编译；
+也能**不用 PyTorch** 直接训练（CUDA 后端），训完直出 `.TG` 交给自家引擎加载。
+硬依赖只有 `numpy`。
 
 ```python
 import tgai_go

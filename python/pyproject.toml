@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tgai-go"
 version = "1.4.1"
-description = "TGAI GO —— 纯 Python 的 TGAI 模型推理库（CPU 引擎，零编译安装）"
+description = "TGAI GO —— 推理 + 训练一体的自研引擎：纯 C 预设架构（llama/GPT-2/Qwen2/TGAI V3）、CUDA 训练后端（比 PyTorch 快 1.3-2.7 倍、显存 0.95-1.15 倍）、零框架依赖（只需 numpy）、零编译安装"
 readme = "README.md"
 requires-python = ">=3.8"
 # ★ license 用 SPDX 字符串（2026-10-11 改）
@@ -15,7 +15,7 @@ requires-python = ">=3.8"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "TGAI" }]
-keywords = ["tgai", "llm", "inference", "moe", "chinese", "llama"]
+keywords = ["tgai", "llm", "inference", "training", "moe", "chinese", "llama", "qwen2", "gpt2", "cuda", "pure-c"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: C",
