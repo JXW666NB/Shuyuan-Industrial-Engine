@@ -333,6 +333,7 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--steps", type=int, default=600)
     ap.add_argument("--out", default="chat10m")
+    ap.add_argument("--save-npz", default="")
     ap.add_argument("--d", type=int, default=256)
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--nh", type=int, default=8)
@@ -407,6 +408,15 @@ def main():
     _lg = np.asarray(_lg.to_numpy() if hasattr(_lg, "to_numpy") else _lg.detach().cpu().numpy())
     _nxt = int(np.argmax(_lg[0, len(_cur) - 1]))
     print("首位 token 对照: id=%d char=%r" % (_nxt, toks[_nxt]))
+
+    if a.save_npz:
+        _npz = {k: np.asarray(v.to_numpy() if hasattr(v, "to_numpy") else v.detach().cpu().numpy(), np.float32)
+                for k, v in p.items()}
+        np.savez(a.save_npz, **{("w__" + k.replace(".", "_")): v for k, v in _npz.items()})
+        import json as _json
+        with open(a.save_npz + ".json", "w", encoding="utf-8") as _f:
+            _json.dump({"vocab": list(toks), "cfg": {k: v for k, v in cfg.items() if k != "emb"}}, _f, ensure_ascii=False)
+        print("已存 npz:", a.save_npz)
 
     raw = {k: np.asarray(val.to_numpy() if hasattr(val, "to_numpy")
                          else val.detach().cpu().numpy(), np.float32) for k, val in p.items()}
