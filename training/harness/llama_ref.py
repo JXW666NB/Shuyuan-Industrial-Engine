@@ -98,9 +98,17 @@ class Llama:
             k = self.w[p + "attn.k.weight"]
             v = self.w[p + "attn.v.weight"]
 
-            qh = (n.reshape(B * S, D) @ q.T).reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
-            kh = (n.reshape(B * S, D) @ k.T).reshape(B, S, NKV, DH).permute(0, 2, 1, 3).reshape(B * NKV, S, DH)
-            vh = (n.reshape(B * S, D) @ v.T).reshape(B, S, NKV, DH).permute(0, 2, 1, 3).reshape(B * NKV, S, DH)
+            nf = n.reshape(B * S, D)
+            qf = nf @ q.T
+            kf = nf @ k.T
+            vf = nf @ v.T
+            if c.get("qkv_bias"):     # Qwen2 的差异就在这三行 bias
+                qf = qf + self.w[p + "attn.q.bias"]
+                kf = kf + self.w[p + "attn.k.bias"]
+                vf = vf + self.w[p + "attn.v.bias"]
+            qh = qf.reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
+            kh = kf.reshape(B, S, NKV, DH).permute(0, 2, 1, 3).reshape(B * NKV, S, DH)
+            vh = vf.reshape(B, S, NKV, DH).permute(0, 2, 1, 3).reshape(B * NKV, S, DH)
 
             qh = _rope(qh, self._cos, self._sin, self._R)
             kh = _rope(kh, self._cos, self._sin, self._R)
@@ -135,6 +143,11 @@ def init_weights(cfg, seed=0):
         p = "blocks.%d." % i
         w[p + "attn_norm.weight"] = np.ones(D, np.float32)
         w[p + "ffn_norm.weight"] = np.ones(D, np.float32)
+        if cfg.get("qkv_bias"):
+            # 必须给非零值：全零的 bias 让 Qwen2 等价于 llama，判分台就白跑了
+            w[p + "attn.q.bias"] = rn(D)
+            w[p + "attn.k.bias"] = rn(NKV * (D // cfg["nh"]))
+            w[p + "attn.v.bias"] = rn(NKV * (D // cfg["nh"]))
         w[p + "attn.q.weight"] = rn(D, D)
         w[p + "attn.k.weight"] = rn(NKV * (D // cfg["nh"]), D)
         w[p + "attn.v.weight"] = rn(NKV * (D // cfg["nh"]), D)
@@ -145,9 +158,10 @@ def init_weights(cfg, seed=0):
     return w
 
 
-def make_cfg(d=32, L=2, nh=4, n_kv=2, ff=64, V=64, seq=16, theta=10000.0, seed=0):
+def make_cfg(d=32, L=2, nh=4, n_kv=2, ff=64, V=64, seq=16, theta=10000.0, seed=0,
+             qkv_bias=False):
     cos, sin = rope_tables(seq, d // nh, theta)
     cfg = dict(d=d, L=L, nh=nh, n_kv=n_kv, ff=ff, V=V, seq=seq, theta=theta,
-               cos=cos, sin=sin, seed=seed)
+               cos=cos, sin=sin, seed=seed, qkv_bias=bool(qkv_bias))
     cfg["weights"] = init_weights(cfg, seed)
     return cfg

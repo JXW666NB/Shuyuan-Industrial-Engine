@@ -70,6 +70,10 @@ def run_torch(cfg, ids, tgt):
         p = "blocks.%d." % i
         P["%d.attn_norm" % i] = m(p + "attn_norm.weight", (D,))
         P["%d.attn.q" % i] = m(p + "attn.q.weight", (D, D))
+        if cfg.get("qkv_bias"):
+            P["%d.attn.qb" % i] = m(p + "attn.q.bias", (D,))
+            P["%d.attn.kb" % i] = m(p + "attn.k.bias", (NKV * DH,))
+            P["%d.attn.vb" % i] = m(p + "attn.v.bias", (NKV * DH,))
         P["%d.attn.k" % i] = m(p + "attn.k.weight", (NKV * DH, D))
         P["%d.attn.v" % i] = m(p + "attn.v.weight", (NKV * DH, D))
         P["%d.attn.o" % i] = m(p + "attn.o.weight", (D, D))
@@ -95,9 +99,17 @@ def run_torch(cfg, ids, tgt):
     h = P["tok_emb"][idx.reshape(-1)].reshape(B, S, D)
     for i in range(L):
         n = rms(h, P["%d.attn_norm" % i])
-        q = (n.reshape(B * S, D) @ P["%d.attn.q" % i].T).reshape(B, S, NH, DH).transpose(1, 2)
-        k = (n.reshape(B * S, D) @ P["%d.attn.k" % i].T).reshape(B, S, NKV, DH).transpose(1, 2)
-        v = (n.reshape(B * S, D) @ P["%d.attn.v" % i].T).reshape(B, S, NKV, DH).transpose(1, 2)
+        nf = n.reshape(B * S, D)
+        qf = nf @ P["%d.attn.q" % i].T
+        kf = nf @ P["%d.attn.k" % i].T
+        vf = nf @ P["%d.attn.v" % i].T
+        if cfg.get("qkv_bias"):
+            qf = qf + P["%d.attn.qb" % i]
+            kf = kf + P["%d.attn.kb" % i]
+            vf = vf + P["%d.attn.vb" % i]
+        q = qf.reshape(B, S, NH, DH).transpose(1, 2)
+        k = kf.reshape(B, S, NKV, DH).transpose(1, 2)
+        v = vf.reshape(B, S, NKV, DH).transpose(1, 2)
         q = rope(q)
         k = rope(k)
         k = k.repeat_interleave(n_rep, dim=1)
@@ -117,7 +129,7 @@ def run_torch(cfg, ids, tgt):
             p.grad = None
     loss.backward()
 
-    out = {"logits": logits.detach().numpy().astype(np.float64), "loss": np.array([float(loss)])}
+    out = {"logits": logits.detach().numpy().astype(np.float64), "loss": np.array([float(loss.detach())])}
     key_map = {"tok_emb.weight": "tok_emb", "lm_head.weight": "lm_head", "final_norm.weight": "final_norm"}
     for i in range(L):
         p = "blocks.%d." % i
@@ -148,9 +160,14 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--cuda", action="store_true")
     ap.add_argument("--c-forward", dest="c_forward", action="store_true")
+    ap.add_argument("--arch", choices=["llama", "qwen2"], default="llama")
+    ap.add_argument("--cpu", action="store_true")
     a = ap.parse_args()
 
-    cfg = llama_ref.make_cfg(**CFG)
+    _kw = dict(CFG)
+    if a.arch == "qwen2":
+        _kw["qkv_bias"] = True
+    cfg = llama_ref.make_cfg(**_kw)
     g = np.random.RandomState(1)
     ids = g.randint(0, cfg["V"], size=(2, cfg["seq"])).astype(np.int64)
     tgt = g.randint(0, cfg["V"], size=2 * cfg["seq"]).astype(np.int64)
@@ -185,14 +202,14 @@ def main():
         print("  VERDICT ok=%s（判据 logits<%.0e）" % (ok, TOL_LOGITS))
         return 0 if ok else 1
 
-    if a.cuda:
+    if a.cuda or a.cpu:
         ref = run_torch(cfg, ids, tgt)
-        cur = run_tgai("cuda", cfg, ids, tgt) if hasattr(T, "set_device") else run_tgai("cpu", cfg, ids, tgt)
+        cur = run_tgai("cuda" if a.cuda else "cpu", cfg, ids, tgt)
         rl = rel(cur["logits"], ref["logits"])
         rloss = rel(cur["loss"], ref["loss"])
         grads = {k: rel(cur[k], ref[k]) for k in ref if k.startswith("g:")}
         worst_g, worst_k = max((v, k) for k, v in grads.items())
-        print("[B1 考核] llama 预设 vs PyTorch（同权重/同输入）")
+        print("[%s 考核] 预设 vs PyTorch（同权重/同输入）" % a.arch.upper())
         print("  logits rel = %.3e   loss rel = %.3e" % (rl, rloss))
         print("  梯度最差 = %s (%.3e)" % (worst_k, worst_g))
         ok = rl < TOL_LOGITS and worst_g < TOL_GRAD
