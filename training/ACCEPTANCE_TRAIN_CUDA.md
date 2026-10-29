@@ -882,3 +882,36 @@ LayerNorm 与 GELU-tanh 作为**共享原语**实现（用既有的 `sum_axis8` 
 **这一步回答了一个设计问题**：GPT-2 与 llama 的差异（归一化/位置/FFN/bias 四个维度）
 **全部可以用描述符字段表达**，不需要改 C 控制流、不需要复制算子 ——
 说明 `TgArch` 的抽象够用，后面 V3（AttnRes + MoE + SiTU）才是真正的压力点。
+
+---
+
+## ★ 更正：`.TG` 写入器**一直存在**，A4-③ 不是死结
+
+上一轮我写"仓库里没有 `.TG` 写入器"——**这个结论是错的**。当时我用 `save_tg|.TG` 等关键词搜索，
+漏掉了类名 `TGWriter`。它就在**我们自己的包**里：`python/tgai_go/pack.py:43`。
+
+**接口**：`TGWriter(n_layers, d_model, n_heads, d_ff, vocab, max_seq, n_experts, n_activated,
+rope_theta, pad/bos/eos/unk, n_kv_heads, arch, weight_dtype)` + `add_weights(dict)` +
+`set_tokenizer(tokens, merges, special_ids)` + `write(path)`。
+
+**实测（本机，无 GPU；`training/harness/tg_writer_probe.py`）**：用仓库里现成的 `build_dummy_tg`
+造一个合成 `.TG`（**47,217 字节**），然后用 `tgai_go.load()` 加载并生成：
+
+```
+[tgai_engine] BUILD 2026-10-18-v3.8-gguf-native-experimental  (V3: QK-Norm + Block AttnRes, attn_res_block=4)
+写出: ...\dummy.TG 47217 字节
+load OK: Model
+forward/generate OK: '<a>ab<a><a>'
+```
+
+**结论**：
+1. **`训练 → .TG → 自家引擎加载 → 生成` 这条闭环在技术上可行**，A4-③ 可以做；
+2. 引擎的 BUILD 号已含 **V3：QK-Norm + Block AttnRes** —— 说明在装的引擎本身认识 V3 架构，
+   B4 的导出路径将来可以直接对齐；
+3. 但引擎的 `Model` **不暴露 logits**（只有 `generate`/文本 API），所以闭环验证只能做到
+   **贪心 token 一致**，做不到逐值对数；要逐值对数得靠原生 DLL 的调试接口（未暴露）。
+
+**待办（下一阶段）**：写 `tgai_go/train/export.py`，把训练侧参数名映射到引擎期望的名字
+（`token_embedding.weight` / `blocks.{i}.ln1|ln2` / `attn.q_proj|k_proj|v_proj|out_proj` /
+`moe.router|gate|_qb_bias` / `experts.{e}.w1|w2|w3` / `final_norm`），
+导出后用"同前缀贪心若干 token 一致"作为判据。
