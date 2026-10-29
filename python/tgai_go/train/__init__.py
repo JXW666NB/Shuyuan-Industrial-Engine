@@ -264,6 +264,7 @@ __all__ = [
     "functional", "nn", "optim",
     "tensor", "zeros", "ones", "full", "randn", "rand", "arange", "from_numpy",
     "manual_seed", "cat", "stack", "matmul", "bmm", "einsum", "permute",
+    "repeat_interleave",
     "exp", "log", "sqrt", "abs", "clamp", "max", "min", "topk", "where",
     "save", "load",
     "dtype", "float32", "float64", "int32", "int64", "long",
@@ -1214,6 +1215,8 @@ class Tensor:
         return self.transpose()
 
     def __getitem__(self, idx):
+        if self.device == "cuda":
+            return self._getitem_cuda(idx)
         out = Tensor(self.data[idx], requires_grad=self.requires_grad, _parents=(self,))
         shape = self.shape
 
@@ -1224,6 +1227,44 @@ class Tensor:
             else:
                 full[idx] += g               # 纯切片
             _acc(grads, self, full)
+        out._backward = bw
+        return out
+
+    def _cuda_logical_storage(self):
+        """与 self.shape 同行主序的设备缓冲。lazy .T 的 _gpu 还是转置前那块。"""
+        lazy = getattr(self, "_lazy_T", None)
+        if lazy is None:
+            return self._gpu
+        return _cuda().transpose2d(lazy._gpu)
+
+    def _getitem_cuda(self, idx):
+        rt = _cuda()
+        out_shape, base, divs, strides = _slice_gather_plan(self.shape, idx)
+        buf = rt.index_gather(self._cuda_logical_storage(), out_shape, base, divs, strides)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+        in_shape = tuple(int(s) for s in self.shape)
+
+        def bw(g, grads):
+            if self.requires_grad:
+                # g 是切出来的形状。清零后只加回被选中的位置，其余保持 0。
+                _acc(grads, self, rt.index_scatter_add(g, in_shape, base, divs, strides))
+        out._backward = bw
+        return out
+
+    def repeat_interleave(self, repeats, dim=None):
+        return _repeat_interleave_impl(self, repeats, dim)
+
+    def _repeat_interleave_cuda(self, repeats, dim):
+        rt = _cuda()
+        out_shape, base, divs, strides = _repeat_gather_plan(self.shape, repeats, dim)
+        buf = rt.index_gather(self._cuda_logical_storage(), out_shape, base, divs, strides)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+        in_shape = tuple(int(s) for s in self.shape)
+
+        def bw(g, grads):
+            if self.requires_grad:
+                # 连续重复的那几份梯度加回同一个源位置。
+                _acc(grads, self, rt.index_scatter_add(g, in_shape, base, divs, strides))
         out._backward = bw
         return out
 
@@ -1279,6 +1320,129 @@ def _has_array_index(idx):
         if isinstance(it, (list, tuple)):
             return True
     return False
+
+
+def _contig_strides(shape):
+    raw = [0] * len(shape)
+    stride = 1
+    for i in range(len(shape) - 1, -1, -1):
+        raw[i] = stride
+        stride *= int(shape[i])
+    return raw
+
+
+def _is_int_index(it):
+    if isinstance(it, (bool, np.bool_)):
+        return False
+    return isinstance(it, (int, np.integer))
+
+
+def _slice_gather_plan(shape, idx):
+    """基础索引收成 gather 计划：(out_shape, base, divs, strides)。
+
+    输出线性下标拆成 coord 后，源下标 =
+        base + sum (coord[d] // divs[d]) * strides[d]
+    切片的 div 恒为 1，strides 已经乘上 step（可以为负）。
+    整数下标折进 base，并且从输出形状里丢掉那一维。
+    """
+    shape = tuple(int(s) for s in shape)
+    nd = len(shape)
+    if nd > 8:
+        raise NotImplementedError("切片最高支持 8 维，收到 %d 维" % nd)
+    if not isinstance(idx, tuple):
+        idx = (idx,)
+    n_ellipsis = 0
+    consumed = 0
+    for it in idx:
+        if it is Ellipsis:
+            n_ellipsis += 1
+            continue
+        if it is None:
+            raise NotImplementedError("切片暂不支持 None（newaxis）")
+        if _is_int_index(it) or isinstance(it, slice):
+            consumed += 1
+            continue
+        raise NotImplementedError("切片暂不支持索引类型 %s" % type(it).__name__)
+    if n_ellipsis > 1:
+        raise IndexError("Ellipsis 只能出现一次")
+    if n_ellipsis == 0:
+        if consumed > nd:
+            raise IndexError("索引维数 %d 超过 ndim %d" % (consumed, nd))
+        items = list(idx) + [slice(None)] * (nd - consumed)
+    else:
+        fill = nd - consumed
+        if fill < 0:
+            raise IndexError("索引维数 %d 超过 ndim %d" % (consumed, nd))
+        items = []
+        for it in idx:
+            if it is Ellipsis:
+                items.extend([slice(None)] * fill)
+            else:
+                items.append(it)
+    strides_in = _contig_strides(shape)
+    out_shape = []
+    divs = []
+    strides = []
+    base = 0
+    axis = 0
+    for it in items:
+        if axis >= nd:
+            raise IndexError("索引维数超过 ndim %d" % nd)
+        length = int(shape[axis])
+        src_st = int(strides_in[axis])
+        if _is_int_index(it):
+            ii = int(it)
+            if ii < 0:
+                ii += length
+            if ii < 0 or ii >= length:
+                raise IndexError("索引 %d 越界（维 %d 长度 %d）" % (int(it), axis, length))
+            base += ii * src_st
+            axis += 1
+            continue
+        start, stop, step = it.indices(length)
+        count = len(range(start, stop, step))
+        out_shape.append(count)
+        divs.append(1)
+        strides.append(int(step) * src_st)
+        base += int(start) * src_st
+        axis += 1
+    if axis != nd:
+        raise IndexError("索引没有覆盖全部维度（%d/%d）" % (axis, nd))
+    if len(out_shape) > 8:
+        raise NotImplementedError("切片结果最高支持 8 维")
+    return tuple(out_shape), int(base), tuple(divs), tuple(strides)
+
+
+def _repeat_gather_plan(shape, repeats, dim):
+    """repeat_interleave 的 gather 计划。被重复的那一维 div=repeats。"""
+    shape = tuple(int(s) for s in shape)
+    nd = len(shape)
+    if nd == 0:
+        raise RuntimeError("标量不能 repeat_interleave，先 reshape 成 1 维")
+    if nd > 8:
+        raise NotImplementedError("repeat_interleave 最高支持 8 维")
+    repeats = int(repeats)
+    if repeats < 0:
+        raise RuntimeError("repeats 必须 >= 0，收到 %d" % repeats)
+    axis = int(dim)
+    if axis < 0:
+        axis += nd
+    if axis < 0 or axis >= nd:
+        raise IndexError("dim %s 越界（ndim=%d）" % (dim, nd))
+    out = list(shape)
+    out[axis] = int(shape[axis]) * repeats
+    strides_in = _contig_strides(shape)
+    divs = []
+    strides = []
+    for i, st in enumerate(strides_in):
+        if i == axis:
+            # 输出该维为 0 时不会发射 kernel，div 不能是 0。
+            divs.append(repeats if repeats > 0 else 1)
+            strides.append(int(st))
+        else:
+            divs.append(1)
+            strides.append(int(st))
+    return tuple(out), 0, tuple(divs), tuple(strides)
 
 
 def _matmul_grad_numpy(g, a, b):
@@ -3021,6 +3185,53 @@ def permute(input, dims):
     if not isinstance(dims, (tuple, list)):
         raise TypeError("permute 的 dims 需要 tuple 或 list，收到 %s" % type(dims).__name__)
     return _as_tensor(input).permute(*dims)
+
+
+def _repeat_interleave_impl(input, repeats, dim=None):
+    """整数 repeats：沿 dim 把每个元素连续复制 repeats 次。dim=None 时先展平。"""
+    t = _as_tensor(input)
+    if isinstance(repeats, (bool, np.bool_)) or not isinstance(repeats, (int, np.integer)):
+        raise TypeError("repeat_interleave 的 repeats 目前只支持整数，收到 %s" % type(repeats).__name__)
+    repeats = int(repeats)
+    if repeats < 0:
+        raise RuntimeError("repeats 必须 >= 0，收到 %d" % repeats)
+    if dim is None:
+        t = t.reshape((int(t.numel()),))
+        dim = 0
+    if repeats == 1:
+        return t
+    if getattr(t, "device", "cpu") == "cuda":
+        return t._repeat_interleave_cuda(repeats, dim)
+    axis = int(dim)
+    if t.ndim == 0:
+        raise RuntimeError("标量不能 repeat_interleave，先 reshape 成 1 维")
+    if axis < 0:
+        axis += t.ndim
+    if axis < 0 or axis >= t.ndim:
+        raise IndexError("dim %s 越界（ndim=%d）" % (dim, t.ndim))
+    data = np.repeat(t.data, repeats, axis=axis)
+    if not np.issubdtype(t.data.dtype, np.floating):
+        return Tensor(data, dtype=t.dtype, requires_grad=False)
+    out = Tensor(data, requires_grad=t.requires_grad, _parents=(t,))
+
+    def bw(g, grads):
+        if not t.requires_grad:
+            return
+        g = np.asarray(g, dtype=np.float32)
+        if repeats == 0:
+            _acc(grads, t, np.zeros(t.shape, dtype=np.float32))
+            return
+        parts = list(g.shape)
+        parts[axis] = int(parts[axis]) // repeats
+        folded = parts[:axis] + [parts[axis], repeats] + parts[axis + 1:]
+        _acc(grads, t, g.reshape(folded).sum(axis=axis + 1))
+    out._backward = bw
+    return out
+
+
+def repeat_interleave(input, repeats, dim=None):
+    """对应 torch.repeat_interleave(input, repeats, dim)。GQA 用 dim=0 或 dim=1。"""
+    return _repeat_interleave_impl(input, repeats, dim)
 
 
 # 公开名字放在文件末尾，避免盖住上面 Muon / cross_entropy 里的内置 max。

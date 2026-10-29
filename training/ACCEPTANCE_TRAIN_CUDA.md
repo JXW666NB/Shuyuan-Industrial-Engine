@@ -592,3 +592,32 @@ Grok 引入**惰性转置**（`.T` 不落地，记 `_lazy_T/_lazy_shape`，为 2
 `rotate_half` 改成乘一个 0/±1 置换矩阵（`x @ R`，浮点精确，因为 3D@2D matmul 支持）。
 **GQA 的 head 重复**（`repeat_interleave`）目前无 CUDA 解法，故本轮把 `n_kv` 设为 `nh` ——
 待补 CUDA 切片或专门的 `repeat_kv` op 后再启用 GQA 并重跑判据。
+
+---
+
+## B1 完成：llama（含 GQA）+ CUDA 切片补齐
+
+**新增/修复**
+- \`Tensor.__getitem__\` 的 **CUDA 路径**：整数下标、任意维切片、\`...\` 展开。
+  主机把下标规范化成 \`(base, div, stride)\`，前向用 \`index_gather8\`，反向先清零再 \`atomicAdd\` 散回原位。
+- \`repeat_interleave(input, repeats, dim)\`：被重复维 \`div=repeats\`，反向把多份梯度加回同一源元素。
+  llama 的 GQA 用它替换了原来会崩的切片实现。
+- 我的 \`slice_basic\` 用例原来在**不参与求导**的张量上调 \`backward()\`（是判分台自己的错），已修为 \`requires_grad=True\`；
+  **断言未被削弱**（仍检查 \`g[:, :3]==2\` 且 \`g[:, 3:]==0\`）。
+
+**实测（4090，我复跑）**
+
+| 项 | 结果 | 判据 |
+|---|---|---|
+| 迁移一致性 CPU | **13/13 PASS** | 全过 |
+| 迁移一致性 CUDA | **13/13 PASS** | 全过 |
+| llama 自证（CPU vs CPU） | **0.000e+00** | 必须 0 ✅ |
+| **llama GQA**（nh=4, n_kv=2）logits | **8.664e-06** | <1e-4 ✅ |
+| llama GQA 梯度最差（\`blocks.1.attn.q.weight\`） | **9.228e-06** | <1e-3 ✅ |
+| 性能 seq=8192 | **0.171 s**（峰值 12.78 GiB） | 保持 |
+| 性能 seq=2048 | **0.036 s** | 保持 |
+
+**回归**：四 \`--selftest\` 全 0；\`moe_selfcheck\` 1.716e-07 ok；\`opt_step_parity --cuda\` 逐位 0；loss 曲线不变。
+
+> **B1 至此为完全体**（RMSNorm / RoPE / SwiGLU / GQA / causal attn / untied 头，前向与反向都与 PyTorch 对齐）。
+> 下一步是把它搬进 **C 核心**，用同一份 \`llama_parity.py\` 当靶子。

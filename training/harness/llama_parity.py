@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "python"
 import tgai_go.train as T            # noqa: E402
 import llama_ref                     # noqa: E402
 
-CFG = dict(d=32, L=2, nh=4, n_kv=4, ff=64, V=64, seq=16, theta=10000.0, seed=0)  # GQA 待 CUDA 切片支持后改回 2
+CFG = dict(d=32, L=2, nh=4, n_kv=2, ff=64, V=64, seq=16, theta=10000.0, seed=0)
 TOL_LOGITS = 1e-4
 TOL_GRAD = 1e-3
 

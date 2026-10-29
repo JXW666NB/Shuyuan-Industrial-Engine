@@ -28,8 +28,8 @@ def rope_tables(seq, head_dim, theta=10000.0, base_dtype=np.float32):
 def _rotate_perm(head_dim):
     """返回 R[dh,dh]，使 x @ R == [-x2, x1]（前半取负换到后半）。
 
-    用矩阵乘而不是切片：CUDA 后端的 Tensor.__getitem__ 尚未实现，但 3D@2D 的 matmul 支持。
-    R 的元素只有 0 / ±1，浮点上精确，不会引入误差。
+    用矩阵乘而不是切片：R 的元素只有 0 / ±1，浮点上精确。
+    切片已经能在 CUDA 上跑，但这里保持原来的 matmul，避免给 RoPE 换一条数值路径。
     """
     half = head_dim // 2
     R = np.zeros((head_dim, head_dim), np.float32)
@@ -51,15 +51,13 @@ def _rope(x, cos_np, sin_np, R_np):
 
 
 def _repeat_kv(x, n_rep):
-    """[B*Hkv, S, Dh] -> [B*Hkv*n_rep, S, Dh]（head 维交错复制）。"""
-    if n_rep == 1:
+    """[B*Hkv, S, Dh] -> [B*Hkv*n_rep, S, Dh]（每个 kv head 连续重复 n_rep 次）。
+
+    走 repeat_interleave，不再用 x[i:i+1] 拼 cat：CUDA 上 cat 还没实现。
+    """
+    if int(n_rep) == 1:
         return x
-    parts = []
-    for i in range(int(x.shape[0])):
-        one = x[i:i + 1]
-        for _ in range(n_rep):
-            parts.append(one)
-    return T.cat(parts, dim=0)
+    return T.repeat_interleave(x, int(n_rep), dim=0)
 
 
 class Llama:
@@ -89,7 +87,7 @@ class Llama:
         B, S = int(ids.shape[0]), int(ids.shape[1])
 
         # 用 nn.Embedding 的 CUDA 路径（row-gather 已有 kernel）；权重与外部共享同一 Parameter。
-        # 注：Tensor.__getitem__ 在 CUDA 上尚未实现，所以不能写 tok_emb.weight[ids]。
+        # __getitem__ 只做整数/切片，不做数组下标，所以不能写 tok_emb.weight[ids]。
         emb = T.nn.Embedding(c["V"], D)
         emb.weight = self.w["tok_emb.weight"]
         h = emb(np.asarray(ids, dtype=np.int64)).reshape(B, S, D)

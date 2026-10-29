@@ -147,6 +147,33 @@ def case_rmsnorm_attn():
     return "ok"
 
 
+def case_slice_basic():
+    """切片：PyTorch 里到处是 x[:, :k] / x[..., :k] / x[1:3]。"""
+    x = torch.randn(4, 6, requires_grad=True)
+    a = x[:, :3]
+    assert _np(a).shape == (4, 3), _np(a).shape
+    b = x[1:3]
+    assert _np(b).shape == (2, 6), _np(b).shape
+    c = x[..., 2:5]
+    assert _np(c).shape == (4, 3), _np(c).shape
+    # 反向只应落在被切走的那些位置
+    (a * 2.0).sum().backward()
+    g = _np(x.grad)
+    assert np.allclose(g[:, :3], 2.0) and np.allclose(g[:, 3:], 0.0), "切片反向落错位置"
+    return "ok"
+
+
+def case_repeat_interleave():
+    """GQA 常用：在 head 维做 repeat_interleave。"""
+    k = torch.randn(2, 3, 4)          # [heads=2, S, Dh]
+    r = torch.cat([k[0:1], k[0:1], k[1:2], k[1:2]], dim=0) if not hasattr(torch, "repeat_interleave") else None
+    if r is None:
+        return "skip(有原生 repeat_interleave)"
+    assert _np(r).shape == (4, 3, 4), _np(r).shape
+    assert np.allclose(_np(r)[0], _np(r)[1]), "重复的头应完全一致"
+    return "ok"
+
+
 CASES = [
     ("tensor_basic", case_tensor_basic),
     ("linear_nd", case_linear_nd),
@@ -159,6 +186,8 @@ CASES = [
     ("reshape_permute", case_reshape_permute),
     ("seed_repeat", case_seed_repeat),
     ("rmsnorm_attn", case_rmsnorm_attn),
+    ("slice_basic", case_slice_basic),
+    ("repeat_interleave", case_repeat_interleave),
 ]
 
 

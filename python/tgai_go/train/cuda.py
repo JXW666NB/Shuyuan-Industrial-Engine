@@ -1061,6 +1061,55 @@ extern "C" __global__ void sumsq_sequential(const float* a, float* out, int n) {
     }
     out[0] = s;
 }
+
+/* 基础切片 / repeat_interleave 的前向。
+   输出下标按行主序拆开，源下标 = base + sum (coord/div)*stride。
+   div 恒 >= 1。切片的 div 是 1，stride 已经乘过 step（可以为负）。
+   repeat_interleave 的 div 是重复次数，stride 是源张量该维的步长。
+   前导维由主机补成 shape=1、div=1、stride=0，所以这里不会除以 0。 */
+extern "C" __global__ void index_gather8(
+    const float* in, float* out, int n, int base,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int d0, int d1, int d2, int d3, int d4, int d5, int d6, int d7,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+    int divs[8] = {d0, d1, d2, d3, d4, d5, d6, d7};
+    int st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    int rem = i;
+    long long src = (long long)base;
+    for (int d = 7; d >= 0; --d) {
+        int sd = shp[d];
+        int coord = rem % sd;
+        rem /= sd;
+        src += (long long)(coord / divs[d]) * (long long)st[d];
+    }
+    out[i] = in[src];
+}
+
+/* 反向：调用方先把 full memset 成 0，再把梯度加回源位置。
+   切片各位置不重叠，atomicAdd 只执行一次；repeat 的同一源位置会被加 repeats 次。 */
+extern "C" __global__ void index_scatter_add8(
+    const float* g, float* full, int n, int base,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int d0, int d1, int d2, int d3, int d4, int d5, int d6, int d7,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+    int divs[8] = {d0, d1, d2, d3, d4, d5, d6, d7};
+    int st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    int rem = i;
+    long long src = (long long)base;
+    for (int d = 7; d >= 0; --d) {
+        int sd = shp[d];
+        int coord = rem % sd;
+        rem /= sd;
+        src += (long long)(coord / divs[d]) * (long long)st[d];
+    }
+    atomicAdd(full + src, g[i]);
+}
 """
 
 # MoE 派发/收集。专家 GEMM 仍走已有的 cublas/sgemm_mode，这里只做索引。
@@ -2552,6 +2601,74 @@ class CudaRuntime:
             ] + [(int(s), ctypes.c_int) for s in self._left_pad8(out_shape, 1)]
               + [(int(s), ctypes.c_int) for s in self._left_pad8(src_stride, 0)])
         return out
+
+    def _index_i32(self, value, what):
+        iv = int(value)
+        if iv < -2147483648 or iv > 2147483647:
+            raise CudaError("%s 超出 int32: %d" % (what, iv))
+        return iv
+
+    def _index_launch_args(self, src, dst, n, base, shape, divs, strides):
+        """把输出形状 / div / stride 补到 8 维。0 长度的维不能进到这里。"""
+        shape8 = self._left_pad8(shape, 1)
+        div8 = self._left_pad8(divs, 1)
+        st8 = self._left_pad8(strides, 0)
+        if any(int(s) < 1 for s in shape8):
+            raise CudaError("index 发射时每一维都必须 >= 1，收到 %s" % (shape8,))
+        if any(int(d) < 1 for d in div8):
+            raise CudaError("index div 必须 >= 1，收到 %s" % (div8,))
+        args = [
+            self._ptr(src), self._ptr(dst),
+            (self._index_i32(n, "index n"), ctypes.c_int),
+            (self._index_i32(base, "index base"), ctypes.c_int),
+        ]
+        args += [(self._index_i32(s, "index shape"), ctypes.c_int) for s in shape8]
+        args += [(self._index_i32(s, "index div"), ctypes.c_int) for s in div8]
+        args += [(self._index_i32(s, "index stride"), ctypes.c_int) for s in st8]
+        return args
+
+    def index_gather(self, buf, out_shape, base, divs, strides):
+        """按主机算好的 (base, div, stride) 从连续缓冲里收集一份新缓冲。"""
+        out_shape = tuple(int(s) for s in out_shape)
+        divs = tuple(int(s) for s in divs)
+        strides = tuple(int(s) for s in strides)
+        if len(divs) != len(out_shape) or len(strides) != len(out_shape):
+            raise CudaError("index_gather 计划长度与输出形状不符: %s" % (out_shape,))
+        if len(out_shape) > 8:
+            raise CudaError("index_gather 最高 8 维，收到 %s" % (out_shape,))
+        if any(s < 0 for s in out_shape):
+            raise CudaError("index_gather 形状非法 %s" % (out_shape,))
+        out = self.empty(out_shape, dtype=np.float32)
+        n = int(out.n)
+        if n == 0:
+            return out
+        if n > 2147483647:
+            raise CudaError("index_gather 元素个数超过 int32")
+        grid, block = self._ewise_grid(n)
+        self.launch("index_gather8", grid, block, self._index_launch_args(
+            buf, out, n, base, out_shape, divs, strides))
+        return out
+
+    def index_scatter_add(self, grad, in_shape, base, divs, strides):
+        """先把源形状清零，再把 grad 按同一映射 atomicAdd 回去。"""
+        in_shape = tuple(int(s) for s in in_shape)
+        divs = tuple(int(s) for s in divs)
+        strides = tuple(int(s) for s in strides)
+        out_shape = tuple(int(s) for s in grad.shape)
+        if len(divs) != len(out_shape) or len(strides) != len(out_shape):
+            raise CudaError("index_scatter 计划与梯度形状不符: %s" % (out_shape,))
+        if len(in_shape) > 8 or len(out_shape) > 8:
+            raise CudaError("index_scatter 最高 8 维")
+        full = self.zeros(in_shape, dtype=np.float32)
+        n = int(grad.n)
+        if n == 0:
+            return full
+        if n > 2147483647:
+            raise CudaError("index_scatter 元素个数超过 int32")
+        grid, block = self._ewise_grid(n)
+        self.launch("index_scatter_add8", grid, block, self._index_launch_args(
+            grad, full, n, base, out_shape, divs, strides))
+        return full
 
     def _broadcast_lead(self, sa, sb):
         sa = tuple(int(s) for s in sa)
