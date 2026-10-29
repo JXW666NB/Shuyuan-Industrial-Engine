@@ -26,7 +26,29 @@ CUDA_OP_T = 1
 # cublas_api.h: CUBLAS_PEDANTIC_MATH = 2
 # 注释写明：cublas<T> 例程因此改用对应的 _PEDANTIC compute type。
 CUBLAS_PEDANTIC_MATH = 2
+CUBLAS_DEFAULT_MATH = 0
 CUBLAS_POINTER_MODE_HOST = 0
+
+# ---- Phase 1 fp16（只给 GEMM 用，由环境变量 TG_FP16=1 打开，默认关） ----
+# cudaDataType_t
+CUDA_R_32F = 0
+CUDA_R_16F = 2
+# cublasComputeType_t：CUBLAS_COMPUTE_16F=64, CUBLAS_COMPUTE_32F=68, 64F=70, 32I=72
+CUBLAS_COMPUTE_32F = 68
+# cublasGemmAlgo_t：CUBLAS_GEMM_DEFAULT=-1。实测（V100 + cublas64_12）
+# algo=-1 在所有形状上都不慢于 99(DEFAULT_TENSOR_OP)，且不用碰已废弃枚举。
+CUBLAS_GEMM_DEFAULT = -1
+
+# 环境变量开关。只认 "1"/"true"/"yes"/"on"（大小写不敏感）。
+_FP16_ENV = "TG_FP16"
+# 输出元素数小于这个数就别转 fp16 了（cast 比省下的 GEMM 时间还贵）。
+_FP16_MIN_OUTPUT = 262144
+_FP16_MAX_K = 1280          # K 超过这个就用 fp32（长累加 + 对消，精度掉得快）
+
+
+def fp16_env_requested():
+    v = os.environ.get(_FP16_ENV, "")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 # cuda.h
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
@@ -1331,9 +1353,75 @@ extern "C" __global__ void cat_extract(
 """
 
 
+_FP16_KERNELS = r"""
+/* ---- Phase 1 fp16：GEMM 用的两个 cast 内核 ----
+ * 刻意不 #include <cuda_fp16.h>（NVRTC 没配 -I，加了会编不过），
+ * 这里只需要 IEEE binary16 的位运算，自己写 round-to-nearest-even 更可控。
+ * 转换结果与 numpy 的 astype(np.float16) 逐位一致（sNaN 归一成 qNaN 除外）。
+ */
+__device__ __forceinline__ unsigned int tg_f32_to_f16_bits(float f) {
+    unsigned int x = __float_as_uint(f);
+    unsigned int s = x & 0x80000000u;
+    unsigned int mag = x & 0x7fffffffu;
+    if (mag >= 0x7f800000u) {                    /* inf / nan */
+        unsigned int payload = (mag > 0x7f800000u) ? 0x200u : 0u;
+        return (s >> 16) | 0x7c00u | payload;
+    }
+    if (mag >= 0x477ff000u) {                    /* >= 65520 一律进位成 inf */
+        return (s >> 16) | 0x7c00u;
+    }
+    int e = (int)(mag >> 23);                    /* 偏置 127 的指数 */
+    unsigned int m = mag & 0x7fffffu;
+    int ne = e - 127 + 15;                       /* 换成偏置 15 */
+    if (ne <= 0) {                               /* half 的次正规 / 0（< 2^-14） */
+        if (ne < -10) return s >> 16;            /* 太小，舍到 0 */
+        m |= 0x800000u;
+        int sh = 14 - ne;                        /* 14..24，留 10 位 */
+        unsigned int h = m >> sh;
+        unsigned int rem = m & ((1u << sh) - 1u);
+        unsigned int mid = 1u << (sh - 1);
+        if (rem > mid || (rem == mid && (h & 1u))) h++;
+        return (s >> 16) | h;
+    }
+    unsigned int h = ((unsigned int)ne << 10) | (m >> 13);
+    unsigned int rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+    return (s >> 16) | h;
+}
+
+__device__ __forceinline__ float tg_f16_bits_to_f32(unsigned int h) {
+    unsigned int s = (h & 0x8000u) << 16;
+    unsigned int e = (h >> 10) & 0x1fu;
+    unsigned int m = h & 0x3ffu;
+    if (e == 0u) {
+        if (m == 0u) return __uint_as_float(s);
+        int sh = 0;
+        while (!(m & 0x400u)) { m <<= 1; sh++; }
+        m &= 0x3ffu;
+        return __uint_as_float(s | ((unsigned int)(113 - sh) << 23) | (m << 13));
+    }
+    if (e == 31u) return __uint_as_float(s | 0x7f800000u | (m << 13));
+    return __uint_as_float(s | ((e + 112u) << 23) | (m << 13));
+}
+
+extern "C" __global__ void cast_f32_to_f16(const float* __restrict__ src,
+                                           unsigned short* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (unsigned short)tg_f32_to_f16_bits(src[i]);
+}
+
+extern "C" __global__ void cast_f16_to_f32(const unsigned short* __restrict__ src,
+                                           float* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = tg_f16_bits_to_f32((unsigned int)src[i]);
+}
+"""
+
+
 def _device_source():
     return (_CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS + "\n"
-            + _M5_KERNELS + "\n" + _MOE_KERNELS + "\n" + _CAT_KERNELS)
+            + _M5_KERNELS + "\n" + _MOE_KERNELS + "\n" + _CAT_KERNELS + "\n"
+            + _FP16_KERNELS)
 
 
 class CudaError(RuntimeError):
@@ -3121,9 +3209,181 @@ class CudaRuntime:
             a.known_scalar = float(a.known_scalar) * scalar
         return a
 
+    # ---- Phase 1 fp16：GEMM 快路径（TG_FP16=1 打开，默认关） --------------
+    def _fp16_state(self):
+        """惰性初始化，不改 __init__，也不给没开 fp16 的进程增加任何开销。"""
+        st = getattr(self, "_fp16", None)
+        if st is None:
+            st = {
+                "on": bool(fp16_env_requested()),
+                "warned": False,
+                "inited": False,
+                # True: C 用 fp32 直接落盘（省一次 cast，误差也更小）。
+                # False: C 也用 fp16，再 cast 回 fp32。
+                "c32": True,
+            }
+            self._fp16 = st
+        return st
+
+    def fp16_gemm_on(self):
+        return bool(self._fp16_state()["on"])
+
+    def _fp16_fail(self, ex):
+        """任何异常都关掉 fp16 并只警告一次，后续全部走 fp32。"""
+        st = self._fp16_state()
+        st["on"] = False
+        if not st["warned"]:
+            st["warned"] = True
+            sys.stderr.write(
+                "[tgai] fp16 GEMM 不可用，已回退 fp32（只警告一次）：%s: %s\n"
+                % (type(ex).__name__, str(ex)[:300]))
+            sys.stderr.flush()
+
+    def _bind_gemm_ex(self):
+        st = self._fp16_state()
+        if st["inited"]:
+            return
+        cb = self.cublas
+        # cublasStatus_t cublasGemmEx(handle, transa, transb, m, n, k,
+        #     const void* alpha, const void* A, cudaDataType Atype, int lda,
+        #     const void* B, cudaDataType Btype, int ldb,
+        #     const void* beta, void* C, cudaDataType Ctype, int ldc,
+        #     cublasComputeType_t computeType, cublasGemmAlgo_t algo)
+        # 枚举在 ABI 上都是 int；设备指针用 c_uint64（c_void_p 有符号会 OverflowError）。
+        cb.cublasGemmEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+        ]
+        cb.cublasGemmEx.restype = ctypes.c_int
+        st["inited"] = True
+
+    def _cast_flat_ptr(self, src_ptr, count, to_f16):
+        """把 src_ptr 起 count 个元素整块 cast 成新缓冲（形状信息不重要）。"""
+        count = int(count)
+        if to_f16:
+            out = self.empty((count,), dtype=np.float16)
+            if count:
+                grid, block = self._ewise_grid(count)
+                self._activate()
+                self.launch("cast_f32_to_f16", grid, block, [
+                    (int(src_ptr), ctypes.c_uint64), self._ptr(out),
+                    (count, ctypes.c_int),
+                ])
+        else:
+            out = self.empty((count,), dtype=np.float32)
+            if count:
+                grid, block = self._ewise_grid(count)
+                self._activate()
+                self.launch("cast_f16_to_f32", grid, block, [
+                    (int(src_ptr), ctypes.c_uint64), self._ptr(out),
+                    (count, ctypes.c_int),
+                ])
+        return out
+
+    def cast_f32_to_f16(self, buf):
+        """fp32 GpuBuf -> fp16 GpuBuf（shape 不变）。给测试和以后的内核用。"""
+        out = self.empty(buf.shape, dtype=np.float16)
+        if int(buf.n):
+            grid, block = self._ewise_grid(int(buf.n))
+            self._activate()
+            self.launch("cast_f32_to_f16", grid, block, [
+                self._ptr(buf), self._ptr(out), (int(buf.n), ctypes.c_int),
+            ])
+        return out
+
+    def cast_f16_to_f32(self, buf):
+        out = self.empty(buf.shape, dtype=np.float32)
+        if int(buf.n):
+            grid, block = self._ewise_grid(int(buf.n))
+            self._activate()
+            self.launch("cast_f16_to_f32", grid, block, [
+                self._ptr(buf), self._ptr(out), (int(buf.n), ctypes.c_int),
+            ])
+        return out
+
+    def _sgemm_f16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
+        """列主序调用和 _sgemm 完全一致，只是 A/B 先转 fp16、按 fp32 累加。
+
+        调用方语义不变：结果仍然写进 fp32 的 C。
+        fp16 缓冲的布局和 fp32 一一对应，所以 lda/ldb/ldc 原样透传。
+        """
+        self._bind_gemm_ex()
+        st = self._fp16_state()
+        # 元素数上界：按 (rows, cols) 的最大那个算，多余部分不会被读到。
+        na = int(lda) * (int(k) if int(transa) == CUDA_OP_N else int(m))
+        nb = int(ldb) * (int(n) if int(transb) == CUDA_OP_N else int(k))
+        nc = int(ldc) * int(n)
+        if max(na, nb, nc) > 2147483647:
+            raise CudaError("fp16 GEMM 元素数超过 int32")
+        a16 = self._cast_flat_ptr(A, na, True)
+        b16 = self._cast_flat_ptr(B, nb, True)
+        if st["c32"]:
+            c16 = None
+            cptr = int(C)
+            ctype = CUDA_R_32F
+        else:
+            c16 = self.empty((nc,), dtype=np.float16)
+            cptr = int(c16.ptr)
+            ctype = CUDA_R_16F
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._activate()
+        self._chk_blas(self.cublas.cublasGemmEx(
+            self.handle,
+            int(transa), int(transb),
+            int(m), int(n), int(k),
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(a16.ptr)), CUDA_R_16F, int(lda),
+            ctypes.c_uint64(int(b16.ptr)), CUDA_R_16F, int(ldb),
+            ctypes.byref(beta),
+            ctypes.c_uint64(cptr), ctype, int(ldc),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "cublasGemmEx")
+        if c16 is not None and nc:
+            grid, block = self._ewise_grid(nc)
+            self.launch("cast_f16_to_f32", grid, block, [
+                self._ptr(c16), (int(C), ctypes.c_uint64), (nc, ctypes.c_int),
+            ])
+
+    def sgemm_fp16(self, A, B):
+        """行优先 C[M,N] = A[M,K] @ B[K,N]，走 fp16 快路径（不受 TG_FP16 限制）。
+
+        A、B 是 fp32 GpuBuf；返回 fp32 GpuBuf。仅用于单点验证和特殊场景。
+        """
+        if len(A.shape) != 2 or len(B.shape) != 2:
+            raise CudaError("sgemm_fp16 需要 2D，收到 %s @ %s" % (A.shape, B.shape))
+        M, K = int(A.shape[0]), int(A.shape[1])
+        K2, N = int(B.shape[0]), int(B.shape[1])
+        if K != K2:
+            raise CudaError("sgemm_fp16 K 不匹配: %s @ %s" % (A.shape, B.shape))
+        C = self.empty((M, N), dtype=np.float32)
+        if M and N and K:
+            # 和 sgemm 一样：列主序视角 C^T(N,M) = B^T @ A^T
+            self._sgemm_f16(CUDA_OP_N, CUDA_OP_N, N, M, K, B.ptr, N, A.ptr, K, C.ptr, N)
+        return C
+
     def _sgemm(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
         if m == 0 or n == 0 or k == 0:
             return
+        # 只有输出够大时才值得转 fp16。实测（V100 / cublas64_12）：
+        #   m*n = 65536,  k=4992 -> fp16 反而慢一倍（0.073 -> 0.142 ms，cast 占满）
+        #   m*n >= 1.28M, k=256..1280 -> fp16 快 1.6~2.6x
+        # 所以拿 m*n 当门槛；小输出（各层 dW 那种 [256,256] @ k=4992）留 fp32。
+        # ★ 只对「K 不长」的 GEMM 走 fp16：dW 类形状（K=4992 的长累加、数值对消严重）
+            #   实测会让参数梯度的相对误差从 3e-4 恶化到 2e-2（loss 600 步偏 10%）。
+            if int(m) * int(n) >= _FP16_MIN_OUTPUT and int(k) <= 1280 and self._fp16_state()["on"]:
+                try:
+                    self._sgemm_f16(transa, transb, m, n, k, A, lda, B, ldb, C, ldc)
+                    return
+                except Exception as ex:
+                    # 回退：fp32 路径 beta=0 会把 C 整个重写，前面 fp16 的半成品不作数。
+                    self._fp16_fail(ex)
         alpha = ctypes.c_float(1.0)
         beta = ctypes.c_float(0.0)
         self._activate()
