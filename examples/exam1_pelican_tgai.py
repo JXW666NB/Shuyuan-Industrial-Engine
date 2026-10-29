@@ -83,7 +83,17 @@ def _rms_composed(x, w, eps=1e-6):
 
 
 def silu(x):
+    # torch 有融合 silu；TGAI 的 CUDA 后端走下面的组合式（只在没有 glu 时用）
+    if hasattr(F, "silu"):
+        return F.silu(x)
     return x * ((T.tensor(np.array([1.0], np.float32)) + (-x).exp()) ** -1.0)
+
+
+def glu(a, b):
+    """out = silu(a) * b。TGAI 有融合 kernel（1 个），其它后端退回组合式。"""
+    if hasattr(T, "silu_mul"):
+        return T.silu_mul(a, b)
+    return silu(a) * b
 
 
 _ROPE_CACHE = {}
@@ -154,7 +164,7 @@ def forward(p, ids, cfg):
         x = x + (o @ p[b + "attn.out_proj.weight"].T).reshape(B, S, D)
 
         hf = ln(x, p[b + "ln2.weight"]).reshape(B * S, D)
-        y = silu(hf @ p[b + "moe.experts.0.w1.weight"].T) * (hf @ p[b + "moe.experts.0.w2.weight"].T)
+        y = glu(hf @ p[b + "moe.experts.0.w1.weight"].T, hf @ p[b + "moe.experts.0.w2.weight"].T)
         x = x + (y @ p[b + "moe.experts.0.w3.weight"].T).reshape(B, S, D)
 
     z = ln(x, p["final_norm.weight"]).reshape(B * S, D)

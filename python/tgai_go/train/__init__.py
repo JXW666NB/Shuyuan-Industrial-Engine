@@ -2692,6 +2692,30 @@ class Embedding(Module):
         return out
 
 
+def silu_mul(a, b):
+    """out = silu(a) * b —— 融合实现（CUDA 上 fwd/bwd 各 1 个 kernel，组合实现要 5 个）。
+
+    silu_mul_fwd 是原地写 a，所以先 clone 一份；反向要用**原始 a**，因此 a 本身不能被改。
+    """
+    if (getattr(a, "device", "cpu") != "cuda" or getattr(b, "device", "cpu") != "cuda"):
+        inv = (Tensor(np.array([1.0], np.float32)) + (-a).exp()) ** -1.0
+        return a * inv * b
+    rt = _cuda()
+    y = rt.silu_mul_fwd(rt.clone(a._gpu), b._gpu)
+    out = Tensor._from_gpu(y, requires_grad=(a.requires_grad or b.requires_grad),
+                           _parents=(a, b))
+
+    def bw(g, grads):
+        da, db = rt.silu_mul_bwd(g, a._gpu, b._gpu)
+        if a.requires_grad:
+            _acc(grads, a, da)
+        if b.requires_grad:
+            _acc(grads, b, db)
+
+    out._backward = bw
+    return out
+
+
 class RMSNorm(Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
