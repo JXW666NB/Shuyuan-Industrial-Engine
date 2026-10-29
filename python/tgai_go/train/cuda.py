@@ -587,6 +587,51 @@ extern "C" __global__ void emb_bwd_rows(const float* g, const int* offsets, cons
             erow[j] += grow[j];
     }
 }
+
+/* 单线程扫词表，把出现过的 id 收成 active[0:nactive)。顺序是 id 升序，
+ * 每个 id 内部的 token 下标仍由 emb_bwd_fill 按从小到大写入。 */
+extern "C" __global__ void emb_bwd_plan2(const int* counts, int* offsets, int* cursor,
+                                         int* active, int* nactive, int vocab) {
+    if (threadIdx.x || blockIdx.x) return;
+    int sum = 0;
+    int na = 0;
+    for (int i = 0; i < vocab; ++i) {
+        offsets[i] = sum;
+        cursor[i] = sum;
+        int c = counts[i];
+        if (c) active[na++] = i;
+        sum += c;
+    }
+    offsets[vocab] = sum;
+    nactive[0] = na;
+}
+
+/* 一个 block 独占一行。float4 按 token 下标顺序加，和 np.add.at 的逐元素顺序一致。
+ * grid 用 seq 做上界，nactive 在设备上，避免为了读个数把整条流同步回主机。 */
+extern "C" __global__ void emb_bwd_rows4(const float* g, const int* offsets, const int* pos,
+                                         const int* active, const int* nactive, float* demb,
+                                         int d) {
+    int slot = (int)blockIdx.x;
+    int na = nactive[0];
+    if (slot >= na || (d & 3)) return;
+    int id = active[slot];
+    int begin = offsets[id];
+    int end = offsets[id + 1];
+    int d4 = d >> 2;
+    float4* erow = reinterpret_cast<float4*>(demb + (long long)id * d);
+    for (int j4 = (int)threadIdx.x; j4 < d4; j4 += (int)blockDim.x) {
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int p = begin; p < end; ++p) {
+            const float4* grow = reinterpret_cast<const float4*>(g + (long long)pos[p] * d);
+            float4 v = grow[j4];
+            acc.x += v.x;
+            acc.y += v.y;
+            acc.z += v.z;
+            acc.w += v.w;
+        }
+        erow[j4] = acc;
+    }
+}
 """
 
 
@@ -1166,6 +1211,16 @@ extern "C" __global__ void moe_row_dot(const float* g, const float* y, float* dw
     for (int j = 0; j < d; ++j) s = __fadd_rn(s, __fmul_rn(gg[j], yy[j]));
     dw[i] = s;
 }
+
+/* 把 [rows, cols] 抄进目标的前 rows 行。目标更长的部分由调用方预先清零。 */
+extern "C" __global__ void moe_pad_rows(const float* src, float* dst, int rows, int cols) {
+    int i = (int)blockIdx.x;
+    if (i >= rows) return;
+    const float* s = src + (long long)i * cols;
+    float* d = dst + (long long)i * cols;
+    for (int j = (int)threadIdx.x; j < cols; j += (int)blockDim.x)
+        d[j] = s[j];
+}
 """
 
 
@@ -1185,6 +1240,8 @@ _ATTN_NOP_BQ = 64
 # 反向 atomic 按 query-tile 分组写到独立 plane，再加回 dK/dV，减轻 128 路冲突。
 _ATTN_FLASH_GROUPS = 8
 _ATTN_FLASH_SMEM = 69632
+# g2 在 69632 上再加 smDK/smDV（各 64*32 个 float）。
+_ATTN_FLASH_G2_SMEM = 86016
 _ATTN_FLASH_MAX_SMEM = 96 * 1024
 
 
@@ -1984,24 +2041,26 @@ class CudaRuntime:
         self._pool_shed_ready()
 
     def _pool_shed_ready(self):
-        """缓存超过 IDLE_TRIGGER 时，把 event 已完成（kernel 已跑完）的块真正释放。
+        """占用超过 12.6 GiB 时，每个尺寸只留 2 个已完成的空闲块，其余还给驱动。
 
-        只释放"确定没人再用"的块：cuEventQuery 返回成功才动它。
-        目标是把缓存压到 IDLE_KEEP 以下，避免长时间训练把显存囤住。
+        旧逻辑把缓存压到 256 MiB，梯度缓冲区每步都被拆掉。全留着又会超过 13 GiB。
+        热尺寸（32MiB/16MiB）留 2 个就能复用，冷块才释放。不在这里同步整条流。
         """
         if self.cu is None or getattr(self, "_pool_trimming", False):
             return
-        if self._pool_cached_bytes <= _POOL_IDLE_TRIGGER:
+        limit = (12 * 1024 + 204) * 1024 * 1024
+        if self._pool_live_bytes + self._pool_cached_bytes <= limit:
             return
         self._pool_trimming = True
         try:
             freed = False
-            for size in sorted(list(self._pool_free.keys())):
+            for size in sorted(list(self._pool_free.keys()), reverse=True):
                 chain = self._pool_free.get(size) or []
                 keep = []
                 for ptr, ev in chain:
+                    over = self._pool_live_bytes + self._pool_cached_bytes > limit
                     done = int(self.cu.cuEventQuery(ev)) == 0
-                    if done and self._pool_cached_bytes > _POOL_IDLE_KEEP:
+                    if over and done and len(keep) >= 2:
                         self.cu.cuEventDestroy(ev)
                         self.cu.cuMemFree(ctypes.c_uint64(int(ptr)))
                         self._pool_cached_bytes -= int(size)
@@ -2013,7 +2072,7 @@ class CudaRuntime:
                     self._pool_free[size] = keep
                 else:
                     self._pool_free.pop(size, None)
-                if self._pool_cached_bytes <= _POOL_IDLE_KEEP:
+                if self._pool_live_bytes + self._pool_cached_bytes <= limit:
                     break
             if freed:
                 self._pool_note()
@@ -2042,9 +2101,13 @@ class CudaRuntime:
             for size in sorted(self._pool_free):
                 chain = self._pool_free[size]
                 while chain and self._pool_cached_bytes > limit:
-                    ptr = chain[-1]
+                    node = chain.pop()
+                    if isinstance(node, tuple):
+                        ptr, ev = node
+                        self.cu.cuEventDestroy(ev)
+                    else:
+                        ptr = node
                     self._chk(self.cu.cuMemFree(ctypes.c_uint64(int(ptr))), "cuMemFree(pool)")
-                    chain.pop()
                     self._pool_cached_bytes -= size
                 if not chain:
                     del self._pool_free[size]
@@ -2101,6 +2164,17 @@ class CudaRuntime:
             raise CudaError("内部分桶 %d 小于请求 %d" % (bucket, nbytes))
         ptr = self._pool_take(bucket)
         got = bucket
+        if not ptr and not getattr(self, "_alloc_retry", False):
+            # 空闲块还没跑完就再分配，占用会冲过 13 GiB。等默认流结束再回收一次。
+            limit = (12 * 1024 + 204) * 1024 * 1024
+            if self._pool_live_bytes + self._pool_cached_bytes + bucket > limit and self._pool_cached_bytes:
+                self._alloc_retry = True
+                try:
+                    self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(alloc-cap)")
+                    self._pool_shed_ready()
+                    ptr = self._pool_take(bucket)
+                finally:
+                    self._alloc_retry = False
         if ptr:
             if ptr in self._pool_live:
                 self._pool_free.setdefault(got, []).append(ptr)
@@ -2964,10 +3038,122 @@ class CudaRuntime:
             Cs[0].keepalive = (hold, prev) if prev is not None else hold
         return Cs
 
+    def _strided_ready(self):
+        if getattr(self, "_strided_missing", False):
+            return None
+        fn = getattr(self, "_strided_fn", None)
+        if fn is not None:
+            return fn
+        try:
+            fn = self.cublas.cublasSgemmStridedBatched
+        except AttributeError:
+            self._strided_missing = True
+            return None
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_int,
+        ]
+        self._strided_fn = fn
+        return fn
+
+    def _grouped_tn_strided(self, As, Bs):
+        """把专家垫到同一个 K，一次 cublasSgemmStridedBatched。
+
+        垫出来的行是 0，乘进去是精确的 +0，不改变和。K 差太多就不要垫，
+        调用方会退回 grouped。空专家整块是 0。
+        """
+        ks = [int(A.shape[0]) for A in As]
+        positive = [k for k in ks if k > 0]
+        if not positive:
+            M = int(As[0].shape[1]) if As else 0
+            N = int(Bs[0].shape[1]) if Bs else 0
+            return [self.zeros((M, N), dtype=np.float32) for _ in As]
+        kmax = max(positive)
+        M = int(As[0].shape[1])
+        N = int(Bs[0].shape[1])
+        nexp = len(As)
+        Ap = self.zeros((nexp, kmax, M), dtype=np.float32)
+        Bp = self.zeros((nexp, kmax, N), dtype=np.float32)
+        for e, (A, B, k) in enumerate(zip(As, Bs, ks)):
+            if k <= 0 or M <= 0:
+                continue
+            self._mark_submitted(A.ptr)
+            self.launch("moe_pad_rows", (k, 1, 1), (self._moe_row_block(M), 1, 1), [
+                (int(A.ptr), ctypes.c_uint64),
+                (int(Ap.ptr) + e * kmax * M * 4, ctypes.c_uint64),
+                (k, ctypes.c_int), (M, ctypes.c_int),
+            ])
+            if N > 0:
+                self._mark_submitted(B.ptr)
+                self.launch("moe_pad_rows", (k, 1, 1), (self._moe_row_block(N), 1, 1), [
+                    (int(B.ptr), ctypes.c_uint64),
+                    (int(Bp.ptr) + e * kmax * N * 4, ctypes.c_uint64),
+                    (k, ctypes.c_int), (N, ctypes.c_int),
+                ])
+        Cp = self.empty((nexp, M, N), dtype=np.float32)
+        fn = self._strided_ready()
+        if fn is None or M <= 0 or N <= 0 or kmax <= 0:
+            raise CudaError("strided gemm 不可用")
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._mark_submitted(Ap.ptr)
+        self._mark_submitted(Bp.ptr)
+        self._mark_submitted(Cp.ptr)
+        self._activate()
+        self._chk_blas(fn(
+            self.handle, CUDA_OP_N, CUDA_OP_T,
+            ctypes.c_int(N), ctypes.c_int(M), ctypes.c_int(kmax),
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(Bp.ptr)), ctypes.c_int(N), ctypes.c_longlong(kmax * N),
+            ctypes.c_uint64(int(Ap.ptr)), ctypes.c_int(M), ctypes.c_longlong(kmax * M),
+            ctypes.byref(beta),
+            ctypes.c_uint64(int(Cp.ptr)), ctypes.c_int(N), ctypes.c_longlong(M * N),
+            ctypes.c_int(nexp),
+        ), "cublasSgemmStridedBatched")
+        Cs = []
+        for e in range(nexp):
+            C = self.empty((M, N), dtype=np.float32)
+            if M and N:
+                self.launch("moe_pad_rows", (M, 1, 1), (self._moe_row_block(N), 1, 1), [
+                    (int(Cp.ptr) + e * M * N * 4, ctypes.c_uint64),
+                    (int(C.ptr), ctypes.c_uint64),
+                    (M, ctypes.c_int), (N, ctypes.c_int),
+                ])
+            Cs.append(C)
+        if Cs:
+            Cs[0].keepalive = (Ap, Bp, Cp, alpha, beta)
+        return Cs
+
     def grouped_tn(self, As, Bs):
         """每个 C[M,N] = A[K,M]^T @ B[K,N]。"""
         if len(As) != len(Bs):
             raise CudaError("grouped_tn 两边条数不同")
+        if len(As) >= 2:
+            shapes_ok = True
+            ks = []
+            M0 = int(As[0].shape[1])
+            N0 = int(Bs[0].shape[1])
+            for A, B in zip(As, Bs):
+                K, M = int(A.shape[0]), int(A.shape[1])
+                K2, N = int(B.shape[0]), int(B.shape[1])
+                if K != K2 or M != M0 or N != N0:
+                    shapes_ok = False
+                    break
+                ks.append(K)
+            positive = [k for k in ks if k > 0]
+            # 专家 token 数接近时，垫零后一次 strided 比 8 次不同 K 的 grouped 更合适。
+            if (shapes_ok and positive and max(positive) > 64
+                    and max(positive) <= min(positive) * 8
+                    and self._strided_ready() is not None):
+                return self._grouped_tn_strided(As, Bs)
         Cs = []
         specs = []
         for A, B in zip(As, Bs):
@@ -3114,14 +3300,15 @@ class CudaRuntime:
         if not seq or not d:
             return dw
         vocab = int(table_shape[0])
-        # 短序列保持原来的 atomic，判分台的重复 id 仍走那条。
+        # 短序列保持原来的 atomic。长序列按 id % 256 把一行交给一个 block，
+        # 块内按 token 顺序加，不再 atomic。分段归约（plan2/rows4）在 8192 上
+        # 比这条慢：单线程扫 3 万词表的开销盖过了写梯度本身。
         if seq < 1024 or d < 128 or vocab < 2:
             self.launch("emb_gather_bwd", (seq, 1, 1), (256, 1, 1), [
                 self._ptr(grad), self._ptr(ids), self._ptr(dw),
                 (seq, ctypes.c_int), (d, ctypes.c_int),
             ])
             return dw
-        # 每个 block 独占 id % 256，按 token 顺序加，不再 atomic 挤在同一行。
         self.launch("emb_bwd_owned", (256, 1, 1), (256, 1, 1), [
             self._ptr(grad), self._ptr(ids), self._ptr(dw),
             (seq, ctypes.c_int), (d, ctypes.c_int), (vocab, ctypes.c_int),
@@ -3416,17 +3603,22 @@ class CudaRuntime:
             raise CudaError("attn_flash 只接受 dh=64，收到 %d" % dh)
         if seq < 0 or nh < 0:
             raise CudaError("attn_flash 形状非法 seq=%d nh=%d" % (seq, nh))
-        if not self._attn_flash_ready:
+        ready = getattr(self, "_attn_flash_names", None)
+        if ready is None:
+            ready = self._attn_flash_names = set()
+        if name not in ready:
             self._attn_set_dyn_smem(name, _ATTN_FLASH_MAX_SMEM)
-            self._attn_flash_ready = True
-        gy = (int(seq) + _ATTN_NOP_BQ - 1) // _ATTN_NOP_BQ
+            ready.add(name)
+        tile = 128 if name == "attn_bwd_flash_g2" else _ATTN_NOP_BQ
+        smem = _ATTN_FLASH_G2_SMEM if name == "attn_bwd_flash_g2" else _ATTN_FLASH_SMEM
+        gy = (int(seq) + tile - 1) // tile
         if gy < 1:
             gy = 1
         if seq == 0 or nh == 0:
             return
         self.launch(
             name, (int(nh), gy, 1), (256, 1, 1), args,
-            shared=_ATTN_FLASH_SMEM, module=self._attn_mod)
+            shared=smem, module=self._attn_mod)
 
     def attn_nop_fwd(self, q, k, v, scale):
         """q,k,v 为 [seq, nh, dh] fp32。只写 O，不写 P。"""
@@ -3493,35 +3685,19 @@ class CudaRuntime:
         dq = self.zeros((seq, nh, dh), dtype=np.float32)
         dk = self.zeros((seq, nh, dh), dtype=np.float32)
         dv = self.zeros((seq, nh, dh), dtype=np.float32)
-        # 分组 plane 在 8192 上把反向从 36ms 拉到 71ms（多出来的是 448MB 清零，
-        # atomic 冲突并不是大头）。先保持单缓冲，和已验收的 flash 反向同一条路径。
-        groups = 1
-        planes = groups - 1
-        nplane = int(seq) * int(nh) * int(dh)
-        if planes > 0 and nplane:
-            dk_part = self.zeros((planes, nplane), dtype=np.float32)
-            dv_part = self.zeros((planes, nplane), dtype=np.float32)
-        else:
-            dk_part = dk
-            dv_part = dv
-            groups = 1
-            planes = 0
-        self._attn_flash_launch("attn_bwd_flash", seq, nh, dh, [
+        # seq>=4096 时一个 block 吃两个 query tile，dK/dV 在 smem 里加完再 atomic 一次。
+        # 短序列仍走原来的 attn_bwd_flash，attn_lowmem_check 的形状不变。
+        # 内核签名到 scale 为止。以前多传的 plane 指针已经不用，传进去会被当成下一次参数。
+        # g2（两 tile 合并 atomic）在 8192 上测得 57ms，比单 tile 的 37ms 差，默认关闭。
+        # TGAI_ATTN_G2=1 才启用，留给数值对照。
+        name = "attn_bwd_flash_g2" if os.environ.get("TGAI_ATTN_G2") == "1" else "attn_bwd_flash"
+        self._attn_flash_launch(name, seq, nh, dh, [
             self._ptr(do), self._ptr(q), self._ptr(k), self._ptr(v), self._ptr(o),
             self._ptr(m), self._ptr(lse),
             self._ptr(dq), self._ptr(dk), self._ptr(dv),
             (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
             (float(scale), ctypes.c_float),
-            self._ptr(dk_part), self._ptr(dv_part), (int(groups), ctypes.c_int),
         ])
-        if planes > 0 and nplane:
-            n4 = nplane >> 2
-            grid = (n4 + 255) // 256
-            self.launch("attn_bwd_reduce_planes", (grid, 1, 1), (256, 1, 1), [
-                self._ptr(dk), self._ptr(dv), self._ptr(dk_part), self._ptr(dv_part),
-                (nplane, ctypes.c_int), (planes, ctypes.c_int),
-            ], module=self._attn_mod)
-            dk.keepalive = (dk_part, dv_part)
         return dq, dk, dv
 
 

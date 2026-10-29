@@ -553,8 +553,7 @@ attn_bwd_flash(const float* __restrict__ dO, const float* __restrict__ Q,
                const float* __restrict__ O,
                const float* __restrict__ m_in, const float* __restrict__ l_in,
                float* __restrict__ dQ, float* __restrict__ dK, float* __restrict__ dV,
-               int seq, int nh, int dh, float scale,
-               float* __restrict__ dK_part, float* __restrict__ dV_part, int groups) {
+               int seq, int nh, int dh, float scale) {
     const int h = (int)blockIdx.x;
     const int t0 = (int)blockIdx.y * BT;
     const int tid = (int)threadIdx.x;
@@ -653,16 +652,8 @@ attn_bwd_flash(const float* __restrict__ dO, const float* __restrict__ Q,
             }
             int tok = k0 + k;
             if (tok < seq) {
-                int grp = groups > 1 ? ((int)blockIdx.y % groups) : 0;
-                float* dk_base = dK;
-                float* dv_base = dV;
-                if (grp > 0) {
-                    long long plane = (long long)seq * nh * dh;
-                    dk_base = dK_part + (long long)(grp - 1) * plane;
-                    dv_base = dV_part + (long long)(grp - 1) * plane;
-                }
-                float* dkrow = dk_base + qkv_at(tok, h, nh, dh);
-                float* dvrow = dv_base + qkv_at(tok, h, nh, dh);
+                float* dkrow = dK + qkv_at(tok, h, nh, dh);
+                float* dvrow = dV + qkv_at(tok, h, nh, dh);
                 atomicAdd(dkrow + d, scale * ak);
                 atomicAdd(dvrow + d, av);
             }
@@ -681,23 +672,175 @@ attn_bwd_flash(const float* __restrict__ dO, const float* __restrict__ Q,
     }
 }
 
-extern "C" __global__ void attn_bwd_reduce_planes(
-    float* __restrict__ dk, float* __restrict__ dv,
-    const float* __restrict__ dk_part, const float* __restrict__ dv_part,
-    int n, int planes) {
-    int i4 = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int n4 = n >> 2;
-    if (i4 >= n4) return;
-    float4 a = reinterpret_cast<float4*>(dk)[i4];
-    float4 b = reinterpret_cast<float4*>(dv)[i4];
-    for (int p = 0; p < planes; ++p) {
-        float4 da = reinterpret_cast<const float4*>(dk_part + (long long)p * n)[i4];
-        float4 db = reinterpret_cast<const float4*>(dv_part + (long long)p * n)[i4];
-        a.x += da.x; a.y += da.y; a.z += da.z; a.w += da.w;
-        b.x += db.x; b.y += db.y; b.z += db.z; b.w += db.w;
+// One query tile against the K/V already in smem. dQ accumulates in registers.
+// dK/dV accumulate into smDK/smDV (caller zeroed them) so two query tiles can
+// share one atomicAdd. All threads of the block must enter together.
+__device__ void flash_bwd_one_tile(
+    float* smQ, float* smDO, float* smK, float* smV, float* smP, float* smDS,
+    float* smDK, float* smDV,
+    const float* __restrict__ dO, const float* __restrict__ Q, const float* __restrict__ O,
+    const float* __restrict__ m_in, const float* __restrict__ l_in,
+    int t0, int k0, int h, int seq, int nh, int dh, float scale,
+    int tid, int lane, int row0, float dq0[8], float dq1[8]) {
+    load_T72(Q, smQ, t0, h, nh, dh, tid, seq);
+    load_T72(dO, smDO, t0, h, nh, dh, tid, seq);
+    __syncthreads();
+
+    float m[8], l[8], D[8];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        int tr = t0 + row0 + r;
+        if (tr < seq) {
+            int mi = tr * nh + h;
+            m[r] = m_in[mi];
+            l[r] = l_in[mi];
+            float part = smDO[lane * QSTR + row0 + r] * O[qkv_at(tr, h, nh, dh) + lane]
+                       + smDO[(lane + 32) * QSTR + row0 + r] * O[qkv_at(tr, h, nh, dh) + lane + 32];
+            D[r] = warp_sum(part);
+        } else {
+            m[r] = NEG;
+            l[r] = 0.f;
+            D[r] = 0.f;
+        }
     }
-    reinterpret_cast<float4*>(dk)[i4] = a;
-    reinterpret_cast<float4*>(dv)[i4] = b;
+    float sx[8], dp[8];
+    flash_qk_dp(smQ, smDO, smK, smV, row0, lane, sx, dp);
+    bool tile_full = (k0 + BC <= t0);
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        sx[r] *= scale;
+        int tr = t0 + row0 + r;
+        int u = k0 + lane;
+        bool ok = (tr < seq) && (u < seq) && (tile_full || (u <= tr));
+        if (!ok) sx[r] = NEG;
+        float p = prob_of(sx[r], m[r], l[r]);
+        float ds = p * (dp[r] - D[r]);
+        smP[(row0 + r) * BC + lane] = p;
+        smDS[(row0 + r) * BC + lane] = ds;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        float g0 = 0.f, g1 = 0.f;
+        int q = row0 + r;
+#pragma unroll
+        for (int k = 0; k < BC; ++k) {
+            float s = smDS[q * BC + k];
+            g0 = fmaf(s, smK[lane * BC + k], g0);
+            g1 = fmaf(s, smK[(lane + 32) * BC + k], g1);
+        }
+        dq0[r] += g0;
+        dq1[r] += g1;
+    }
+#pragma unroll 1
+    for (int e = 0; e < 8; ++e) {
+        int idx = tid + e * 256;
+        int k = idx >> 6;
+        int d = idx & 63;
+        float ak = 0.f, av = 0.f;
+#pragma unroll 4
+        for (int q = 0; q < BT; ++q) {
+            ak = fmaf(smDS[q * BC + k], smQ[d * QSTR + q], ak);
+            av = fmaf(smP[q * BC + k], smDO[d * QSTR + q], av);
+        }
+        smDK[d * BC + k] += ak;
+        smDV[d * BC + k] += av;
+    }
+    __syncthreads();
+}
+
+// Two query tiles per block. dK/dV of those tiles are summed in smem, then
+// one atomicAdd. dQ stays in registers. Grid y is ceil(seq / 128).
+extern "C" __global__ void __launch_bounds__(256, 2)
+attn_bwd_flash_g2(const float* __restrict__ dO, const float* __restrict__ Q,
+                  const float* __restrict__ K, const float* __restrict__ V,
+                  const float* __restrict__ O,
+                  const float* __restrict__ m_in, const float* __restrict__ l_in,
+                  float* __restrict__ dQ, float* __restrict__ dK, float* __restrict__ dV,
+                  int seq, int nh, int dh, float scale) {
+    const int h = (int)blockIdx.x;
+    const int tA = (int)blockIdx.y * (BT * 2);
+    const int tB = tA + BT;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int row0 = warp * 8;
+    if (tA >= seq || dh != DH) return;
+
+    float* smQ = smem;
+    float* smDO = smQ + 64 * QSTR;
+    float* smK = smDO + 64 * QSTR;
+    float* smV = smK + 64 * BC;
+    float* smP = smV + 64 * BC;
+    float* smDS = smP + 64 * BC;
+    float* smDK = smDS + 64 * BC;
+    float* smDV = smDK + 64 * BC;
+
+    float dqA0[8], dqA1[8], dqB0[8], dqB1[8];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        dqA0[r] = 0.f;
+        dqA1[r] = 0.f;
+        dqB0[r] = 0.f;
+        dqB1[r] = 0.f;
+    }
+
+    int last = tA + BT - 1;
+    if (tB < seq) last = tB + BT - 1;
+    if (last >= seq) last = seq - 1;
+    int k_end = last + 1;
+    int ntiles = (k_end + BC - 1) / BC;
+    int phase = ntiles > 0 ? ((int)blockIdx.y % ntiles) : 0;
+#pragma unroll 1
+    for (int step = 0; step < ntiles; ++step) {
+        int k0 = ((phase + step) % ntiles) * BC;
+        for (int e = tid; e < 64 * BC; e += 256) {
+            smDK[e] = 0.f;
+            smDV[e] = 0.f;
+        }
+        __syncthreads();
+        load_KT(K, smK, k0, h, nh, dh, tid, seq);
+        load_KT(V, smV, k0, h, nh, dh, tid, seq);
+        __syncthreads();
+        if (k0 < tA + BT) {
+            flash_bwd_one_tile(smQ, smDO, smK, smV, smP, smDS, smDK, smDV,
+                               dO, Q, O, m_in, l_in, tA, k0, h, seq, nh, dh, scale,
+                               tid, lane, row0, dqA0, dqA1);
+        }
+        if (tB < seq && k0 < tB + BT) {
+            flash_bwd_one_tile(smQ, smDO, smK, smV, smP, smDS, smDK, smDV,
+                               dO, Q, O, m_in, l_in, tB, k0, h, seq, nh, dh, scale,
+                               tid, lane, row0, dqB0, dqB1);
+        }
+#pragma unroll 1
+        for (int e = 0; e < 8; ++e) {
+            int idx = tid + e * 256;
+            int k = idx >> 6;
+            int d = idx & 63;
+            int tok = k0 + k;
+            if (tok < seq) {
+                atomicAdd(dK + qkv_at(tok, h, nh, dh) + d, scale * smDK[d * BC + k]);
+                atomicAdd(dV + qkv_at(tok, h, nh, dh) + d, smDV[d * BC + k]);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        int tr = tA + row0 + r;
+        if (tr < seq) {
+            float* rowp = dQ + qkv_at(tr, h, nh, dh);
+            rowp[lane] = scale * dqA0[r];
+            rowp[lane + 32] = scale * dqA1[r];
+        }
+        tr = tB + row0 + r;
+        if (tB < seq && tr < seq) {
+            float* rowp = dQ + qkv_at(tr, h, nh, dh);
+            rowp[lane] = scale * dqB0[r];
+            rowp[lane + 32] = scale * dqB1[r];
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

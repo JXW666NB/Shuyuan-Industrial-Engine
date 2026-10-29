@@ -935,12 +935,16 @@ class Tensor:
                 continue
             if getattr(node, "device", "cpu") != "cuda":
                 raise RuntimeError("CUDA 反传遇到 CPU 张量")
-            if node.grad is None:
-                node.grad = Tensor._from_gpu(rt.clone(g), requires_grad=False)
-            else:
-                if not isinstance(node.grad, Tensor) or getattr(node.grad, "device", "cpu") != "cuda":
-                    raise RuntimeError("CUDA 张量的 .grad 必须是 CUDA Tensor")
-                node.grad = Tensor._from_gpu(rt.add(node.grad._gpu, g), requires_grad=False)
+            # 只给叶子张量留 .grad，和 PyTorch 一样。中间激活的梯度以前每次都 clone
+            # 一份，seq=8192 上这 100 多次拷贝既占时间也把显存顶过 13 GiB。
+            # 叶子的 g 是父算子刚写出来的新缓冲，反向不再改它，可以直接挂上，不必再拷。
+            if node._backward is None:
+                if node.grad is None:
+                    node.grad = Tensor._from_gpu(g, requires_grad=False)
+                else:
+                    if not isinstance(node.grad, Tensor) or getattr(node.grad, "device", "cpu") != "cuda":
+                        raise RuntimeError("CUDA 张量的 .grad 必须是 CUDA Tensor")
+                    node.grad = Tensor._from_gpu(rt.add(node.grad._gpu, g), requires_grad=False)
             if node._backward is not None and _GRAD_ENABLED[0]:
                 node._backward(g, grads)
         rt.sync()
