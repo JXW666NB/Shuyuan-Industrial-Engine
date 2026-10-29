@@ -91,35 +91,45 @@ def encode(text, stoi):
 
 
 def build_examples(text, stoi, seq):
-    """按对话切分：序列 = [BOS] + "<用户>\\nQ\\n<TGAI><回答>\\n" + A + <eos>，只学回答部分。"""
-    rows = []
+    """构造与引擎 `build_prompt` 逐字符一致的训练序列。
+
+    引擎：`<用户>\n{q}<TGAI><回答>\n`（`<TGAI>` 前**不换行**）。
+
+    ★ 损失用**全位置**（只忽略第 0 位），不是只算回答：
+      字符级 10M 小模型如果只对回答计损，学不到上下文，实测会退化成复读
+      （"象象象象嗨嗨嗨嗨…"）。全位置损失才对得上之前验证过的结果。
+    """
+    pairs = []
     for chunk in text.split("<用户>")[1:]:
         body = "<用户>" + chunk
         if "<TGAI>" not in body:
             continue
         qpart, _, apart = body.partition("<TGAI>")
-        # ★ 必须与引擎 build_prompt 逐字符一致：`<用户>\n{q}<TGAI><回答>\n`（<TGAI> 前**不换行**）。
-        #   语料里 q 后面带一个 \n，必须 strip 掉，否则引擎拼出来的上下文比训练少一个换行，
-        #   模型会答非所问（实测：训练答案"嗨，终于有人问起我了…"变成"我是TGAI…"）。
-        prompt = "<用户>\n" + qpart.replace("<用户>", "", 1).strip() + "<TGAI><回答>\n"
-        answer = apart.replace("<回答>", "").strip()
-        if not answer:
-            continue
-        ids = [BOS] + encode(prompt, stoi) + encode(answer, stoi) + [stoi["<eos>"]]
-        if len(ids) > seq:
-            ids = ids[:seq]
-            ids[-1] = stoi["<eos>"]
-        rows.append(ids)
-    if not rows:
+        q = qpart.replace("<用户>", "", 1).strip()
+        a = apart.replace("<回答>", "").strip()
+        if q and a:
+            pairs.append((q, a))
+    if not pairs:
         return None, None
+
+    eos = stoi["<eos>"]
+    rows = []
+    for q, a in pairs:
+        sq = [BOS] + encode("<用户>\n%s<TGAI><回答>\n" % q, stoi) + encode(a, stoi) + [eos]
+        if len(sq) > seq:
+            sq = sq[:seq]
+            sq[-1] = eos
+        rows.append(sq)
     S = max(len(r) for r in rows)
-    ids = np.zeros((len(rows), S), np.int64)
-    tgt = np.full((len(rows), S), -100, np.int64)
+    X = np.zeros((len(rows), S), np.int64)
+    Y = np.full((len(rows), S), -100, np.int64)
     for r, sq in enumerate(rows):
-        ids[r, :len(sq)] = sq
-        tgt[r, :len(sq) - 1] = sq[1:]
-        tgt[r, len(sq) - 1] = stoi["<eos>"]
-    return ids, tgt
+        n = len(sq)
+        X[r, :n] = sq
+        Y[r, :n - 1] = sq[1:]
+        Y[r, n - 1] = eos
+        Y[r, 0] = -100          # 首个 BOS 位不计损失
+    return X, Y
 
 
 def rms(x, w, eps=1e-6):
