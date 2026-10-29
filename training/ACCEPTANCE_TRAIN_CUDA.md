@@ -915,3 +915,32 @@ forward/generate OK: '<a>ab<a><a>'
 （`token_embedding.weight` / `blocks.{i}.ln1|ln2` / `attn.q_proj|k_proj|v_proj|out_proj` /
 `moe.router|gate|_qb_bias` / `experts.{e}.w1|w2|w3` / `final_norm`），
 导出后用"同前缀贪心若干 token 一致"作为判据。
+
+---
+
+## A4-③ 进展：导出器已写、能加载，但生成阶段崩（未闭环）
+
+**已交付**
+- `python/tgai_go/train/export.py`：`save_tg(path, params, ...)`，把训练侧参数名映射到引擎命名
+  （`experts.{e}.gate/up/down` → `w1/w2/w3`），自动补 `moe.gate.weight` / `moe._qb_bias` / `attn.rope.cos,sin`，
+  词表与 merges 一起写进文件（用户不需要单独提供分词表）。
+- `training/harness/tg_export_roundtrip.py`：`--selftest`（字节确定性）与 `--check`（导出→加载→生成）。
+
+**实测**
+
+| 检查 | 结果 |
+|---|---|
+| 导出字节确定性（写两次 sha256 相同） | ✅ **一致**（50,940 → 补 buffer 后 55,140 字节） |
+| `tgai_go.load()` | ✅ **OK** |
+| `generate()` | ❌ **`OSError: access violation reading 0x1A00`** |
+
+**诊断（已缩小范围）**：把"能正常生成的合成文件（`build_dummy_tg`）"与"我们导出的文件"做权重表对比 ——
+两边都是 **16 个权重**，交集 13 个，**各有 3 个名字不匹配**（形状相同的候选）。
+说明导出器的**命名映射有 3 处与引擎期望不符**，引擎按名取权重失败后拿到空指针才崩。
+下一步：逐名打印两边 (哈希, 形状) 对齐这 3 个，再跑闭环。
+
+### 顺带修掉一个**用户会踩的真 bug**（在已发布的包路径里）
+`_session.py` 的 `generate()`：`_stop_trace` 在 `try` 内部赋值、却在 `finally` 里使用。
+一旦异常发生在赋值之前，`finally` 会抛 `UnboundLocalError` 并**掩盖真正的异常** ——
+实测把一个 `AttributeError` 盖成了"`_stop_trace` 未绑定"，白查一轮。
+已改为 `if locals().get('_stop_trace'):`，并把初始化提到函数早期。

@@ -220,6 +220,12 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
         _code_overrides = False
         _saved_params = {}
         _closing_tid = -1
+        # ★ 必须在 try 之前初始化：这两个变量在 finally 里被使用，
+        #   若 try 内部在赋值前抛异常，finally 会踩 UnboundLocalError 并**掩盖真实错误**
+        #   （实测：params 为 None 时真正的 AttributeError 被盖成了 _stop_trace 未绑定）。
+        _stop_reason = None
+        import os as _os0
+        _stop_trace = _os0.environ.get('TGAI_STOP_TRACE') == '1'
         try:
             _tk = engine.encode('`', add_bos=False)
             if _tk:
@@ -372,7 +378,10 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                 _stop_reason = 'max_seq reached'
                 break
     finally:
-        if _stop_trace:
+        # ★ 防御式判断：这个 finally 归属的 try 起点很早，若异常发生在 _stop_trace
+        #   赋值之前，直接引用会抛 UnboundLocalError 并**掩盖真正的异常**
+        #   （实测：一个 AttributeError 被盖成了 "_stop_trace 未绑定"）。
+        if locals().get('_stop_trace'):
             import sys as _sys2
             _hint = ''
             if _fence_open == 1:
