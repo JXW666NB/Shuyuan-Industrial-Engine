@@ -1094,3 +1094,25 @@ GPU DLL 的用户与 `tgai.py` 的 CPU 路径；产线 11450 用 GPU DLL，不�
 > 这一轮又抓到一类"源码树里正常、安装态才暴露"的问题：**`__version__` 与 pyproject 不一致**。
 > 加上之前的 `packages` 漏 `tgai_go.train`、`pipeline` 读仓库路径、`*.c` 被排除，
 > 同类问题本期共 4 例。
+
+---
+
+## B4 进展：V3 的**梯度 oracle** 已生成（反向判据的基础设施）
+
+B1 的判据要求"反向梯度 < 1e-3"。V3 目前只验了前向（5.02e-05），反向缺真值。
+
+**做法**：用官方实现 `model_v3.py` 跑同一小配置，给 logits 加权求和
+（上游权重固定随机种子 7），`backward()` 后导出全部参数梯度。
+
+| 产出 | 内容 |
+|---|---|
+| `training/oracle/v3_tiny_grads.npz` | **112** 个参数梯度（340,992 B） |
+| `training/oracle/v3_tiny_upstream.npy` | 上游权重 `(1,16,64)` |
+| loss | **4.653289**（固定可复现） |
+
+**一个有意思的细节**：`attn_res_proj.0` / `.1` **没有梯度** ——
+因为前两层 `blocks` 还是空的，AttnRes 直接返回输入、伪查询未被使用。
+官方实现也是这个行为，说明 oracle 是**忠实**的，不是漏导。
+
+**下一步**：在 `v3_ref.py` 里补反向（AttnRes 的 softmax 注意力、SiTU-GLU 的 tanh/sigmoid 导数、
+QK-Norm、RoPE、MoE 的 top-k 门控），与这 112 个梯度逐参数对拍，判据 < 1e-3。

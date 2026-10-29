@@ -80,4 +80,26 @@ with open(os.path.join(OUT, "cfg.json"), "w", encoding="utf-8") as f:
                         "theta": cfg.rope_theta, "eps": cfg.norm_eps}},
               f, ensure_ascii=False, indent=1)
 print("已写入", OUT)
+
+
+# ── 梯度 oracle（B4 反向判据用）──────────────────────────────
+# 用固定的随机"上游权重"给 logits 加权求和，backward 后把所有参数梯度存下来。
+# 这样梯度是确定的，我们的实现可以逐参数对拍。
+g2 = np.random.RandomState(7)
+upstream = torch.tensor(g2.randn(*logits.shape).astype(np.float32))
+model.zero_grad(set_to_none=True)
+with torch.enable_grad():
+    out2 = model(t)
+    lg2 = out2[0] if isinstance(out2, (tuple, list)) else out2
+    loss = (lg2.float() * upstream).sum()
+    loss.backward()
+grads = {}
+for name, prm in model.named_parameters():
+    if prm.grad is not None:
+        grads[name] = prm.grad.detach().float().numpy()
+np.savez(os.path.join(OUT, "grads.npz"), **grads)
+np.save(os.path.join(OUT, "upstream.npy"), upstream.numpy())
+print("梯度张量数 %d，loss=%.6f" % (len(grads), float(loss)))
+print("示例键:", sorted(grads.keys())[:4])
+
 print("权重键示例:", sorted(w.keys())[:6])
