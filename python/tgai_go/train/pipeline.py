@@ -153,20 +153,55 @@ def _logits_np(model, ids):
     return np.array(np.asarray(out.to_numpy(), dtype=np.float32), copy=True)
 
 
+SUPPORTED_ARCHS = ("llama", "qwen2", "gpt2")
+
+
 def _check_arch(arch, d_model, n_layers, n_heads, n_kv, seq, steps):
-    if arch != "llama":
-        raise NotImplementedError("本轮流水线只支持 arch='llama'，收到 %r" % (arch,))
-    if int(steps) < 1:
-        raise ValueError("steps 必须 >= 1，收到 %r" % (steps,))
-    if int(seq) < 1 or int(n_layers) < 1 or int(n_heads) < 1 or int(n_kv) < 1:
-        raise ValueError("seq / n_layers / n_heads / n_kv 必须是正整数")
-    if int(d_model) % int(n_heads) != 0:
-        raise ValueError("d_model=%s 不能被 n_heads=%s 整除" % (d_model, n_heads))
-    if int(n_heads) % int(n_kv) != 0:
-        raise ValueError("n_heads=%s 不能被 n_kv=%s 整除" % (n_heads, n_kv))
-    head_dim = int(d_model) // int(n_heads)
-    if head_dim % 2 != 0:
-        raise ValueError("RoPE 需要偶数 head dim，当前 %d" % head_dim)
+    """只做校验，不再限制成 llama。三套预设共用同一份「读语料→自训 BPE→训练」的流程。"""
+    if arch not in SUPPORTED_ARCHS:
+        raise NotImplementedError("流水线支持的架构: %s（收到 %r）"
+                                  % (", ".join(SUPPORTED_ARCHS), arch))
+    if d_model % n_heads != 0:
+        raise ValueError("d_model(%d) 必须能被 n_heads(%d) 整除" % (d_model, n_heads))
+    if n_kv <= 0 or n_heads % n_kv != 0:
+        raise ValueError("n_heads(%d) 必须是 n_kv(%d) 的整数倍" % (n_heads, n_kv))
+
+
+def _model_mod(arch):
+    """按架构取"薄定义"模块：优先包内 `tgai_go.train.models`，回落到 training/harness。"""
+    names = {"llama": "llama_ref", "qwen2": "qwen2_ref", "gpt2": "gpt2_ref"}
+    mod_name = names[arch]
+    try:
+        from . import models
+        mod = getattr(models, mod_name)
+        if mod is not None:
+            return mod
+    except Exception:
+        pass
+    import importlib
+    return importlib.import_module(mod_name)
+
+
+def _build(arch, V, d_model, n_layers, n_heads, n_kv, d_ff, seq, seed=0, weights=None):
+    """建模型；返回 (model, cfg)。gpt2 用 untied 头，其余用 llama 系。"""
+    mod = _model_mod(arch)
+    if arch == "gpt2":
+        cfg = mod.make_cfg(d=d_model, L=n_layers, nh=n_heads, ff=d_ff, V=V,
+                           seq=seq, tie=True, seed=seed)
+        if weights is not None:
+            cfg["weights"] = weights
+        return mod.GPT2(cfg, cfg["weights"]), cfg
+    kw = dict(d=d_model, L=n_layers, nh=n_heads, n_kv=n_kv, ff=d_ff, V=V, seq=seq, seed=seed)
+    if arch == "qwen2":
+        # qwen2_ref.make_cfg 内部已经把 qkv_bias 打开，这里不要再传
+        cfg = mod.make_cfg(**kw)
+        if weights is not None:
+            cfg["weights"] = weights
+        return mod.build(cfg), cfg
+    cfg = mod.make_cfg(**kw)
+    if weights is not None:
+        cfg["weights"] = weights
+    return mod.Llama(cfg, cfg["weights"]), cfg
 
 
 def run(corpus_dir, out_dir, arch="llama", vocab_size=512, seq=128, steps=200,
@@ -204,12 +239,7 @@ def run(corpus_dir, out_dir, arch="llama", vocab_size=512, seq=128, steps=200,
     if int(x.max()) >= len(vocab) or int(y.max()) >= len(vocab):
         raise RuntimeError("编码出了词表以外的 id")
 
-    llama_ref = _llama_ref()
-    cfg = llama_ref.make_cfg(
-        d=int(d_model), L=int(n_layers), nh=int(n_heads), n_kv=int(n_kv),
-        ff=int(d_ff), V=len(vocab), seq=seq, seed=seed,
-    )
-    model = llama_ref.Llama(cfg, cfg["weights"])
+    model, cfg = _build(arch, len(vocab), d_model, n_layers, n_heads, n_kv, d_ff, seq, seed)
     opt = T.optim.AdamW(model.parameters(), lr=float(lr))
 
     first_loss = None
@@ -255,7 +285,9 @@ def run(corpus_dir, out_dir, arch="llama", vocab_size=512, seq=128, steps=200,
             loaded[name] = np.ascontiguousarray(blob[name], dtype=np.float32).copy()
             if not np.array_equal(saved[name], loaded[name]):
                 raise RuntimeError("ckpt.npz 往返后权重变了: %s" % name)
-    reloaded = llama_ref.Llama(cfg, loaded)
+    # ★ 必须把权重直接传进构造函数：这些"薄定义"模型不是 Module，没有 load_state_dict
+    reloaded, _ = _build(arch, len(vocab), d_model, n_layers, n_heads, n_kv, d_ff, seq,
+                         seed, weights=loaded)
     logits_after = _logits_np(reloaded, probe)
     reload_bitwise = bool(np.array_equal(logits_before, logits_after))
 

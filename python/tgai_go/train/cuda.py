@@ -1299,9 +1299,41 @@ extern "C" __global__ void moe_pad_rows(const float* src, float* dst, int rows, 
 """
 
 
+# cat：沿任意轴把若干块连续 float32 抄进同一块连续缓冲，反向再按槽切回来。
+# 下标用 long long，避免 outer×span×inner 的中间乘积在 int32 里回绕。
+# 纯赋值，不经过 fma，和 CPU 的 np.concatenate / np.split 逐位相同。
+_CAT_KERNELS = r"""
+extern "C" __global__ void cat_place(
+    const float* src, float* dst, int n,
+    int src_axis, int dst_axis, int inner, int dst_off) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n || inner <= 0 || src_axis <= 0) return;
+    int inner_i = i % inner;
+    int t = i / inner;
+    int s_i = t % src_axis;
+    int o = t / src_axis;
+    long long di = (((long long)o * dst_axis + (long long)dst_off + s_i) * inner) + inner_i;
+    dst[di] = src[i];
+}
+
+extern "C" __global__ void cat_extract(
+    const float* src, float* dst, int n,
+    int src_axis, int dst_axis, int inner, int src_off) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n || inner <= 0 || dst_axis <= 0) return;
+    int inner_i = i % inner;
+    int t = i / inner;
+    int d_i = t % dst_axis;
+    int o = t / dst_axis;
+    long long si = (((long long)o * src_axis + (long long)src_off + d_i) * inner) + inner_i;
+    dst[i] = src[si];
+}
+"""
+
+
 def _device_source():
     return (_CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS + "\n"
-            + _M5_KERNELS + "\n" + _MOE_KERNELS)
+            + _M5_KERNELS + "\n" + _MOE_KERNELS + "\n" + _CAT_KERNELS)
 
 
 class CudaError(RuntimeError):
@@ -2707,6 +2739,91 @@ class CudaRuntime:
         self.launch("index_scatter_add8", grid, block, self._index_launch_args(
             grad, full, n, base, out_shape, divs, strides))
         return full
+
+    def _cat_geom(self, shape, axis):
+        """行主序连续缓冲沿 axis 拆成 outer × span × inner。"""
+        shape = tuple(int(s) for s in shape)
+        axis = int(axis)
+        if not shape or axis < 0 or axis >= len(shape):
+            raise CudaError("cat 轴 %d 越界（shape=%s）" % (axis, shape))
+        outer = 1
+        for s in shape[:axis]:
+            if s < 0:
+                raise CudaError("cat 形状非法 %s" % (shape,))
+            outer *= s
+        inner = 1
+        for s in shape[axis + 1:]:
+            if s < 0:
+                raise CudaError("cat 形状非法 %s" % (shape,))
+            inner *= s
+        span = int(shape[axis])
+        if span < 0:
+            raise CudaError("cat 形状非法 %s" % (shape,))
+        n = outer * span * inner
+        if (n > 2147483647 or outer > 2147483647 or inner > 2147483647
+                or span > 2147483647):
+            raise CudaError("cat 元素个数超过 int32（shape=%s）" % (shape,))
+        return int(outer), int(span), int(inner), int(n)
+
+    def cat_place(self, src, dst, axis, dst_off):
+        """把连续 src 抄进 dst 沿 axis 的槽 [dst_off, dst_off+src_span)。纯拷贝。"""
+        if src.dtype != np.float32 or dst.dtype != np.float32:
+            raise CudaError("cat_place 只支持 float32")
+        _s_outer, s_span, s_inner, s_n = self._cat_geom(src.shape, axis)
+        _d_outer, d_span, d_inner, d_n = self._cat_geom(dst.shape, axis)
+        if _s_outer != _d_outer or s_inner != d_inner:
+            raise CudaError(
+                "cat_place 形状对不上: %s -> %s axis=%d" % (src.shape, dst.shape, axis))
+        if int(src.n) != s_n or int(dst.n) != d_n:
+            raise CudaError("cat_place 缓冲不是按形状打包的连续块")
+        off = int(dst_off)
+        if off < 0 or s_span < 0 or off + s_span > d_span:
+            raise CudaError(
+                "cat_place 槽越界 off=%d len=%d dst=%d" % (off, s_span, d_span))
+        if s_n == 0:
+            return
+        grid, block = self._ewise_grid(s_n)
+        self.launch("cat_place", grid, block, [
+            self._ptr(src), self._ptr(dst),
+            (s_n, ctypes.c_int),
+            (s_span, ctypes.c_int),
+            (d_span, ctypes.c_int),
+            (s_inner, ctypes.c_int),
+            (off, ctypes.c_int),
+        ])
+
+    def cat_extract(self, src, axis, src_off, span, dst_shape):
+        """从连续 src 沿 axis 切出 [src_off, src_off+span)，写成一块新的连续缓冲。"""
+        dst_shape = tuple(int(s) for s in dst_shape)
+        if src.dtype != np.float32:
+            raise CudaError("cat_extract 只支持 float32")
+        _s_outer, s_span, s_inner, s_n = self._cat_geom(src.shape, axis)
+        _d_outer, d_span, d_inner, d_n = self._cat_geom(dst_shape, axis)
+        if d_span != int(span):
+            raise CudaError(
+                "cat_extract 长度 %d 与目标形状 %s 不符" % (int(span), dst_shape))
+        if _s_outer != _d_outer or s_inner != d_inner:
+            raise CudaError(
+                "cat_extract 形状对不上: %s -> %s axis=%d" % (src.shape, dst_shape, axis))
+        if int(src.n) != s_n:
+            raise CudaError("cat_extract 源缓冲不是按形状打包的连续块")
+        off = int(src_off)
+        if off < 0 or d_span < 0 or off + d_span > s_span:
+            raise CudaError(
+                "cat_extract 槽越界 off=%d len=%d src=%d" % (off, d_span, s_span))
+        out = self.empty(dst_shape, dtype=np.float32)
+        if d_n == 0:
+            return out
+        grid, block = self._ewise_grid(d_n)
+        self.launch("cat_extract", grid, block, [
+            self._ptr(src), self._ptr(out),
+            (d_n, ctypes.c_int),
+            (s_span, ctypes.c_int),
+            (d_span, ctypes.c_int),
+            (d_inner, ctypes.c_int),
+            (off, ctypes.c_int),
+        ])
+        return out
 
     def _broadcast_lead(self, sa, sb):
         sa = tuple(int(s) for s in sa)

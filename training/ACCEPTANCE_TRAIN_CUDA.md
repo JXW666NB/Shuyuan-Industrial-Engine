@@ -1215,3 +1215,49 @@ csa_compress=1(关 CSA) csa_latent=128 attn_res_block=4 θ=5e5`
 - `gpt2_ref.forward` 原来"先取 `lm_head` 再按 tie 覆盖"，加载真实权重时 KeyError；
   改成**先按 tie 选头再取权重**；
 - `gpt2_parity.run_torch` 无条件注册 `lm_head`，tie 时同样 KeyError；改成 tie 时不注册。
+
+---
+
+## ★ 过拟合对照测试：TGAI(CUDA) vs PyTorch —— **400 步逐 step 最大相对差 5.684e-05**
+
+这是"TGAI GO 能否替代 PyTorch"的核心判据：**同一份训练循环**（`overfit_parity.py::train_once`）
+分别用 `tgai_go.train`(CUDA) 与真 `torch` 跑，权重用 numpy 固定种子初始化后**灌进两边**
+（必须逐位相同，否则比较无意义）。
+
+| 项 | TGAI CUDA | PyTorch |
+|---|---|---|
+| loss 首 → 末 | 4.161366 → **0.008179** | 4.161367 → 0.008179 |
+| 过拟合（<0.05） | ✅ | ✅ |
+| **400 步逐 step 最大相对差** | **5.684e-05** | — |
+
+短程 20 步时该差值是 **2.322e-07**（fp32 舍入量级）。
+
+### 本轮修掉的两个**迁移障碍**（都是真实缺陷）
+
+1. **`nn.Linear` 默认 `bias=False`** —— PyTorch 是 `True`。PyT 程序改导入后参数量会不一致。
+   已改为 `bias=True`。
+2. **CUDA 下给参数赋初值不能用 `p.data = ...`**（CUDA 参数 `data` 为 None，值在 `_gpu`），
+   必须用 `load_state_dict()`。我第一版就栽在这：以为"数学不对"，实际是**初始化根本没生效**
+   （表现为 loss 起点差 0.08%，还被我误判成"混沌放大"）。
+   已在示例里改正，并在 `overfit_parity.py` 里加了**初始化自检断言**。
+
+### 示例（用户视角：改导入 / 几行代码）
+
+| 示例 | 有效代码 | 实测 |
+|---|---|---|
+| `examples/torch_style_overfit.py` —— PyTorch 风格训练循环，只改导入 | 46 行 | CUDA 上 loss **4.8449 → 0.004463**（降 99.9%），过拟合 PASS |
+| `examples/train_preset.py` —— 预设架构训练 | **15 行** | 见下表 |
+
+三套预设各训 40 步（同一份流水线，只换 `arch=`）：
+
+| arch | 自训词表 | loss | 重载逐位一致 |
+|---|---|---|---|
+| llama | 132 | 5.1666 → **0.0500** | ✅ |
+| qwen2 | 132 | 4.9137 → **0.0502** | ✅ |
+| gpt2 | 132 | 4.8231 → **0.0443** | ✅ |
+
+### 顺带修掉的流水线缺陷
+- 原来只允许 `arch='llama'`；现在支持 llama/qwen2/gpt2；
+- 原来重载时用 `hasattr(load_state_dict)` 判断，而这些"薄定义"模型不是 Module ⇒ **静默跳过加载**、
+  重载校验假通过。改成把权重直接传进构造函数。
+- 模型定义搬进包内 `tgai_go/train/models/`（原来依赖仓库 `training/harness`，pip 安装后必崩）。

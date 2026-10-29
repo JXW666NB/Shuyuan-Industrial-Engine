@@ -1754,12 +1754,88 @@ def from_numpy(ndarray):
     raise TypeError("from_numpy 暂不支持 dtype=%s" % ndarray.dtype)
 
 
+def _cat_check(ts, dim):
+    """拼接轴，以及每个输入的形状。除拼接轴外必须一致。"""
+    nd = int(ts[0].ndim)
+    shapes = []
+    for i, t in enumerate(ts):
+        if int(t.ndim) != nd:
+            raise ValueError(
+                "cat 各张量维度数必须相同，张量 0 是 %d 维 %s，张量 %d 是 %d 维 %s"
+                % (nd, tuple(int(s) for s in ts[0].shape),
+                   i, int(t.ndim), tuple(int(s) for s in t.shape)))
+        shapes.append(tuple(int(s) for s in t.shape))
+    if nd == 0:
+        raise ValueError("cat 不支持 0 维张量（形状 %s）" % (shapes[0],))
+    axis = int(dim)
+    if axis < 0:
+        axis += nd
+    if axis < 0 or axis >= nd:
+        raise ValueError("cat 轴 %s 越界（ndim=%d）" % (dim, nd))
+    ref = shapes[0]
+    for i, sh in enumerate(shapes[1:], 1):
+        for d, (a, b) in enumerate(zip(ref, sh)):
+            if d != axis and a != b:
+                raise ValueError(
+                    "cat 除拼接轴 %d 外形状必须一致：张量 0 %s，张量 %d %s"
+                    % (axis, ref, i, sh))
+    return axis, shapes
+
+
+def _cat_cuda(ts, dim):
+    """沿任意轴拼接。前向按槽拷贝，反向把上游梯度按同样的槽切回去。"""
+    axis, shapes = _cat_check(ts, dim)
+    rt = _cuda()
+    sizes = [int(sh[axis]) for sh in shapes]
+    out_shape = list(shapes[0])
+    total = 0
+    for sz in sizes:
+        total += int(sz)
+    out_shape[axis] = int(total)
+    out_shape = tuple(out_shape)
+    srcs = []
+    for t, sh in zip(ts, shapes):
+        src = t._cuda_logical_storage()
+        got = tuple(int(s) for s in src.shape)
+        if got != sh:
+            raise RuntimeError("cat 设备布局 %s 与逻辑形状 %s 不一致" % (got, sh))
+        if src.dtype != np.float32:
+            raise TypeError("CUDA cat 目前只支持 float32，收到 %s" % (src.dtype,))
+        srcs.append(src)
+    dst = rt.empty(out_shape, dtype=np.float32)
+    # 逻辑存储若是临时转置，必须活过默认流上的拷贝核。
+    dst.keepalive = tuple(srcs)
+    off = 0
+    for src, sz in zip(srcs, sizes):
+        if sz:
+            rt.cat_place(src, dst, axis, off)
+        off += int(sz)
+    rg = any(t.requires_grad for t in ts)
+    out = Tensor._from_gpu(dst, requires_grad=rg, _parents=tuple(ts))
+    saved_sizes = tuple(int(s) for s in sizes)
+    saved_shapes = tuple(shapes)
+
+    def bw(g, grads, _ts=ts, _sizes=saved_sizes, _axis=axis, _shapes=saved_shapes):
+        off_b = 0
+        for t, sz, sh in zip(_ts, _sizes, _shapes):
+            if t.requires_grad:
+                part = rt.cat_extract(g, _axis, off_b, sz, sh)
+                _acc(grads, t, part)
+            off_b += int(sz)
+    out._backward = bw
+    return out
+
+
 def cat(tensors, dim=0):
     ts = [_as_tensor(t) for t in tensors]
     if not ts:
         raise ValueError("cat 至少需要一个张量")
     if any(getattr(t, "device", "cpu") == "cuda" for t in ts):
-        raise NotImplementedError("CUDA cat 尚未实现")
+        if any(getattr(t, "device", "cpu") != "cuda" for t in ts):
+            raise RuntimeError(
+                "cat 不能混用 CPU 和 CUDA 张量，收到 %s"
+                % ", ".join(str(getattr(t, "device", "cpu")) for t in ts))
+        return _cat_cuda(ts, dim)
     axis = int(dim)
     if axis < 0:
         axis += ts[0].ndim
@@ -2515,7 +2591,9 @@ class Module:
 
 
 class Linear(Module):
-    def __init__(self, in_features, out_features, bias=False):
+    # 默认 bias=True，与 torch.nn.Linear 对齐（迁移兼容性）。
+    # 之前默认 False：PyTorch 程序改导入后参数量会不一致，是迁移的障碍。
+    def __init__(self, in_features, out_features, bias=True):
         super().__init__()
         k = 1.0 / np.sqrt(in_features)
         self.weight = Parameter(np.random.randn(out_features, in_features).astype(np.float32) * k)
