@@ -484,7 +484,8 @@ def _unbroadcast(grad, shape):
 class Tensor:
     """最小可用的张量：数据 + 梯度 + 反向闭包。"""
 
-    __slots__ = ("data", "grad", "requires_grad", "_parents", "_backward", "device", "_gpu")
+    __slots__ = ("data", "grad", "requires_grad", "_parents", "_backward", "device", "_gpu",
+                 "_lazy_T", "_lazy_shape")
     __array_priority__ = 1000        # 让 ndarray <op> Tensor 走我们的 __r*__
 
     def __init__(self, data, requires_grad=False, _parents=(), _backward=None, device=None, dtype=None):
@@ -497,6 +498,8 @@ class Tensor:
         self.requires_grad = bool(requires_grad)
         self._parents = _parents
         self._backward = _backward
+        self._lazy_T = None
+        self._lazy_shape = None
         if dev == "cpu":
             # 整数/布尔只当显式 dtype 给出时才保留。默认路径与原来一样，强制 float32。
             if dtype is not None and not _is_float_dtype(dtype):
@@ -522,6 +525,8 @@ class Tensor:
         obj.requires_grad = bool(requires_grad)
         obj._parents = _parents
         obj._backward = _backward
+        obj._lazy_T = None
+        obj._lazy_shape = None
         return obj
 
     def _cpu_only(self, op):
@@ -531,6 +536,9 @@ class Tensor:
     # ---- 属性 ----
     @property
     def shape(self):
+        lazy = getattr(self, "_lazy_shape", None)
+        if lazy is not None:
+            return lazy
         if self.device == "cuda":
             return self._gpu.shape
         return self.data.shape
@@ -782,6 +790,35 @@ class Tensor:
                     _acc(grads, other, rt.bmm(rt.swap_last2(a), g))
             out._backward = bw
             return out
+        src = getattr(other, "_lazy_T", None)
+        if src is not None and self.ndim == 2 and getattr(src, "ndim", 0) == 2:
+            M, K = int(self.shape[0]), int(self.shape[1])
+            N, K2 = int(src.shape[0]), int(src.shape[1])
+            if K != K2:
+                raise ValueError("matmul K 不匹配: %s @ %s^T" % (self.shape, src.shape))
+            if not rt._numpy_exact_gemm(M, N, K):
+                buf = rt.gemm_nt(self._gpu, src._gpu)
+                rg = self.requires_grad or src.requires_grad
+                out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, src) if rg else ())
+                a, w = self._gpu, src._gpu
+
+                def bw(g, grads, _a=a, _w=w, _self=self, _src=src):
+                    # dA = g @ W，dW = g^T @ A。不再经过物化的 W^T。
+                    if _self.requires_grad:
+                        _acc(grads, _self, rt.sgemm(g, _w))
+                    if _src.requires_grad:
+                        _acc(grads, _src, rt.gemm_tn(g, _a))
+                out._backward = bw
+                return out
+            buf_t = rt.transpose2d(src._gpu)
+            other = Tensor._from_gpu(
+                buf_t, requires_grad=src.requires_grad,
+                _parents=(src,) if src.requires_grad else ())
+
+            def bw_t(g, grads, _src=src):
+                if _src.requires_grad:
+                    _acc(grads, _src, rt.transpose2d(g))
+            other._backward = bw_t
         if self.ndim != 2 or other.ndim != 2:
             if self.ndim >= 2 and other.ndim >= 2:
                 return self._matmul_cuda_nd(other)
@@ -801,9 +838,33 @@ class Tensor:
         out._backward = bw
         return out
 
+    def _materialize_lazy_T(self):
+        """把惰性转置还原成一个真实节点（带标准 transpose 反向）。
+
+        `.T` 默认是惰性的（只为 2D matmul 省一次拷贝）。N 维 matmul 读的是原始缓冲区，
+        不认识惰性状态，所以这条路径必须先实体化 —— 否则形状对不上
+        （实测症状：`linear_nd` 报 matmul K 不匹配 (2,3,16) @ (8,16)）。
+        """
+        rt = _cuda()
+        base = self._lazy_T
+        buf = rt.transpose2d(base._gpu)
+        out = Tensor._from_gpu(buf, requires_grad=base.requires_grad, _parents=(base,))
+
+        def bw(g, grads):
+            if base.requires_grad:
+                _acc(grads, base, rt.transpose2d(g))
+
+        out._backward = bw
+        return out
+
     def _matmul_cuda_nd(self, other):
         """最后两维 matmul，前导维广播。反向先乘再 unbroadcast 回原形状。"""
         rt = _cuda()
+        # 惰性转置在这条路径上必须先落地（原缓冲区形状是转置前的）
+        if getattr(self, "_lazy_T", None) is not None:
+            self = self._materialize_lazy_T()
+        if getattr(other, "_lazy_T", None) is not None:
+            other = other._materialize_lazy_T()
         buf = rt.matmul_general(self._gpu, other._gpu)
         rg = self.requires_grad or other.requires_grad
         out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
@@ -828,9 +889,12 @@ class Tensor:
     def _transpose_cuda(self):
         if self.ndim != 2:
             raise NotImplementedError("CUDA transpose 目前只支持 2D，收到 %dD" % self.ndim)
+        # 不物化。matmul 看见 _lazy_T 就走 gemm_nt，省掉词表那么大的转置。
+        # 真要读数值时 to_numpy 再转。小矩阵的精确 GEMM 会在 matmul 里物化。
         rt = _cuda()
-        buf = rt.transpose2d(self._gpu)
-        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+        out = Tensor._from_gpu(self._gpu, requires_grad=self.requires_grad, _parents=(self,))
+        out._lazy_T = self
+        out._lazy_shape = (int(self.shape[1]), int(self.shape[0]))
 
         def bw(g, grads):
             if self.requires_grad:
@@ -1180,6 +1244,9 @@ class Tensor:
 
     def to_numpy(self):
         if self.device == "cuda":
+            src = getattr(self, "_lazy_T", None)
+            if src is not None:
+                return _cuda().d2h(_cuda().transpose2d(src._gpu))
             return _cuda().d2h(self._gpu)
         return self.data
 
@@ -2461,6 +2528,102 @@ class _ExpertList(Module):
             yield self[i]
 
 
+def _moe_grouped_cuda(x, w, tok_buf, slot_buf, off, experts, n, d, k):
+    """8 个专家的 GEMM 合成一次 cublasSgemmGroupedBatched。
+
+    token 数不必相同，也不 pad：每组 group_size=1。小形状（自检）返回 None，
+    仍走逐专家的原路径，保证和 CPU 的逐位/1e-5 判据不变。
+    反向里 pad 不存在；没选中的专家不写梯度。
+    """
+    counts = [int(off[e + 1]) - int(off[e]) for e in range(len(experts))]
+    active = [e for e, c in enumerate(counts) if c > 0]
+    if not active or _builtin_max(counts) <= 64:
+        return None
+    rt = _cuda()
+    rows = [rt.moe_gather_rows(x._gpu, tok_buf, int(off[e]), counts[e], d) for e in active]
+    wg = [experts[e].gate.weight._gpu for e in active]
+    wu = [experts[e].up.weight._gpu for e in active]
+    wd = [experts[e].down.weight._gpu for e in active]
+    gate = rt.grouped_nt(rows, wg)
+    up = rt.grouped_nt(rows, wu)
+    silu = []
+    for g in gate:
+        s = rt.clone(g)
+        ones = rt.full(g.shape, 1.0)
+        rt.silu_mul_fwd(s, ones)
+        s.keepalive = ones
+        silu.append(s)
+    hidden = [rt.mul(s, u) for s, u in zip(silu, up)]
+    y_rows = rt.grouped_nt(hidden, wd)
+    wws = []
+    out_buf = rt.zeros((n, d), dtype=np.float32)
+    for e, y in zip(active, y_rows):
+        ww = rt.moe_gather_slots(w._gpu, tok_buf, slot_buf, int(off[e]), counts[e], k)
+        wws.append(ww)
+        scaled = rt.moe_row_scale(y, ww)
+        rt.moe_scatter_rows_add(scaled, tok_buf, int(off[e]), counts[e], out_buf)
+    parents = [x, w]
+    for e in active:
+        parents.append(experts[e].gate.weight)
+        parents.append(experts[e].up.weight)
+        parents.append(experts[e].down.weight)
+    need = any(getattr(p, "requires_grad", False) for p in parents)
+    out = Tensor._from_gpu(out_buf, requires_grad=need, _parents=tuple(parents) if need else ())
+    if not need:
+        return out
+    saved = (rows, gate, up, silu, hidden, y_rows, wws)
+
+    def bw(g, grads, _saved=saved, _active=tuple(active), _counts=tuple(counts)):
+        rows_s, gate_s, up_s, silu_s, hidden_s, y_s, ww_s = _saved
+        d_scaled = [rt.moe_gather_rows(g, tok_buf, int(off[e]), _counts[e], d) for e in _active]
+        d_y = [rt.moe_row_scale(ds, ww) for ds, ww in zip(d_scaled, ww_s)]
+        d_ww = [rt.moe_row_dot(ds, y) for ds, y in zip(d_scaled, y_s)]
+        d_hidden = rt.grouped_nn(d_y, wd)
+        d_wd = rt.grouped_tn(d_y, hidden_s)
+        d_s = [rt.mul(dh, u) for dh, u in zip(d_hidden, up_s)]
+        d_up = [rt.mul(dh, s) for dh, s in zip(d_hidden, silu_s)]
+        d_gate = []
+        for ds, gpre in zip(d_s, gate_s):
+            ones = rt.full(gpre.shape, 1.0)
+            da, _db = rt.silu_mul_bwd(ds, gpre, ones)
+            da.keepalive = ones
+            d_gate.append(da)
+        d_wg = rt.grouped_tn(d_gate, rows_s)
+        d_wu = rt.grouped_tn(d_up, rows_s)
+        d_rows_g = rt.grouped_nn(d_gate, wg)
+        d_rows_u = rt.grouped_nn(d_up, wu)
+        hold = (d_scaled, d_y, d_hidden, d_s, d_up, d_gate, d_rows_g, d_rows_u)
+        if x.requires_grad:
+            dx = rt.zeros((n, d), dtype=np.float32)
+            for e, a, b in zip(_active, d_rows_g, d_rows_u):
+                both = rt.add(a, b)
+                rt.moe_scatter_rows_add(both, tok_buf, int(off[e]), _counts[e], dx)
+            dx.keepalive = hold
+            _acc(grads, x, dx)
+        elif d_wg:
+            d_wg[0].keepalive = hold
+        for e, dw in zip(_active, d_wg):
+            if experts[e].gate.weight.requires_grad:
+                _acc(grads, experts[e].gate.weight, dw)
+        for e, dw in zip(_active, d_wu):
+            if experts[e].up.weight.requires_grad:
+                _acc(grads, experts[e].up.weight, dw)
+        for e, dw in zip(_active, d_wd):
+            if experts[e].down.weight.requires_grad:
+                _acc(grads, experts[e].down.weight, dw)
+        if w.requires_grad:
+            acc_w = None
+            for e, dw in zip(_active, d_ww):
+                part = rt.moe_scatter_slots(dw, tok_buf, slot_buf, int(off[e]), _counts[e], n, k)
+                acc_w = part if acc_w is None else rt.add(acc_w, part)
+            if acc_w is not None:
+                _acc(grads, w, acc_w)
+
+    out._backward = bw
+    out_buf.keepalive = saved
+    return out
+
+
 class MoE(Module):
     """带两种门控的 MoE。专家按 token 分组，空专家不参与 GEMM。
 
@@ -2580,6 +2743,10 @@ class MoE(Module):
         off_buf, tok_buf, slot_buf = rt.moe_compact(idx_buf, n, n_exp, k)
         # 只有 E+1 个计数回到主机，用来跳过空专家。激活留在设备上。
         off = np.asarray(rt.d2h(off_buf), dtype=np.int32).reshape(-1)
+        grouped = _moe_grouped_cuda(
+            x, w, tok_buf, slot_buf, off, self.experts, n, d, k)
+        if grouped is not None:
+            return grouped
         acc = None
         for e, expert in enumerate(self.experts):
             begin = int(off[e])

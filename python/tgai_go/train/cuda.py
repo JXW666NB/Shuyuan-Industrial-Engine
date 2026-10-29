@@ -118,25 +118,122 @@ extern "C" __global__ void ce_fwd_mean(const float* terms, float* loss, int N) {
     loss[0] = __fdiv_rn(acc, static_cast<float>(N));
 }
 
+/* V<=256 仍走上面的按线程连续段，和单线程左折叠逐位相同。
+ * V>256（训练词表 32779）改成对齐后的 float4 合并访问：旧的按 tid*chunk
+ * 扫列，相邻线程隔 129 个 float，带宽只有 ~140GB/s。这里一趟归约 max、
+ * 一趟归约 sum(exp)，再一趟写出 (exp-onehot)/N。exp32 / __fadd_rn 不换。
+ */
+__device__ int ce_align_prefix(const float* row, int V) {
+    unsigned long long a = (unsigned long long)row;
+    int mis = (int)((a >> 2) & 3ull);
+    if (mis == 0) return 0;
+    int pre = 4 - mis;
+    return pre > V ? V : pre;
+}
+
+__device__ float ce_row_max_vec(const float* row, int V, float* sm) {
+    const int tid = (int)threadIdx.x;
+    const int pre = ce_align_prefix(row, V);
+    float m = __int_as_float(0xff800000u);
+    for (int j = tid; j < pre; j += 256) m = fmaxf(m, row[j]);
+    const int vend = pre + ((V - pre) & ~3);
+    const int n4 = (vend - pre) >> 2;
+    const float4* p = (const float4*)(row + pre);
+    for (int j4 = tid; j4 < n4; j4 += 256) {
+        float4 v = p[j4];
+        m = fmaxf(m, fmaxf(fmaxf(v.x, v.y), fmaxf(v.z, v.w)));
+    }
+    for (int j = vend + tid; j < V; j += 256) m = fmaxf(m, row[j]);
+    return ce_red_max(m, sm);
+}
+
+__device__ float ce_row_sumexp_vec(const float* row, int V, float m, float* sm) {
+    const int tid = (int)threadIdx.x;
+    const int pre = ce_align_prefix(row, V);
+    float s = 0.0f;
+    for (int j = tid; j < pre; j += 256)
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(row[j], m)));
+    const int vend = pre + ((V - pre) & ~3);
+    const int n4 = (vend - pre) >> 2;
+    const float4* p = (const float4*)(row + pre);
+    for (int j4 = tid; j4 < n4; j4 += 256) {
+        float4 v = p[j4];
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(v.x, m)));
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(v.y, m)));
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(v.z, m)));
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(v.w, m)));
+    }
+    for (int j = vend + tid; j < V; j += 256)
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(row[j], m)));
+    return ce_red_sum(s, sm);
+}
+
+__device__ void ce_row_write_vec(const float* row, float* grow, int V, float m,
+                                 float inv_sum, float inv_n, int target) {
+    const int tid = (int)threadIdx.x;
+    const int pre = ce_align_prefix(row, V);
+    for (int j = tid; j < pre; j += 256) {
+        float p = __fmul_rn(exp32_bits(__fsub_rn(row[j], m)), inv_sum);
+        if (j == target) p = __fsub_rn(p, 1.0f);
+        grow[j] = __fmul_rn(p, inv_n);
+    }
+    const int vend = pre + ((V - pre) & ~3);
+    const int n4 = (vend - pre) >> 2;
+    const float4* p = (const float4*)(row + pre);
+    float4* g4 = (float4*)(grow + pre);
+    for (int j4 = tid; j4 < n4; j4 += 256) {
+        float4 v = p[j4];
+        int j = pre + (j4 << 2);
+        float4 o;
+        o.x = __fmul_rn(exp32_bits(__fsub_rn(v.x, m)), inv_sum);
+        o.y = __fmul_rn(exp32_bits(__fsub_rn(v.y, m)), inv_sum);
+        o.z = __fmul_rn(exp32_bits(__fsub_rn(v.z, m)), inv_sum);
+        o.w = __fmul_rn(exp32_bits(__fsub_rn(v.w, m)), inv_sum);
+        if (j == target) o.x = __fsub_rn(o.x, 1.0f);
+        if (j + 1 == target) o.y = __fsub_rn(o.y, 1.0f);
+        if (j + 2 == target) o.z = __fsub_rn(o.z, 1.0f);
+        if (j + 3 == target) o.w = __fsub_rn(o.w, 1.0f);
+        o.x = __fmul_rn(o.x, inv_n);
+        o.y = __fmul_rn(o.y, inv_n);
+        o.z = __fmul_rn(o.z, inv_n);
+        o.w = __fmul_rn(o.w, inv_n);
+        g4[j4] = o;
+    }
+    for (int j = vend + tid; j < V; j += 256) {
+        float pv = __fmul_rn(exp32_bits(__fsub_rn(row[j], m)), inv_sum);
+        if (j == target) pv = __fsub_rn(pv, 1.0f);
+        grow[j] = __fmul_rn(pv, inv_n);
+    }
+}
+
 extern "C" __global__ void ce_bwd(const float* logits, const int* targets, float* dlogits,
                                   int N, int V) {
     __shared__ float sm[256];
     const int i = (int)blockIdx.x;
     const float* row = logits + static_cast<long long>(i) * (long long)V;
     float* grow = dlogits + static_cast<long long>(i) * (long long)V;
-    float m, sum;
-    ce_row_stats(row, V, sm, &m, &sum);
+    if (V <= 256) {
+        float m, sum;
+        ce_row_stats(row, V, sm, &m, &sum);
+        const float inv_sum = __fdiv_rn(1.0f, sum);
+        const float inv_n = __fdiv_rn(1.0f, static_cast<float>(N));
+        const int t = targets[i];
+        int begin, end;
+        ce_chunk_range(V, &begin, &end);
+        for (int j = begin; j < end; ++j) {
+            float e = exp32_bits(__fsub_rn(row[j], m));
+            float p = __fmul_rn(e, inv_sum);
+            if (j == t) p = __fsub_rn(p, 1.0f);
+            grow[j] = __fmul_rn(p, inv_n);
+        }
+        return;
+    }
+    const float m = ce_row_max_vec(row, V, sm);
+    const float sum = ce_row_sumexp_vec(row, V, m, sm);
     const float inv_sum = __fdiv_rn(1.0f, sum);
     const float inv_n = __fdiv_rn(1.0f, static_cast<float>(N));
     const int t = targets[i];
-    int begin, end;
-    ce_chunk_range(V, &begin, &end);
-    for (int j = begin; j < end; ++j) {
-        float e = exp32_bits(__fsub_rn(row[j], m));
-        float p = __fmul_rn(e, inv_sum);
-        if (j == t) p = __fsub_rn(p, 1.0f);
-        grow[j] = __fmul_rn(p, inv_n);
-    }
+    ce_row_write_vec(row, grow, V, m, inv_sum, inv_n, t);
 }
 
 extern "C" __global__ void transpose2d(const float* a, float* b, int rows, int cols) {
@@ -431,6 +528,64 @@ extern "C" __global__ void emb_gather_bwd(const float* g, const int* ids, float*
     float* erow = demb + id * d;
     for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x)
         atomicAdd(erow + j, grow[j]);
+}
+
+/* 长序列、少量重复 id（字节级语料）时，按 id 独占一行再顺序加，避免 atomic 挤在同一行。
+ * 加的顺序是 token 下标从小到大，和 CPU 的 np.add.at 同一方向。
+ */
+extern "C" __global__ void emb_bwd_hist(const int* ids, int* counts, int seq) {
+    int t = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t < seq) atomicAdd(counts + ids[t], 1);
+}
+
+extern "C" __global__ void emb_bwd_plan(const int* counts, int* offsets, int* cursor, int vocab) {
+    if (threadIdx.x || blockIdx.x) return;
+    int sum = 0;
+    for (int i = 0; i < vocab; ++i) {
+        offsets[i] = sum;
+        cursor[i] = sum;
+        sum += counts[i];
+    }
+    offsets[vocab] = sum;
+}
+
+extern "C" __global__ void emb_bwd_fill(const int* ids, int* cursor, int* pos, int seq) {
+    if (threadIdx.x || blockIdx.x) return;
+    for (int t = 0; t < seq; ++t) {
+        int id = ids[t];
+        pos[cursor[id]++] = t;
+    }
+}
+
+extern "C" __global__ void emb_bwd_owned(const float* g, const int* ids, float* demb,
+                                       int seq, int d, int vocab) {
+    int blocks = (int)gridDim.x;
+    int mine = (int)blockIdx.x;
+    if (blocks < 1 || mine >= blocks) return;
+    for (int t = 0; t < seq; ++t) {
+        int id = ids[t];
+        if (id < 0 || id >= vocab || (id % blocks) != mine) continue;
+        const float* grow = g + (long long)t * d;
+        float* erow = demb + (long long)id * d;
+        int j = (int)threadIdx.x;
+        int stride = (int)blockDim.x;
+        for (; j < d; j += stride) erow[j] += grow[j];
+    }
+}
+
+extern "C" __global__ void emb_bwd_rows(const float* g, const int* offsets, const int* pos,
+                                        float* demb, int vocab, int d) {
+    int id = (int)blockIdx.x;
+    if (id >= vocab) return;
+    int begin = offsets[id];
+    int end = offsets[id + 1];
+    if (begin == end) return;
+    float* erow = demb + (long long)id * d;
+    for (int p = begin; p < end; ++p) {
+        const float* grow = g + (long long)pos[p] * d;
+        for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x)
+            erow[j] += grow[j];
+    }
 }
 """
 
@@ -1027,6 +1182,8 @@ class CudaError(RuntimeError):
 _ATTN_NOP_SMEM = 32 * 1024
 _ATTN_NOP_BQ = 64
 # attn_bwd_flash：Q/dO stride 72，K/V/P/dS 各 64*32。见 tgai_attn_nop.cu。
+# 反向 atomic 按 query-tile 分组写到独立 plane，再加回 dK/dV，减轻 128 路冲突。
+_ATTN_FLASH_GROUPS = 8
 _ATTN_FLASH_SMEM = 69632
 _ATTN_FLASH_MAX_SMEM = 96 * 1024
 
@@ -2675,6 +2832,161 @@ class CudaRuntime:
         self._sgemm(CUDA_OP_N, CUDA_OP_T, N, M, K, B.ptr, N, A.ptr, M, C.ptr, N)
         return C
 
+    def _grouped_ready(self):
+        if getattr(self, "_grouped_missing", False):
+            return None
+        fn = getattr(self, "_grouped_fn", None)
+        if fn is not None:
+            return fn
+        try:
+            fn = self.cublas.cublasSgemmGroupedBatched
+        except AttributeError:
+            # 这台机器运行时加载的 libcublas 没有 grouped 符号。退回紧凑的
+            # 多次 cublasSgemm：仍然是一次 Python 调用发出全部专家，不再逐个建反传节点。
+            self._grouped_missing = True
+            return None
+        fn.restype = ctypes.c_int
+        # 指针数组在主机上，元素是设备地址。c_void_p 会把高位地址变成负数。
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+        ]
+        self._grouped_fn = fn
+        return fn
+
+    def _grouped_sgemm(self, specs):
+        """一批不同形状的 sgemm，一次 cublasSgemmGroupedBatched。
+
+        specs: (transa, transb, m, n, k, A, lda, B, ldb, C, ldc)，指针是 int。
+        每组 group_size=1，所以专家 token 数不必 pad。m/n/k 为 0 的项跳过。
+        beta=0，C 不必先清零。主机参数数组挂在返回值上，避免调用返回后被收掉。
+        """
+        specs = [s for s in specs if int(s[2]) > 0 and int(s[3]) > 0 and int(s[4]) > 0]
+        if not specs:
+            return None
+        g = len(specs)
+        transa = (ctypes.c_int * g)()
+        transb = (ctypes.c_int * g)()
+        ma = (ctypes.c_int * g)()
+        na = (ctypes.c_int * g)()
+        ka = (ctypes.c_int * g)()
+        alpha = (ctypes.c_float * g)()
+        beta = (ctypes.c_float * g)()
+        aa = (ctypes.c_uint64 * g)()
+        lda = (ctypes.c_int * g)()
+        ba = (ctypes.c_uint64 * g)()
+        ldb = (ctypes.c_int * g)()
+        ca = (ctypes.c_uint64 * g)()
+        ldc = (ctypes.c_int * g)()
+        gsize = (ctypes.c_int * g)()
+        for i, s in enumerate(specs):
+            transa[i] = int(s[0])
+            transb[i] = int(s[1])
+            ma[i] = int(s[2])
+            na[i] = int(s[3])
+            ka[i] = int(s[4])
+            alpha[i] = 1.0
+            beta[i] = 0.0
+            aa[i] = ctypes.c_uint64(int(s[5]))
+            lda[i] = int(s[6])
+            ba[i] = ctypes.c_uint64(int(s[7]))
+            ldb[i] = int(s[8])
+            ca[i] = ctypes.c_uint64(int(s[9]))
+            ldc[i] = int(s[10])
+            gsize[i] = 1
+            self._mark_submitted(int(s[5]))
+            self._mark_submitted(int(s[7]))
+            self._mark_submitted(int(s[9]))
+        self._activate()
+        fn = self._grouped_ready()
+        if fn is None:
+            for s in specs:
+                self._sgemm(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10])
+            return None
+        self._chk_blas(fn(
+            self.handle, transa, transb, ma, na, ka, alpha,
+            aa, lda, ba, ldb, beta, ca, ldc, int(g), gsize,
+        ), "cublasSgemmGroupedBatched")
+        return (transa, transb, ma, na, ka, alpha, beta, aa, lda, ba, ldb, ca, ldc, gsize)
+
+    def grouped_nt(self, As, Bs):
+        """每个 C[M,N] = A[M,K] @ B[N,K]^T。M 可以各不相同，K/N 按各对自己的形状。"""
+        if len(As) != len(Bs):
+            raise CudaError("grouped_nt 两边条数不同")
+        Cs = []
+        specs = []
+        for A, B in zip(As, Bs):
+            if len(A.shape) != 2 or len(B.shape) != 2:
+                raise CudaError("grouped_nt 需要 2D")
+            M, K = int(A.shape[0]), int(A.shape[1])
+            N, K2 = int(B.shape[0]), int(B.shape[1])
+            if K != K2:
+                raise CudaError("grouped_nt K 不匹配: %s @ %s^T" % (A.shape, B.shape))
+            C = self.empty((M, N), dtype=np.float32)
+            Cs.append(C)
+            if M and N and K:
+                # 与 gemm_nt 同一套列主序：C^T = B(T) @ A(N)
+                specs.append((CUDA_OP_T, CUDA_OP_N, N, M, K, B.ptr, K, A.ptr, K, C.ptr, N))
+            else:
+                self._memset32(C, 0)
+        hold = self._grouped_sgemm(specs)
+        if Cs:
+            Cs[0].keepalive = hold
+        return Cs
+
+    def grouped_nn(self, As, Bs):
+        """每个 C[M,N] = A[M,K] @ B[K,N]。"""
+        if len(As) != len(Bs):
+            raise CudaError("grouped_nn 两边条数不同")
+        Cs = []
+        specs = []
+        for A, B in zip(As, Bs):
+            M, K = int(A.shape[0]), int(A.shape[1])
+            K2, N = int(B.shape[0]), int(B.shape[1])
+            if K != K2:
+                raise CudaError("grouped_nn K 不匹配: %s @ %s" % (A.shape, B.shape))
+            C = self.empty((M, N), dtype=np.float32)
+            Cs.append(C)
+            if M and N and K:
+                specs.append((CUDA_OP_N, CUDA_OP_N, N, M, K, B.ptr, N, A.ptr, K, C.ptr, N))
+            else:
+                self._memset32(C, 0)
+        hold = self._grouped_sgemm(specs)
+        if Cs:
+            prev = Cs[0].keepalive
+            Cs[0].keepalive = (hold, prev) if prev is not None else hold
+        return Cs
+
+    def grouped_tn(self, As, Bs):
+        """每个 C[M,N] = A[K,M]^T @ B[K,N]。"""
+        if len(As) != len(Bs):
+            raise CudaError("grouped_tn 两边条数不同")
+        Cs = []
+        specs = []
+        for A, B in zip(As, Bs):
+            K, M = int(A.shape[0]), int(A.shape[1])
+            K2, N = int(B.shape[0]), int(B.shape[1])
+            if K != K2:
+                raise CudaError("grouped_tn K 不匹配: %s^T @ %s" % (A.shape, B.shape))
+            C = self.empty((M, N), dtype=np.float32)
+            Cs.append(C)
+            if M and N and K:
+                specs.append((CUDA_OP_N, CUDA_OP_T, N, M, K, B.ptr, N, A.ptr, M, C.ptr, N))
+            else:
+                self._memset32(C, 0)
+        hold = self._grouped_sgemm(specs)
+        if Cs:
+            prev = Cs[0].keepalive
+            Cs[0].keepalive = (hold, prev) if prev is not None else hold
+        return Cs
+
     def ce_fwd(self, logits, targets, n, v):
         n = int(n)
         v = int(v)
@@ -2797,11 +3109,23 @@ class CudaRuntime:
 
     def emb_bwd(self, grad, ids, seq, d, table_shape):
         dw = self.zeros(table_shape, dtype=np.float32)
-        if seq and d:
-            self.launch("emb_gather_bwd", (int(seq), 1, 1), (256, 1, 1), [
+        seq = int(seq)
+        d = int(d)
+        if not seq or not d:
+            return dw
+        vocab = int(table_shape[0])
+        # 短序列保持原来的 atomic，判分台的重复 id 仍走那条。
+        if seq < 1024 or d < 128 or vocab < 2:
+            self.launch("emb_gather_bwd", (seq, 1, 1), (256, 1, 1), [
                 self._ptr(grad), self._ptr(ids), self._ptr(dw),
-                (int(seq), ctypes.c_int), (int(d), ctypes.c_int),
+                (seq, ctypes.c_int), (d, ctypes.c_int),
             ])
+            return dw
+        # 每个 block 独占 id % 256，按 token 顺序加，不再 atomic 挤在同一行。
+        self.launch("emb_bwd_owned", (256, 1, 1), (256, 1, 1), [
+            self._ptr(grad), self._ptr(ids), self._ptr(dw),
+            (seq, ctypes.c_int), (d, ctypes.c_int), (vocab, ctypes.c_int),
+        ])
         return dw
 
     def adamw(self, p, g, m, v, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
@@ -2970,6 +3294,16 @@ class CudaRuntime:
 
     def moe_scatter_rows(self, y, tok, begin, m, n, d):
         out = self.zeros((int(n), int(d)), dtype=np.float32)
+        if m and d:
+            self.launch("moe_scatter_rows", (int(m), 1, 1), (self._moe_row_block(d), 1, 1), [
+                self._ptr(y), self._ptr(tok), self._ptr(out),
+                (int(begin), ctypes.c_int), (int(m), ctypes.c_int), (int(d), ctypes.c_int),
+            ])
+        return out
+
+    def moe_scatter_rows_add(self, y, tok, begin, m, out):
+        """往已有 [N,D] 上 atomicAdd。调用方保证 out 已经清零，专家按顺序发射。"""
+        d = int(out.shape[1]) if len(out.shape) == 2 else int(y.shape[1])
         if m and d:
             self.launch("moe_scatter_rows", (int(m), 1, 1), (self._moe_row_block(d), 1, 1), [
                 self._ptr(y), self._ptr(tok), self._ptr(out),
@@ -3159,13 +3493,35 @@ class CudaRuntime:
         dq = self.zeros((seq, nh, dh), dtype=np.float32)
         dk = self.zeros((seq, nh, dh), dtype=np.float32)
         dv = self.zeros((seq, nh, dh), dtype=np.float32)
+        # 分组 plane 在 8192 上把反向从 36ms 拉到 71ms（多出来的是 448MB 清零，
+        # atomic 冲突并不是大头）。先保持单缓冲，和已验收的 flash 反向同一条路径。
+        groups = 1
+        planes = groups - 1
+        nplane = int(seq) * int(nh) * int(dh)
+        if planes > 0 and nplane:
+            dk_part = self.zeros((planes, nplane), dtype=np.float32)
+            dv_part = self.zeros((planes, nplane), dtype=np.float32)
+        else:
+            dk_part = dk
+            dv_part = dv
+            groups = 1
+            planes = 0
         self._attn_flash_launch("attn_bwd_flash", seq, nh, dh, [
             self._ptr(do), self._ptr(q), self._ptr(k), self._ptr(v), self._ptr(o),
             self._ptr(m), self._ptr(lse),
             self._ptr(dq), self._ptr(dk), self._ptr(dv),
             (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
             (float(scale), ctypes.c_float),
+            self._ptr(dk_part), self._ptr(dv_part), (int(groups), ctypes.c_int),
         ])
+        if planes > 0 and nplane:
+            n4 = nplane >> 2
+            grid = (n4 + 255) // 256
+            self.launch("attn_bwd_reduce_planes", (grid, 1, 1), (256, 1, 1), [
+                self._ptr(dk), self._ptr(dv), self._ptr(dk_part), self._ptr(dv_part),
+                (nplane, ctypes.c_int), (planes, ctypes.c_int),
+            ], module=self._attn_mod)
+            dk.keepalive = (dk_part, dv_part)
         return dq, dk, dv
 
 

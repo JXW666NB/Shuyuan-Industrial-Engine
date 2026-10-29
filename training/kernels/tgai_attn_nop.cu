@@ -553,7 +553,8 @@ attn_bwd_flash(const float* __restrict__ dO, const float* __restrict__ Q,
                const float* __restrict__ O,
                const float* __restrict__ m_in, const float* __restrict__ l_in,
                float* __restrict__ dQ, float* __restrict__ dK, float* __restrict__ dV,
-               int seq, int nh, int dh, float scale) {
+               int seq, int nh, int dh, float scale,
+               float* __restrict__ dK_part, float* __restrict__ dV_part, int groups) {
     const int h = (int)blockIdx.x;
     const int t0 = (int)blockIdx.y * BT;
     const int tid = (int)threadIdx.x;
@@ -652,8 +653,16 @@ attn_bwd_flash(const float* __restrict__ dO, const float* __restrict__ Q,
             }
             int tok = k0 + k;
             if (tok < seq) {
-                float* dkrow = dK + qkv_at(tok, h, nh, dh);
-                float* dvrow = dV + qkv_at(tok, h, nh, dh);
+                int grp = groups > 1 ? ((int)blockIdx.y % groups) : 0;
+                float* dk_base = dK;
+                float* dv_base = dV;
+                if (grp > 0) {
+                    long long plane = (long long)seq * nh * dh;
+                    dk_base = dK_part + (long long)(grp - 1) * plane;
+                    dv_base = dV_part + (long long)(grp - 1) * plane;
+                }
+                float* dkrow = dk_base + qkv_at(tok, h, nh, dh);
+                float* dvrow = dv_base + qkv_at(tok, h, nh, dh);
                 atomicAdd(dkrow + d, scale * ak);
                 atomicAdd(dvrow + d, av);
             }
@@ -670,6 +679,25 @@ attn_bwd_flash(const float* __restrict__ dO, const float* __restrict__ Q,
             rowp[lane + 32] = scale * dq1[r];
         }
     }
+}
+
+extern "C" __global__ void attn_bwd_reduce_planes(
+    float* __restrict__ dk, float* __restrict__ dv,
+    const float* __restrict__ dk_part, const float* __restrict__ dv_part,
+    int n, int planes) {
+    int i4 = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int n4 = n >> 2;
+    if (i4 >= n4) return;
+    float4 a = reinterpret_cast<float4*>(dk)[i4];
+    float4 b = reinterpret_cast<float4*>(dv)[i4];
+    for (int p = 0; p < planes; ++p) {
+        float4 da = reinterpret_cast<const float4*>(dk_part + (long long)p * n)[i4];
+        float4 db = reinterpret_cast<const float4*>(dv_part + (long long)p * n)[i4];
+        a.x += da.x; a.y += da.y; a.z += da.z; a.w += da.w;
+        b.x += db.x; b.y += db.y; b.z += db.z; b.w += db.w;
+    }
+    reinterpret_cast<float4*>(dk)[i4] = a;
+    reinterpret_cast<float4*>(dv)[i4] = b;
 }
 
 // ---------------------------------------------------------------------------
