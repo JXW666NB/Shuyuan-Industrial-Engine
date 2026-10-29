@@ -790,3 +790,34 @@ Python 侧唯一的 `for` 循环在**构造期**装配权重指针表，`forward
 
 **回归**：conformance CPU **13/13**、CUDA **13/13**；性能 **0.035 / 0.142 s** 未退；
 llama 的 CUDA 判分不变（8.664e-06 / 9.228e-06）。
+
+---
+
+## B4 第一步：TGAI V3（非 CSA）前向与官方实现对齐 —— 5.02e-05
+
+**基准不是 PyTorch 通用实现，而是 V3 自己的 `model_v3.py`**（用官方代码跑小配置导出 logits/weights，
+存于 `training/oracle/v3_tiny_*`，见 `docs/v3_architecture_facts.md`）。
+
+**复刻范围**（全部按源码逐条实现，`training/harness/v3_ref.py`）：
+- 每层**两个 Block AttnRes**（attn 前 / mlp 前）：伪查询 `w∈R^d` + RMSNorm，
+  对 `blocks + [partial]` 在 block 维做 softmax 注意力
+- attention：q/k/v proj → **QK-Norm（在 RoPE 之前）** → RoPE → GQA repeat（`repeat_interleave`）→ causal SDPA → o_proj
+- MoE：`sigmoid(router)` → `s + expert_bias` 选择 → **选中集内归一化** → 每专家 **SiTU-GLU**
+  （`β₁·tanh(g/β₁)·sigmoid(g)` ⊙ `β₂·tanh(u/β₂)`，β₁=4、β₂=25）→ topk 求和 → **post_norm** → **共享专家无门控相加**
+- 输出头与词表共享（`tie_embeddings=True`）
+
+**实测（本机 CPU，判分台先自证）**
+
+| 项 | 结果 | 判据 |
+|---|---|---|
+| 自证（同侧两次） | **0.000e+00** | 必须为 0 ✅ |
+| **V3 前向 vs 官方 oracle** | **5.021e-05** | <1e-4 ✅ |
+
+### 对拍时踩到的两个坑（都是"看起来一样、其实不同"的语义）
+1. **V3 的 `_rotate_half` 是交错式**：`(x1,x2,x3,x4) → (-x2,x1,-x4,x3)`，
+   **不是** llama/GPT-2 的半切 `[-x2, x1]`。用半切时相对误差 **9.29e-01**，改成交错后直接到 5e-5。
+2. **RoPE 的 cos/sin 是 `[1,1,max_seq,dh]` 的 buffer**，要按 `seq` 切片、并**按 q 与 k 各自的头数**分别平铺
+   （q 是 `B*NH`、k 是 `B*NKV`，GQA 下不同）。
+
+**本阶段只做前向**：MoE 的按专家 gather/scatter 需要 fancy indexing，当前张量层在 CUDA 上还不完整；
+前向用 numpy 组装拿到数值对齐，**反向留到下一阶段**。
