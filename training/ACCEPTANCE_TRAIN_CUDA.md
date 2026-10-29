@@ -560,3 +560,35 @@ Grok 引入**惰性转置**（`.T` 不落地，记 `_lazy_T/_lazy_shape`，为 2
 - `moe_selfcheck`：**连跑 3 次均 ok=True**（1.716e-07）；但有一次在批量连跑中报 `ok=False` 而同数值不变，
   属**观察到的偶发**，未复现，记录待查。
 - loss 曲线：seq=8192 10.5505 → 7.3241 → 5.6400（与改前一致）
+
+---
+
+## B1 起步：llama 语义基准锁定（纯 Python 薄定义，作为 C 移植的绿色参照）
+
+**做法**：先用现有算子写一份 llama 薄定义 `training/harness/llama_ref.py`
+（RMSNorm → RoPE → GQA causal attn → 残差 → RMSNorm → SwiGLU → 残差 → final norm → untied 头），
+配 `training/harness/llama_parity.py` 与 PyTorch **同权重、同输入**对拍。
+
+**实测（4090，判分台先自证 CPU vs CPU = 0.000e+00）**：
+
+| 项 | 结果 | 判据 |
+|---|---|---|
+| logits 相对误差 | **6.728e-06** | <1e-4 ✅ |
+| loss 相对误差 | 1.600e-06 | — |
+| 梯度最差（`blocks.1.ffn.gate.weight`） | **1.121e-05** | <1e-3 ✅ |
+| **VERDICT** | **ok=True** | — |
+
+配置：d=32 / L=2 / nh=4 / **n_kv=4（暂未启用 GQA 分组）** / ff=64 / V=64 / seq=16 / θ=10000。
+
+### 写这份参考实现时暴露的三个 CUDA 缺口（B 的 C 实现必须原生具备）
+
+| 缺口 | 现象 | 影响 |
+|---|---|---|
+| `Tensor.__getitem__` 不支持 CUDA | `tok_emb.weight[ids]`、`x[..., :half]` 直接崩 | 任何 PyTorch 风格的切片/取行都失败 |
+| `mul` 不支持广播 | `x * cos`（[8,16,8] × [16,8]）报"只支持同形状" | RoPE、任何逐元素广播都会踩 |
+| `mean` 未实现 | `x*x.mean(-1, keepdim=True)` 崩 | 手写 RMSNorm/LayerNorm 都会踩 |
+
+**目前的绕法**（都在参考实现里标注了）：token 取行走 `nn.Embedding`；`mul` 广播靠把 cos/sin 平铺成同形状；
+`rotate_half` 改成乘一个 0/±1 置换矩阵（`x @ R`，浮点精确，因为 3D@2D matmul 支持）。
+**GQA 的 head 重复**（`repeat_interleave`）目前无 CUDA 解法，故本轮把 `n_kv` 设为 `nh` ——
+待补 CUDA 切片或专门的 `repeat_kv` op 后再启用 GQA 并重跑判据。
