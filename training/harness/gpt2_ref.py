@@ -93,10 +93,10 @@ class GPT2:
             h = h + self._linear(mid, p + "mlp.proj").reshape(B, S, D)
 
         hn = self._ln(h, "ln_f")
-        logits = hn.reshape(B * S, D) @ self.w["lm_head"].T
-        if c.get("tie"):
-            logits = hn.reshape(B * S, D) @ self.w["wte.weight"].T
-        return logits
+        # ★ 先按 tie 选头，再取权重：真实 GPT-2 是 tied 且**没有** lm_head 这个键，
+        #   之前"先取 lm_head 再覆盖"的写法会在加载真实权重时 KeyError。
+        head = self.w["wte.weight"] if c.get("tie") else self.w["lm_head"]
+        return hn.reshape(B * S, D) @ head.T
 
 
 def init_weights(cfg, seed=0):

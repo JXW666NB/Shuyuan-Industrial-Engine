@@ -1183,3 +1183,35 @@ csa_compress=1(关 CSA) csa_latent=128 attn_res_block=4 θ=5e5`
 - 该配置**关掉了 CSA**（`csa_compress=1`）—— CSA 层参数名不同，我们尚未实现（见"未达成"清单）；
 - 序列长度取 16（numpy CPU 跑得动的规模）；
 - 这是**正确性与规模的验证**，不是性能验证（V3 的 C 侧执行器尚未实现）。
+
+---
+
+## B2 补齐：加载**真实 GPT-2 权重**对齐 logits（8.254e-07，argmax 全同）
+
+目标 B2 原文要求"**且能加载真实 GPT-2 权重对齐 logits**"。本轮做到。
+
+**权重**：官方 `gpt2`（124M）`pytorch_model.bin`，522.7 MB，下载自 hf-mirror（直连 200）。
+实测结构：`L=12 d=768 V=50257`，`layer_norm_epsilon=1e-5`，`gelu_new`。
+
+**三个必须对齐的细节**（都踩过）：
+1. **Conv1D 布局**：HF 的 Linear 权重是 `[in, out]`，我们是 `[out, in]` ⇒ 全部**转置**；
+2. **tie**：真实 GPT-2 的 `wte` 与 `lm_head` 共享，且 state_dict 里**没有** `lm_head` 键；
+3. 因果掩码 buffer（`attn.bias`）要跳过，但**不能**用 `endswith("attn.bias")` ——
+   `attn.c_attn.bias` 是真参数，会被误删（我第一版就这么删的）。
+
+**实测**
+
+| 项 | 结果 |
+|---|---|
+| 我们的 logits | `(6, 50257)` |
+| PyTorch 参考 logits | `(6, 50257)` |
+| **相对误差** | **8.254e-07**（判据 <1e-4）✅ |
+| **argmax** | `[11, 314, 1438]` 两边**完全一致** ✅ |
+
+输入用 GPT-2 分词器已知序列（"Hello, my dog is cute" → `[15496,11,616,3290,318,13779]`），
+避免依赖分词器实现。脚本 `training/harness/gpt2_real_parity.py`（`--bin` 指定权重路径）。
+
+### 顺带修掉两个 ref 的实现缺陷
+- `gpt2_ref.forward` 原来"先取 `lm_head` 再按 tie 覆盖"，加载真实权重时 KeyError；
+  改成**先按 tie 选头再取权重**；
+- `gpt2_parity.run_torch` 无条件注册 `lm_head`，tie 时同样 KeyError；改成 tie 时不注册。

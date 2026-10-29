@@ -62,7 +62,11 @@ def run_torch(cfg, ids, tgt):
     def reg(name, shape):
         P[name] = nn.Parameter(torch.tensor(cfg["weights"][name].copy(), dtype=torch.float64))
 
-    for nm in ("wte.weight", "wpe.weight", "ln_f.weight", "ln_f.bias", "lm_head"):
+    # tie=True 时用 wte 当头，**不注册** lm_head —— 真实 GPT-2 的 state_dict 里没有这个键
+    heads = ("wte.weight", "wpe.weight", "ln_f.weight", "ln_f.bias")
+    if not cfg.get("tie"):
+        heads = heads + ("lm_head",)
+    for nm in heads:
         reg(nm, cfg["weights"][nm].shape)
     for i in range(L):
         p = "blocks.%d." % i
