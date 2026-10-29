@@ -283,6 +283,7 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--out", default="chat10m.pt")
     ap.add_argument("--log-csv", default="")
+    ap.add_argument("--fp16", action="store_true")
     a = ap.parse_args()
     T.set_default_device(a.device)
 
@@ -300,6 +301,7 @@ def main():
     print("device=%s  参数量=%.3fM（含词表 %.3fM）"
           % (a.device, n_par / 1e6, cfg["V"] * cfg["D"] / 1e6))
     opt = T.optim.AdamW(list(p.values()), lr=a.lr)
+    scaler = T.cuda.amp.GradScaler(enabled=a.fp16)
 
     log = open(a.log_csv, "w", encoding="utf-8") if a.log_csv else None
     if log:
@@ -308,12 +310,18 @@ def main():
     first = None
     v = float("nan")
     for step in range(a.steps):
-        logits = forward(p, x, cfg)
-        loss = F.cross_entropy(logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
-                               T.tensor(y.reshape(-1)), ignore_index=-100)
         opt.zero_grad()
-        loss.backward()
-        opt.step()
+        with T.autocast("cuda", dtype=T.float16, enabled=a.fp16):
+            logits = forward(p, x, cfg)
+            loss = F.cross_entropy(logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
+                                   T.tensor(y.reshape(-1)), ignore_index=-100)
+        if a.fp16:
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            opt.step()
         v = float(np.asarray(loss.to_numpy() if hasattr(loss, "to_numpy")
                              else loss.detach().cpu().numpy()).reshape(-1)[0])
         if first is None:
