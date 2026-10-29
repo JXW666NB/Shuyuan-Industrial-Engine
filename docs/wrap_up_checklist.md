@@ -108,3 +108,36 @@ bash training/harness/run_all.sh
    **每个交付都要在干净 venv 里过一遍。**
 3. **能重编才能修** —— 曾以为"没有编译器"，实际 `cl.exe` 只在 Developer Command Prompt 的
    PATH 里（`where cl` 查不到不代表没装）。打通构建后才有"零改动重编 → 验证 → 再改"的资格。
+
+---
+
+## 六、考试一（鹈鹕模型）—— 已完成训练，产物已入库
+
+**题目**：训一个只会输出「鹈鹕骑自行车」或「自行车骑行鹈鹕」的模型，非预设架构，
+TGAI 版与 PyT 版**只差导入**，产物为 `.TG` 与 `.pt`。
+
+**代码**：`examples/exam1_pelican_tgai.py` / `examples/exam1_pelican_torch.py`
+`git diff --no-index` 证明差异只有 **SHIM①导入(1 行) + SHIM②保存(5 行) + 输出文件名(2 行)**；
+模型定义、RoPE、注意力、训练循环、贪心校验**逐字节相同**。
+
+**实测（CUDA，600 步）**
+
+| 版本 | 设备 | loss | 贪心 6 次 | 产物 |
+|---|---|---|---|---|
+| TGAI GO | cuda | 2.31 → ~0.00 | **6/6 PASS** | `pelican.TG` **540,080 B** |
+| PyTorch | cuda | 同量级 | **6/6 PASS** | `pelican.pt` **1,328,456 B** |
+
+产物：`examples/artifacts/pelican.TG`、`examples/artifacts/pelican.pt`。
+
+### 为"只差导入"补的兼容层（4 处，都是真缺口）
+1. `Tensor.mean(dim=, keepdim=)` —— 原来只认 `axis/keepdims`；
+2. 模块级别名 `tensor` 与 `set_default_device`（对应 `torch.tensor` / `torch.set_default_device`）；
+3. `Parameter` 接受 Tensor 入参（原来只接受 numpy）；
+4. `functional.cross_entropy` 接受 Tensor 目标（torch 的 CE 只接受 Tensor）。
+
+### 未完成 / 待办
+- **`.TG` 的引擎加载验证没做**：我误把 `feat.py` 指向的 **4090（Linux）** 当成了 V100，
+  而包里随附的是 **Windows 引擎 DLL**，在 Linux 上 `invalid ELF header`。
+  需要在 **Windows 的 V100** 上、用 `D:\TGAI\libtgai_engine_gpu.dll` 复验：
+  `tgai_go.load("pelican.TG", dll=...)` 然后 `generate`，期望输出含那两句之一。
+- 考试二（10M 对话小模型）**尚未开始**。

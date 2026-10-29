@@ -1146,7 +1146,12 @@ class Tensor:
         out._backward = bw
         return out
 
-    def mean(self, axis=None, keepdims=False):
+    def mean(self, axis=None, keepdims=False, dim=None, keepdim=None):
+        # 接受 torch 拼写（dim/keepdim），便于'改个导入就迁移'
+        if dim is not None:
+            axis = dim
+        if keepdim is not None:
+            keepdims = keepdim
         if self.device == "cuda":
             if isinstance(axis, (tuple, list)):
                 raise NotImplementedError("CUDA mean 目前只支持单轴或全归约，收到 %r" % (axis,))
@@ -2324,6 +2329,9 @@ class _Functional:
 
     @staticmethod
     def cross_entropy(logits: Tensor, target, ignore_index=-100):
+
+        if isinstance(target, Tensor):
+            target = target.to_numpy()
         """logits [N,V]，target [N]（int）。返回标量 loss（mean）。"""
         if getattr(logits, "device", "cpu") == "cuda":
             return _cross_entropy_cuda(logits, target, ignore_index)
@@ -2522,6 +2530,9 @@ def _cross_entropy_cuda_ignore(logits, tgt, ignore_index):
 # ─────────────────────────── nn ───────────────────────────
 class Parameter(Tensor):
     def __init__(self, data):
+        # 与 torch.nn.Parameter 一致：也接受 Tensor 入参（迁移兼容）
+        if isinstance(data, Tensor):
+            data = data.to_numpy() if getattr(data, "device", "cpu") == "cuda" else data.data
         super().__init__(data, requires_grad=True)
 
 
@@ -3489,3 +3500,12 @@ abs = _api_abs
 clamp = _api_clamp
 max = _api_max
 min = _api_min
+
+# ═══════════════════════════════════════════════════════════
+# torch 同义名（迁移兼容）：让 PyTorch 脚本"只改导入"即可运行
+# ═══════════════════════════════════════════════════════════
+tensor = Tensor            # torch.tensor(...) -> Tensor(...)
+# torch.set_default_device('cuda') 的同义实现
+def set_default_device(device):
+    return set_device(device)
+
