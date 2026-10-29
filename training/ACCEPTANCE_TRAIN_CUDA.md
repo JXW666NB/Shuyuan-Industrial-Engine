@@ -1261,3 +1261,25 @@ csa_compress=1(关 CSA) csa_latent=128 attn_res_block=4 θ=5e5`
 - 原来重载时用 `hasattr(load_state_dict)` 判断，而这些"薄定义"模型不是 Module ⇒ **静默跳过加载**、
   重载校验假通过。改成把权重直接传进构造函数。
 - 模型定义搬进包内 `tgai_go/train/models/`（原来依赖仓库 `training/harness`，pip 安装后必崩）。
+
+---
+
+## B5 第一步达成：MLA（隐空间注意力）在 CPU 与 CUDA 上都与 PyTorch 对齐
+
+**范围（诚实边界）**：实现了 MLA 的**结构核心** ——
+`c_kv = W_dkv x`（真正的 KV 只有隐空间一份）、`k_nope / k_rope / v` 从 `c_kv` 上投影、
+**`k_rope` 全头共享**、Q 可选低秩（`q_dora`）、输出投影。
+**未实现**：RoPE 本身、完整 DeepSeek MoE 路由、吸收矩阵优化。
+
+| 后端 | logits 相对误差 | 判定 |
+|---|---|---|
+| CPU | **1.944e-07** | ✅ |
+| **CUDA** | **3.092e-07** | ✅ |
+| 自证（同侧两次） | **0.000e+00** | ✅ |
+
+`q_lora=True` 变体也通过（1.944e-07）。
+
+**顺带补上的 CUDA 算子**：`T.cat`（之前 `NotImplementedError: CUDA cat 尚未实现`）。
+这是基础算子，用户自己写模型也会用到。补上后 MLA 的 CUDA 路径才通。
+（该改动来自一次被取消的子任务，我事后**独立验证**：conformance CPU **13/13**、CUDA **13/13**，
+四个 selftest 全 0，没有回归。）
