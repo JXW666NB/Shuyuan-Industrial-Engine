@@ -27,10 +27,20 @@ CORPUS = ["<bos>鹈鹕骑自行车<eos>", "<bos>自行车骑行鹈鹕<eos>"]
 
 # ═══════════════ SHIM ②：保存（.TG 只有 TGAI 能写）═══════════════
 def save_artifacts(path, params, vocab, meta):
+    import os as _os
     from tgai_go.train.export import save_tg
+    # TG_NEXP：把单专家复制成 N 份（用于验证引擎是否支持 n_experts==1）
+    ne = int(_os.environ.get("TG_NEXP", "1"))
+    if ne > 1:
+        for i in range(meta["L"]):
+            src = "blocks.%d.moe.experts.0." % i
+            for e in range(1, ne):
+                for w in ("w1", "w2", "w3"):
+                    params["blocks.%d.moe.experts.%d.%s.weight" % (i, e, w)] = params[src + w + ".weight"]
     save_tg(path, params, n_layers=meta["L"], d_model=meta["D"], n_heads=meta["NH"],
-            d_ff=meta["FF"], vocab_tokens=vocab, merges=[], max_seq=meta["S"],
-            n_experts=1, n_activated=1, rope_theta=10000.0,
+            d_ff=meta["FF"], vocab_tokens=vocab, merges=[], max_seq=64,   # ★ 不能只写训练长度 9：
+            #   引擎按 max_seq 决定 RoPE 表长度，太短会拒绝 generate(max_tokens>max_seq)
+            n_experts=ne, n_activated=1, rope_theta=10000.0,
             special_ids=[0, 1, 2, 3], weight_dtype=0)
 # ══════════════════════════════════════════════════════════════
 
@@ -63,9 +73,20 @@ def silu(x):
 
 
 def rope(x, cos, sin):
-    """半切 RoPE：[-x_hi, x_lo] 与 x 交错。"""
-    h = int(x.shape[-1]) // 2
-    rot = T.cat([(T.tensor(np.zeros((1,), np.float32)) - x[..., :h]), x[..., h:]], dim=-1)
+    """**交错式** RoPE：out[2k] = -x[2k+1], out[2k+1] = x[2k]。
+
+    引擎（V3 血统）用交错式；之前用"半切"时引擎能跑但输出错句
+    （'自行车骑自行车' 而不是 '鹈鹕骑自行车'）—— 这就是约定不一致。
+    用置换矩阵实现：rot = x @ P，两个后端都支持、且可求导。
+    """
+    dh = int(x.shape[-1])
+    P = np.zeros((dh, dh), np.float32)
+    for j in range(dh):
+        if j % 2 == 0:
+            P[j, j + 1] = -1.0
+        else:
+            P[j, j - 1] = 1.0
+    rot = x @ T.tensor(P)
     return x * cos + rot * sin
 
 
@@ -104,8 +125,8 @@ def forward(p, ids, cfg):
     half = DH // 2
     ang = (np.arange(S, dtype=np.float64)[:, None]
            * (10000.0 ** (-2.0 * np.arange(half, dtype=np.float64) / DH))[None, :])
-    cos = T.tensor(np.tile(np.concatenate([np.cos(ang)] * 2, 1).astype(np.float32), (B * NH, 1, 1)))
-    sin = T.tensor(np.tile(np.concatenate([np.sin(ang)] * 2, 1).astype(np.float32), (B * NH, 1, 1)))
+    cos = T.tensor(np.tile(np.repeat(np.cos(ang), 2, axis=1).astype(np.float32), (B * NH, 1, 1)))
+    sin = T.tensor(np.tile(np.repeat(np.sin(ang), 2, axis=1).astype(np.float32), (B * NH, 1, 1)))
 
     for i in range(L):
         b = "blocks.%d." % i
@@ -134,7 +155,13 @@ def main():
     T.set_default_device(a.device)
 
     toks, stoi = build_vocab()
-    seqs = [encode(s, stoi) for s in CORPUS]
+    base = [encode(s, stoi) for s in CORPUS]
+    # ★ 引擎在 prompt 前面会塞 pad/unk，与"纯 <bos> 开头"的训练分布不一致
+    #   ⇒ 训练时加入 0~4 个前导 <pad> 的变体，让模型学会忽略前缀、直接说那句话。
+    seqs = []
+    for k in range(5):
+        for sq in base:
+            seqs.append([stoi["<pad>"]] * k + sq)
     L = max(len(s) for s in seqs)
     cfg = dict(V=len(toks), D=128, NH=4, L=2, FF=256, S=L)
 

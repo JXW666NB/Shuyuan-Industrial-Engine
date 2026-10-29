@@ -47,6 +47,11 @@ def _engine_name(name, n_experts):
             block = head
         if rest in m:
             return "%s.moe.experts.%s.%s.weight" % (block, idx, m[rest])
+        # ★ 已经是引擎命名（w1/w2/w3）时必须**原样保留**。
+        #   早期版本这里直接 return None，把 w1/w2/w3 全丢了 ⇒ 导出的 .TG **没有任何专家权重**，
+        #   引擎前向取专家指针拿到 NULL，崩在 access violation（0x1A000）。
+        if rest in ("w1", "w2", "w3"):
+            return "%s.moe.experts.%s.%s.weight" % (block, idx, rest)
         return None
     if n.endswith(".router.weight"):
         return n
