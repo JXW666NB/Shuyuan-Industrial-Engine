@@ -1064,3 +1064,33 @@ GPU DLL 的用户与 `tgai.py` 的 CPU 路径；产线 11450 用 GPU DLL，不�
 
 **产线未改动**：新构建只放在 V100 `D:\kernel_lab\` 验证；产线 DLL 已备份
 （`D:\TGAI\libtgai_engine_gpu.dll.bak_20261029`），本轮未替换。
+
+---
+
+## B7 打包：C 源码随 wheel 分发 + README「预设架构 + 纯 C」+ 1.4.1
+
+**做了什么**
+1. C 核心源码搬进包：`python/tgai_go/_native/src/`（`llama_fwd.c` 40 KB / `.h` / `build_llama_fwd.sh` / `README.md`）；
+2. `pyproject.toml`：
+   - 版本 **1.4.0 → 1.4.1**；
+   - `package-data` 增加 `_native/src/*.c|h|sh|md`；
+   - **去掉全局 `*.c` 排除**（原来它会把上一步的源码一起剔掉 —— 只加 package-data 不够）；
+3. `python/README.md` 新增「预设架构 + 纯 C」章节：描述符字段表、三架构实测误差、一键流水线、`.TG` 导出用法；
+4. 修 `tgai_go.__version__`：原来硬编码 **1.3.0**，而 pyproject 是 1.4.0 —— 版本漂移（技能文档记过同类事故）。
+
+**实测（真实安装态，干净 venv）**
+
+| 检查 | 结果 |
+|---|---|
+| wheel 构建 | ✅ `tgai_go-1.4.1-py3-none-any.whl`，877,167 B |
+| metadata `Version` | **1.4.1** |
+| `tgai_go.__version__` | **1.4.1**（改前 1.3.0，不一致） |
+| `_native/src/llama_fwd.c` 在包内 | ✅ **41,103 B** |
+| README 进长描述（含新章节） | ✅ |
+| 安装后 `from tgai_go.train.pipeline import _load_bpe_funcs` | ✅ 取自 **`tgai_go.train.bpe`**（包内，不依赖仓库 `training/`） |
+| 安装后自训 BPE | ✅ 词表 25 / merges 13（小样本） |
+| 安装后 `from tgai_go.train.export import save_tg` | ✅ |
+
+> 这一轮又抓到一类"源码树里正常、安装态才暴露"的问题：**`__version__` 与 pyproject 不一致**。
+> 加上之前的 `packages` 漏 `tgai_go.train`、`pipeline` 读仓库路径、`*.c` 被排除，
+> 同类问题本期共 4 例。

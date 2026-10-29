@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tgai-go"
-version = "1.4.0"
+version = "1.4.1"
 description = "TGAI GO —— 纯 Python 的 TGAI 模型推理库（CPU 引擎，零编译安装）"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -76,10 +76,15 @@ zip-safe = false
 #   文件名由 build_wheel.py 按平台放置
 "tgai_go" = [
     "_native/*.dll", "_native/*.so", "_native/*.dylib", "_native/README.md",
+    # ★ 纯 C 预设核心的源码随包分发（B7）：用户能看到描述符驱动的一份核心，
+    #   需要自己重编时不必再找仓库。产物在 _native/*.so|*.dll。
+    "_native/src/*.c", "_native/src/*.h", "_native/src/*.sh", "_native/src/README.md",
     # ★ 训练后端的长上下文 attention 源码：运行时由 NVRTC 编译，必须随包分发
     #   否则 pip 安装后 lowmem=True 会找不到 tgai_attn_nop.cu
     "train/kernels/*.cu",
 ]
 
 [tool.setuptools.exclude-package-data]
-"*" = ["*.pyc", "__pycache__/*", "*.c", "*.obj", "*.lib", "*.exp"]
+# 说明：原来这里排除了 *.c，会连 _native/src 下的 C 源码一起剔掉。
+#      现在 C 源码是**刻意**随包分发的（B7），故只保留其余临时产物。
+"*" = ["*.pyc", "__pycache__/*", "*.obj", "*.lib", "*.exp"]

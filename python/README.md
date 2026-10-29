@@ -325,3 +325,63 @@ MIT
 - `.TG` 格式：128 字节头 + 分词器段 + 权重表 + 权重数据（+ 可选对话配置段）
 - 支持的架构：TGAI MoE / Llama / Mistral（按 `arch_type` 字段区分）
 - 量化：FP32 / FP16 / BF16 / INT8 / Q8_0 / Q4_0 / Q4K
+
+---
+
+## 预设架构 + 纯 C（1.4.1 起）
+
+**一个 C 核心 + 一张描述符表**，多套架构共用同一份实现 —— 不是每套架构复制一份算子。
+
+```python
+from tgai_go import presets
+
+m = presets.llama(cfg)      # RMSNorm / RoPE / SwiGLU / GQA
+m = presets.qwen2(cfg)      # 同一份 C，仅 qkv_bias=1
+m = presets.gpt2(cfg)       # LayerNorm / GELU / 学习式位置 / 全 bias
+y = m.forward(ids)          # 一次前向只跨 Python↔C 一次
+```
+
+描述符（`TgArch`）字段决定差异，C 里用 `if/switch` 选分支：
+
+| 字段 | 取值 | 影响 |
+|---|---|---|
+| `qkv_bias` | 0/1 | Q/K/V 投影后是否加 bias（llama=0，qwen2=1） |
+| `norm` | `rmsnorm` / `ln` | 归一化方式（GPT-2 用 LayerNorm，带 beta） |
+| `pos` | `rope` / `wpe` | 位置编码（GPT-2 用学习式位置表） |
+| `ffn` | `swiglu` / `gelu` | FFN 类型 |
+| `n_kv` | 整数 | GQA 比例（repeat 次数 = n_heads / n_kv） |
+
+**C 源码随包分发**：`tgai_go/_native/src/llama_fwd.c`（约 40 KB）与 `llama_fwd.h`。
+需要换编译器或打补丁时直接改它，编译脚本 `build_llama_fwd.sh` 也在同目录。
+
+### 实测（与 PyTorch 参考实现同权重、同输入对拍）
+
+| 架构 | logits 相对误差 | 梯度最差 |
+|---|---|---|
+| llama | 8.664e-06 | 9.228e-06 |
+| qwen2 | 4.403e-06 | 8.382e-06 |
+| gpt2 | 1.857e-07 | 4.321e-07 |
+
+判据是 logits < 1e-4、梯度 < 1e-3。C 路径与 Python 参考的误差同为 1e-6 量级，
+且连跑两次逐位一致。
+
+### 一键流水线（给定语料即可训练）
+
+```python
+from tgai_go.train.pipeline import run
+run(corpus_dir="我的语料/", out_dir="run/", arch="llama", steps=200)
+```
+
+- **分词表不用你提供**：引擎会用你的语料自训一个 BPE（`tgai_go.train.bpe`）；
+- 产出 `tokenizer.json` / `ckpt.npz` / `meta.json`；
+- 实测（小配置）：自训词表 132、loss 5.3091 → 0.1755、重载后 logits 逐位一致。
+
+### 导出 `.TG` 给引擎加载
+
+```python
+from tgai_go.train.export import save_tg
+save_tg("model.TG", params, n_layers=..., d_model=..., n_heads=..., d_ff=...,
+        vocab_tokens=tokens, merges=merges, rope_theta=10000.0)
+```
+
+实测：导出的 `.TG` 能被 `tgai_go.load()` 加载并在 GPU 引擎上稳定生成（5/5，退出码 0）。
