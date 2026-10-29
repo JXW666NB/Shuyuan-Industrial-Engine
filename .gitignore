@@ -72,3 +72,4 @@ wechatauto_logs/
 # 同步备份（laptop<->V100 双向同步时产生）
 *.pre_sync_*
 *.pre_sync
+_z_*.py
