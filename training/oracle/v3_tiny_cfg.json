@@ -1,0 +1,41 @@
+{
+ "flags": {
+  "use_csa": false,
+  "dense_ffn": false,
+  "attn_res_enabled": true,
+  "dense_attn_res_free": true,
+  "moe_use_situ": true,
+  "moe_post_norm": true,
+  "attn_qk_norm": true,
+  "tie_embeddings": true,
+  "is_global_layer": [
+   false,
+   false,
+   false,
+   true
+  ],
+  "rope_cfg_global": [
+   500000.0,
+   1.0
+  ],
+  "rope_cfg_local": [
+   500000.0,
+   1.0
+  ]
+ },
+ "tiny": {
+  "vocab": 64,
+  "d": 32,
+  "L": 4,
+  "nh": 4,
+  "n_kv": 2,
+  "ff": 32,
+  "seq": 16,
+  "E": 4,
+  "topk": 2,
+  "shared": 1,
+  "res_block": 2,
+  "theta": 500000.0,
+  "eps": 1e-06
+ }
+}
