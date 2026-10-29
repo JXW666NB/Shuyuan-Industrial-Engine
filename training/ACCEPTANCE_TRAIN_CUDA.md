@@ -651,3 +651,49 @@ Python 侧唯一的 `for` 循环在**构造期**装配权重指针表，`forward
 > **还差反向**：目前 C 核心只有前向（判分台 `--c-forward` 只比 logits）。
 > B1 的完整判据（梯度 <1e-3）还需要 C 侧反向，这是下一步。
 > 另外 RoPE 没有独立 kernel，C 里沿用 `x @ R`（置换矩阵，浮点精确）+ `ewise_mul/add`，报告里已注明。
+
+---
+
+## A3 显存：口径修正 + 一个假设被证伪
+
+### ★ 修正：之前用 `nvidia-smi` 轮询量的显存不可靠
+同一份代码，`nvidia-smi` 每 100 ms 采样一次，跑 3 步只有 0.15 s，采样点可能落在初始化中或结束后 ——
+我实测读到过 **2.90 GiB 与 6.17 GiB 两个数**。因此 A3 不能再用它判。
+
+**新口径（`training/harness/a3_mem_parity.py`）**：比**双方分配器的高水位**
+- 我们：`CudaRuntime.pool_stats()['peak_bytes']`
+- PyTorch：`torch.cuda.max_memory_allocated()`
+
+### 用新口径重测（4090）
+
+| seq | tgai_go（分配器峰值） | PyTorch（分配器峰值） | 比值 | 目标 |
+|---|---|---|---|---|
+| 2048 | **4.177 GiB** | 2.966 GiB | **1.41×** | ≤1.2× |
+| 8192 | **9.811 GiB** | 7.101 GiB | **1.38×** | ≤1.2× |
+
+**结论修正**：显存差距是 **1.38~1.41×**，不是之前写的 1.8~2.1×（那是 nvidia-smi 口径虚高）。
+离 A3 的 1.2× 还差约 15~20%，比原先估计的近得多。
+
+### 一个假设被证伪：logits 不是显存大头
+我判断"全词表 logits `[N, V]` 是最大激活"，于是实现了
+`functional.linear_cross_entropy(x, weight, target, chunk=1024)`（按 token 分块算 logits+CE，
+全量 logits 不落地；CPU 与普通路径**逐位一致，差 0.00e+00**）。
+
+实测分块前后：
+
+| seq | 不分块 | 分块 1024 | 变化 |
+|---|---|---|---|
+| 2048 | 4.177 GiB | 4.192 GiB | **无变化** |
+| 8192 | 9.811 GiB | 9.873 GiB | **无变化** |
+
+**说明峰值不是被某一个大缓冲撑起来的**，而是**大量中等缓冲并存**：池的未命中统计里
+8 MB×134、16 MB×96、32 MB×136、2.36 MB×29…… 加起来才是几个 GiB。
+所以下一步要查"谁在峰值时刻还活着"（按分配点归因），而不是继续压单块。
+
+> 分块函数保留（对 V=96000 这类更大词表仍有意义，且已验证与普通路径等价）。
+
+### 过程中修掉的三个真 bug
+1. 我插入 `linear_cross_entropy` 时**把 `@staticmethod` 装饰器错位**，导致 `cross_entropy` 变成实例方法 →
+   CPU 路径 `_cross_entropy_cpu` 收到 `self` 而不是 logits，报 `'_Functional' object has no attribute 'shape'`。
+2. 类内裸写 `min(s0+c, n)` 被**模块级张量 API `min`** 抢走 → CUDA 上抛"max/min 尚未实现"。已改为显式比较。
+3. 类内裸调 `cross_entropy(...)` 是**模块级查找**（不是类属性）→ `NameError`。已改为 `_Functional.cross_entropy(...)`。

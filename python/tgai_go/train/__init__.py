@@ -2087,6 +2087,36 @@ class _Functional:
         return _cuda().ensure_attn_nop()
 
     @staticmethod
+    def linear_cross_entropy(x: Tensor, weight: Tensor, target, chunk: int = 1024):
+        """分块算 logits + cross_entropy，避免把 [N, V] 全量物化。
+
+        V 很大时（32779 / 96000）全量 logits 一步就 1 GiB 以上；按 token 分块后
+        峰值只与 chunk 有关，总 FLOPs 不变。CE 逐行独立，所以按 (块行数/总行数) 加权累加即等价。
+        反向由 autograd 串起来，每块的 dlogits 用完即释放、池可复用。
+        """
+        # 分块只为省显存（VRAM），CPU 侧没有这个动机，直接走普通路径，
+        # 避免 0 维标量相乘在 CPU 广播路径上的边界问题（实测会踩 numpy axis 越界）。
+        if getattr(x, "device", "cpu") != "cuda":
+            return _Functional.cross_entropy(x @ weight.T, target)
+        n = int(x.shape[0])
+        if int(target.shape[0]) != n:
+            raise ValueError("linear_cross_entropy 目标长度 %d != N=%d"
+                             % (int(target.shape[0]), n))
+        c = int(chunk) if chunk else n
+        if c <= 0:
+            c = n
+        total = None
+        for s0 in range(0, n, c):
+            e0 = s0 + c
+            if e0 > n:          # 注意：模块级 min 已被张量 API 占用，这里不能裸写 min
+                e0 = n
+            lg = x[s0:e0] @ weight.T                  # [块行数, V]
+            part = _Functional.cross_entropy(lg, target[s0:e0])   # 块内均值
+            term = part * (float(e0 - s0) / float(n))
+            total = term if total is None else total + term
+        return total
+
+    @staticmethod
     def cross_entropy(logits: Tensor, target, ignore_index=-100):
         """logits [N,V]，target [N]（int）。返回标量 loss（mean）。"""
         if getattr(logits, "device", "cpu") == "cuda":
