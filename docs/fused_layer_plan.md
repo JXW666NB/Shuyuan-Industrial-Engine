@@ -92,3 +92,30 @@ examples/exam2_chat10m_tgai.py   # 增加 --fused 开关（默认开，可回退
 | **P2** | 融合反向（dRMSNorm + dGLU + dAttn） | ~20 ms（1.5×） |
 | **P3** | 整层一个 C 函数（Python 每层 1 次调用） | ~17 ms（1.85×） |
 | **P4** | 定位报告《为什么用 TGAI GO》 | 交付 |
+
+---
+
+## ★ 实现路径已确认（第 1 轮，2026-10-30）
+
+`cuda.py` 里的 CUDA 内核是**源码字符串 + NVRTC 运行时编译**：
+
+- 文件头注释写明：只通过 ctypes 调 **驱动 / cuBLAS / NVRTC**，不 import torch；
+- 内核源码直接嵌在 `cuda.py` 里（例如 `extern "C" __global__ void sgemm_mode(...)` 在 L875、
+  `silu_mul_fwd` 在 L445），由 `_fn(name)` 按需从 NVRTC 模块取函数指针；
+- **没有单独的 .cu 构建步骤** —— 加一个融合核 = 加一段源码字符串 + 一个 `launch()` 封装。
+
+⇒ P1 不需要改构建系统，可以直接在 `cuda.py` 里加：
+
+```python
+# 伪代码：加在现有内核字符串旁边
+extern "C" __global__ void fused_rope_fwd(float* z, const float* cos, const float* sin,
+                                          int rows, int seq, int nh, int dh) { ... }
+```
+再写一个 `def fused_rope_fwd(self, z, cos, sin, seq, nh, dh)` 用 `self.launch(...)`，
+Python 侧 `Tensor._backward` 照 RMSNorm 的模式接（见 `__init__.py` 的 `RMSNorm._forward_cuda`）。
+
+**因此下一轮的第一步**：
+1. 在 `cuda.py` 加 `fused_rope_fwd` 源码 + 封装；
+2. 在 `__init__.py` 加 `T.fused_rope(x, cos, sin)`，反向暂时复用现有 `rope` 的 Python 反向；
+3. 4090 上对拍（与现有 `rope()` 比 fwd 输出，应 ≤1e-6）+ 测单层耗时；
+4. 通过后再做 `fused_attn_fwd`（在线 softmax + 返回 lse），这是 P1 的大头。
