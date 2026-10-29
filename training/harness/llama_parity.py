@@ -147,6 +147,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--cuda", action="store_true")
+    ap.add_argument("--c-forward", dest="c_forward", action="store_true")
     a = ap.parse_args()
 
     cfg = llama_ref.make_cfg(**CFG)
@@ -162,6 +163,26 @@ def main():
         print("  tgai CPU vs CPU: worst=%.3e" % worst)
         ok = worst == 0.0
         print("  VERDICT ok=%s（必须恰好为 0）" % ok)
+        return 0 if ok else 1
+
+    if getattr(a, "c_forward", False):
+        # C 核心（纯 C 编排）只比前向 logits：契约见 tgai_go.presets.llama
+        try:
+            from tgai_go import presets
+        except Exception as ex:
+            print("tgai_go.presets 不可用：%r" % (ex,))
+            return 3
+        if not hasattr(presets, "llama"):
+            print("tgai_go.presets.llama 尚未实现（C 核心的交付目标）")
+            return 3
+        ref = run_torch(cfg, ids, tgt)
+        m = presets.llama(cfg)
+        got = np.asarray(m.forward(ids), np.float64)
+        rl = rel(got, ref["logits"])
+        print("[B1-C 考核] C 核心 llama 前向 vs PyTorch（同权重/同输入）")
+        print("  logits rel = %.3e" % rl)
+        ok = rl < TOL_LOGITS
+        print("  VERDICT ok=%s（判据 logits<%.0e）" % (ok, TOL_LOGITS))
         return 0 if ok else 1
 
     if a.cuda:

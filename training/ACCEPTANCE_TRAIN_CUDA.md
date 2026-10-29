@@ -621,3 +621,33 @@ Grok 引入**惰性转置**（`.T` 不落地，记 `_lazy_T/_lazy_shape`，为 2
 
 > **B1 至此为完全体**（RMSNorm / RoPE / SwiGLU / GQA / causal attn / untied 头，前向与反向都与 PyTorch 对齐）。
 > 下一步是把它搬进 **C 核心**，用同一份 \`llama_parity.py\` 当靶子。
+
+---
+
+## C 核心（第一步）：纯 C 编排的 llama 前向 —— 一次 forward 只跨 Python↔C 一次
+
+**设计**：C 层只做**编排**，不重写 kernel。已有 CUDA kernel（已通过 13/13 与 M1–M3 验证）以
+`CUfunction` 句柄 + `cublasSgemm_v2` 函数指针的形式一次性传给 C；C 里用 `cuLaunchKernel` 自己发射，
+**层循环完全在 C 内**。Python 只负责喂 ids、收 logits。
+
+**交付物**
+- `native/llama_fwd.c`（26 KB）/ `native/llama_fwd.h` / `native/build_llama_fwd.sh`
+- `python/tgai_go/presets.py`（234 行；构造时装配权重指针表，`forward` 单次进 C）
+- 报告 `docs/train_c_core_llama_fwd.md`
+
+**实测（4090，我独立编译并复跑）**
+
+| 项 | 结果 | 判据 |
+|---|---|---|
+| `llama_parity.py --c-forward` logits | **8.664e-06** | <1e-4 ✅ |
+| **一次 forward 的 Python→C 次数** | **1** | ≤2 ✅ |
+| 两次 forward 逐位相同 | **True** | 确定性 ✅ |
+| 迁移一致性 CUDA | **13/13** | 无回归 ✅ |
+| 性能 seq=2048 / seq=8192 | **0.036 / 0.171 s** | 无回归 ✅ |
+
+**我审过源码，确认没有作弊**：`llama_fwd.c` 里没有 `PyObject` / `import` / 任何回调；
+Python 侧唯一的 `for` 循环在**构造期**装配权重指针表，`forward()` 只有一次 `tgai_llama_forward` 调用。
+
+> **还差反向**：目前 C 核心只有前向（判分台 `--c-forward` 只比 logits）。
+> B1 的完整判据（梯度 <1e-3）还需要 C 侧反向，这是下一步。
+> 另外 RoPE 没有独立 kernel，C 里沿用 `x @ R`（置换矩阵，浮点精确）+ `ewise_mul/add`，报告里已注明。
