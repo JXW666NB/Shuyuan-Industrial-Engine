@@ -137,6 +137,25 @@ def rms(x, w, eps=1e-6):
     return x * ((m + T.tensor(np.array([eps], np.float32))) ** -0.5) * w
 
 
+_EMB_CACHE = {}
+_IS_TORCH = getattr(T, "__name__", "") == "torch"
+
+
+def emb_lookup(ids, w, V, D):
+    """按 id 取词向量：用后端的融合 gather（CUDA 上是 1 个 kernel）。
+
+    之前是 `np.eye(V)[ids] @ W`：每步要造一个 [B*S, V] 的稠密矩阵（10M 模型是 7 MB），
+    再做一次稠密 GEMM —— 换成 gather 后这两样都省了。
+    """
+    m = _EMB_CACHE.get(id(w))
+    if m is None:
+        m = T.nn.Embedding(V, D)
+        m.weight = w
+        _EMB_CACHE[id(w)] = m
+    idx = T.tensor(ids) if _IS_TORCH else ids
+    return m(idx)
+
+
 _LN_CACHE = {}
 
 
@@ -221,8 +240,7 @@ def forward(p, ids, cfg):
     D, NH, L, S, V = cfg["D"], cfg["NH"], cfg["L"], cfg["S"], cfg["V"]
     B = int(ids.shape[0])
     DH = D // NH
-    oh = T.tensor(np.eye(V, dtype=np.float32)[np.asarray(ids).reshape(-1)])
-    x = (oh @ p["token_embedding.weight"]).reshape(B, S, D)
+    x = emb_lookup(ids, p["token_embedding.weight"], V, D).reshape(B, S, D)
 
     half = DH // 2
     ang = (np.arange(S, dtype=np.float64)[:, None]

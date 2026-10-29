@@ -2660,10 +2660,9 @@ class Embedding(Module):
         self.weight = Parameter((np.random.randn(num_embeddings, dim) * 0.02).astype(np.float32))
 
     def forward(self, idx):
-        # 与 torch.nn.Embedding 一致：接受 Tensor 或 numpy 索引
+        # 接受 Tensor 或 numpy；CUDA 上走融合 gather 内核（emb_fwd，1 个 kernel）
         if isinstance(idx, Tensor):
             idx = idx.to_numpy() if getattr(idx, "device", "cpu") == "cuda" else idx.data
-        return self.weight[np.asarray(idx, dtype=np.int64)]
         idx = np.asarray(idx, dtype=np.int64)
         if getattr(self.weight, "device", "cpu") == "cuda":
             return self._forward_cuda(idx)
