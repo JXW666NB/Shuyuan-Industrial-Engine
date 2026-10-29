@@ -288,3 +288,36 @@ tg_forward → OSError: access violation reading 0x000000000001A000
 **下一步（第 30 轮）**：组件二分 —— 依次把 block 权重置零（只留 embed+norm+head）、
 再只留注意力、再只留 FFN，逐级定位差异发生在哪个组件。
 脚本 `bisect.py` 已就绪（`zeros` / `attn` 两种模式），但本轮末尾执行时无输出，需先单独跑一次看报错。
+
+### 第 30 轮：组件二分（有数值证据）+ 一条强推论
+
+**拿到了引擎的原始 logits**（绕过 `generate` 的后处理）：
+```python
+lib.tg_forward.restype = ctypes.POINTER(ctypes.c_float)
+cache = lib.tg_kvcache_new(model, 64)
+lp = lib.tg_forward(model, (c_int32*n)(*ids), n, cache, 0)   # lp[i] 就是 logits
+```
+
+| 模型变体（随机权重，同一 seed） | 我们的 top-k | 引擎 top-k | corr |
+|---|---|---|---|
+| `zeros`（block 权重全零 → 只剩 embed→final_norm→head） | `\n` 2.512 / `回` 0.762 / `忘` 0.745 | **完全相同** | ≈1.0 ✅ |
+| `ffn`（只开 FFN，注意力置零） | `规` 0.633 / `灵` 0.547 / `q` 0.525 | **完全相同** | ≈1.0 ✅ |
+| `attn`（只开注意力，FFN 置零） | `近` 0.877 / `世` 0.546 / `当` 0.51 | 排名一致但数值 0.791/0.608/0.579 | 0.83 |
+| `full` | `呀` 0.617 … | `亲` | 0.8334 |
+
+**CPU 引擎与 GPU 引擎结果完全一致（corr 都是 0.8334、首 token 都是 `呀`）**
+⇒ 排除 GPU/bf16 精度问题，是**我们前向与引擎规格的差异**。
+
+**强推论**：把 prompt 换成空串时序列只有 `[0]`（seq=1）——
+此时注意力权重恒为 1、RoPE 对输出无影响、也没有 softmax 歧义，
+但引擎给 `播`、我们给 `模` **仍然不同**
+⇒ 差异落在 **`v_proj` → 缓存 → `out_proj` 这条路**（或 v 的读法/布局），
+而不是 RoPE、softmax、causal mask。
+
+**其余已排除**：RoPE 交错约定与 `theta^(i/dk)`（源码逐行比对 + 拟合分母 32/64/128，32 最好）、
+MoE w1/w2/w3 顺序（源码 L4276-4286 一致）、`n_kv_heads`（引擎 0→n_heads）、注意力 scale（拟合 c 无改善）。
+
+**顺手确认的引擎行为**：OOV 字符 → id **0(pad)**，我们 → 3(unk)。词表不全时会错位。
+
+**下一轮**：针对 `v_proj → out_proj` 做单点验证（seq=1 手算 vs 引擎），
+若确认是 v 的读法问题，修 `export.py` 的写入布局或引擎侧的 v 读取。
