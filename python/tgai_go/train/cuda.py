@@ -445,6 +445,26 @@ extern "C" __global__ void silu_mul_fwd(float* a, const float* b, int n) {
     }
 }
 
+/* b==1 的特例：不分配全 1 缓冲。对有限数，少乘一次 1 与 silu_mul_fwd 逐位相同。 */
+extern "C" __global__ void silu_fwd_inplace(float* a, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        float y, d;
+        silu32_pair(a[i], &y, &d);
+        a[i] = y;
+    }
+}
+
+extern "C" __global__ void silu_bwd_da(const float* g, const float* a, float* da, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        float y, dsilu;
+        silu32_pair(a[i], &y, &dsilu);
+        (void)y;
+        da[i] = __fmul_rn(g[i], dsilu);
+    }
+}
+
 extern "C" __global__ void emb_gather_fwd(float* out, const float* emb, const int* ids,
                                           int seq, int d, int vocab, int unk) {
     int t = (int)blockIdx.x;
@@ -1318,15 +1338,21 @@ def attn_nop_source_path():
 
 
 class GpuBuf:
-    """一块设备内存。由创建它的 CudaRuntime 释放。不要复制 ptr 到第二个 GpuBuf。"""
+    """一块设备内存。由创建它的 CudaRuntime 释放。
+
+    视图（reshape）共用同一 ptr，但 _token 为空，析构不归还池。
+    keepalive 拉住被视图的那一块，避免主人先死。不要再把同一个 ptr
+    登记成第二个会 free 的主人。
+    """
 
     __slots__ = ("rt", "ptr", "nbytes", "shape", "n", "dtype",
-                 "known_scalar", "host_hold", "keepalive", "_token")
+                 "known_scalar", "host_hold", "keepalive", "_token", "_base")
 
-    def __init__(self, rt, ptr, nbytes, shape, n, dtype):
+    def __init__(self, rt, ptr, nbytes, shape, n, dtype, view_of=None):
         self.rt = rt
         self.ptr = int(ptr)
         self._token = None
+        self._base = None
         self.nbytes = int(nbytes)
         self.shape = tuple(shape)
         self.n = int(n)
@@ -1337,7 +1363,13 @@ class GpuBuf:
         self.host_hold = None
         # 让还没跑完的 kernel 依赖的临时缓冲跟着本缓冲一起活。
         self.keepalive = None
-        if rt is not None and self.ptr:
+        if view_of is not None:
+            base = getattr(view_of, "_base", None) or view_of
+            self._base = base
+            self.keepalive = view_of
+            if int(n) == 1:
+                self.known_scalar = getattr(view_of, "known_scalar", None)
+        elif rt is not None and self.ptr:
             self._token = rt._pool_token_of(self.ptr)
 
     def __del__(self):
@@ -2719,7 +2751,12 @@ class CudaRuntime:
         return self.reshape(C3, out_lead + (M, N))
 
     def reshape(self, buf, shape):
-        """C 顺序重解释。字节序不变，所以反向也只是再解释一次。"""
+        """C 顺序重解释。本运行时的缓冲都是打包连续的，只改形状元数据。
+
+        以前每次都 cuMemcpyDtoD 一份新缓冲。seq=8192 上前向和反向各累计约 512 MiB，
+        而且图还活着，池子腾不出来。元素个数必须相等；不连续的 permute 结果
+        本身已经是新的连续缓冲，再 reshape 仍然是视图。
+        """
         shape = tuple(int(s) for s in shape)
         if any(s < 0 for s in shape):
             raise CudaError("reshape 不支持负数维度 %s" % (shape,))
@@ -2728,16 +2765,7 @@ class CudaRuntime:
             n *= int(s)
         if n != int(buf.n):
             raise CudaError("reshape %s -> %s 元素个数 %d != %d" % (buf.shape, shape, buf.n, n))
-        out = self.empty(shape, dtype=buf.dtype)
-        if n:
-            self._mark_submitted(buf.ptr)
-            self._mark_submitted(out.ptr)
-            self._activate()
-            self._chk(self.cu.cuMemcpyDtoD(
-                ctypes.c_uint64(out.ptr),
-                ctypes.c_uint64(buf.ptr),
-                ctypes.c_size_t(n * int(buf.dtype.itemsize))), "cuMemcpyDtoD(reshape)")
-        return out
+        return GpuBuf(self, buf.ptr, buf.nbytes, shape, n, buf.dtype, view_of=buf)
 
     def swap_last2(self, buf):
         if len(buf.shape) < 2:
@@ -2897,6 +2925,19 @@ class CudaRuntime:
                 (int(a.n), ctypes.c_int),
             ])
         return out
+
+    def scale_inplace(self, a, scalar):
+        """c[i] = a[i] * s 写回 a。每个线程只碰自己的下标，可以和输入同址。"""
+        scalar = float(scalar)
+        if a.n and scalar != 1.0:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_scale", grid, block, [
+                self._ptr(a), (scalar, ctypes.c_float), self._ptr(a),
+                (int(a.n), ctypes.c_int),
+            ])
+        if a.n == 1 and a.known_scalar is not None:
+            a.known_scalar = float(a.known_scalar) * scalar
+        return a
 
     def _sgemm(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
         if m == 0 or n == 0 or k == 0:
@@ -3245,8 +3286,11 @@ class CudaRuntime:
                     (M, ctypes.c_int), (N, ctypes.c_int),
                 ])
             Cs.append(C)
+        # 设备垫片只活到本函数返回：kernel 已排进默认流，下一次复用排在它们之后。
+        # 主机上的 alpha/beta 是按值传入的，cublas 返回后不再读。别把 Ap/Bp/Cp
+        # 挂在梯度上活过整个反传，那是一份和 token 数成正比的额外占用。
         if Cs:
-            Cs[0].keepalive = (Ap, Bp, Cp, alpha, beta)
+            Cs[0].keepalive = (alpha, beta)
         return Cs
 
     def grouped_tn(self, As, Bs):
@@ -3310,10 +3354,21 @@ class CudaRuntime:
         loss.keepalive = terms
         return loss
 
-    def ce_bwd(self, logits, targets, n, v):
+    def ce_bwd(self, logits, targets, n, v, out=None):
+        """out 与 logits 可以是同一块。
+
+        写阶段每个线程只读自己即将覆盖的元素，max/sum 在写之前已经归约完，
+        所以原地写 dlogits 与另开缓冲逐位相同。调用方必须保证没有第二个读者。
+        """
         n = int(n)
         v = int(v)
-        dl = self.empty((n, v), dtype=np.float32)
+        if out is None:
+            dl = self.empty((n, v), dtype=np.float32)
+        else:
+            if tuple(int(s) for s in out.shape) != (n, v) or int(out.n) != n * v:
+                raise CudaError("ce_bwd 输出形状 %s 不是 (%d, %d)" % (out.shape, n, v))
+            dl = out
+            dl.known_scalar = None
         if n > 0 and v > 0:
             self.launch("ce_bwd", (n, 1, 1), (256, 1, 1), [
                 self._ptr(logits), self._ptr(targets), self._ptr(dl),
@@ -3387,6 +3442,28 @@ class CudaRuntime:
                 self._ptr(a), self._ptr(b), (int(a.n), ctypes.c_int),
             ])
         return a
+
+    def silu_fwd_inplace(self, a):
+        """原地 a[i] = silu(a[i])。b 恒为 1 时用这个，省掉一份全 1。"""
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("silu_fwd_inplace", grid, block, [
+                self._ptr(a), (int(a.n), ctypes.c_int),
+            ])
+        return a
+
+    def silu_bwd_da(self, g, a):
+        """da = g * dsilu(a)，对应 b==1 且不需要 db。"""
+        if g.n != a.n:
+            raise CudaError("silu_bwd_da 长度不同: %s vs %s" % (g.n, a.n))
+        da = self.empty(a.shape, dtype=np.float32)
+        n = int(a.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("silu_bwd_da", grid, block, [
+                self._ptr(g), self._ptr(a), self._ptr(da), (n, ctypes.c_int),
+            ])
+        return da
 
     def silu_mul_bwd(self, g, a, b):
         da = self.empty(a.shape, dtype=np.float32)

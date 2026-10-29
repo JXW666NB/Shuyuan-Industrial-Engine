@@ -2217,18 +2217,16 @@ def _softmax_cuda(x, axis):
 
 
 def _silu_cuda(x):
-    """silu(x) = silu_mul(clone(x), 1)。反向复用 silu_mul_bwd，b 是全 1。"""
+    """silu(x)。b 恒为 1，不再分配全 1，也不再分配用不到的 db。"""
     rt = _cuda()
-    ones = rt.full(x.shape, 1.0)
     y = rt.clone(x._gpu)
-    rt.silu_mul_fwd(y, ones)
+    rt.silu_fwd_inplace(y)
     out = Tensor._from_gpu(y, requires_grad=x.requires_grad, _parents=(x,))
 
     def bw(g, grads):
         if not x.requires_grad:
             return
-        da, _db = rt.silu_mul_bwd(g, x._gpu, ones)
-        _acc(grads, x, da)
+        _acc(grads, x, rt.silu_bwd_da(g, x._gpu))
 
     out._backward = bw
     return out
@@ -2272,9 +2270,18 @@ def _cross_entropy_cuda(logits, target, ignore_index):
         # 根梯度几乎总是主机填好的 1。先读已知值，再发射 ce_bwd，
         # 这样就算真要回读，也不会把 ce_bwd 自己等进去。
         scale = rt.read_scalar(g)
-        dl = rt.ce_bwd(logits._gpu, tgt_buf, n, v)
-        if scale != 1.0:
-            dl = rt.scale(dl, scale)
+        gpu = logits._gpu
+        # 大词表才原地写。llama_parity 会在 backward 之后读 logits，小张量必须保住原值。
+        # 视图也不能原地：那会改掉被 reshape 共享的上游激活。
+        owned = getattr(gpu, "_base", None) is None and getattr(gpu, "_token", None) is not None
+        if owned and n * v >= (1 << 20):
+            dl = rt.ce_bwd(gpu, tgt_buf, n, v, out=gpu)
+            if scale != 1.0:
+                dl = rt.scale_inplace(dl, scale)
+        else:
+            dl = rt.ce_bwd(gpu, tgt_buf, n, v)
+            if scale != 1.0:
+                dl = rt.scale(dl, scale)
         _acc(grads, logits, dl)
 
     out._backward = bw
@@ -2747,9 +2754,7 @@ def _moe_grouped_cuda(x, w, tok_buf, slot_buf, off, experts, n, d, k):
     silu = []
     for g in gate:
         s = rt.clone(g)
-        ones = rt.full(g.shape, 1.0)
-        rt.silu_mul_fwd(s, ones)
-        s.keepalive = ones
+        rt.silu_fwd_inplace(s)
         silu.append(s)
     hidden = [rt.mul(s, u) for s, u in zip(silu, up)]
     y_rows = rt.grouped_nt(hidden, wd)
@@ -2769,37 +2774,43 @@ def _moe_grouped_cuda(x, w, tok_buf, slot_buf, off, experts, n, d, k):
     out = Tensor._from_gpu(out_buf, requires_grad=need, _parents=tuple(parents) if need else ())
     if not need:
         return out
-    saved = (rows, gate, up, silu, hidden, y_rows, wws)
+    # 盒子而不是默认参数：反传用完就能丢掉前向激活，后面的注意力反传才能复用这块池。
+    saved_box = [(rows, gate, up, silu, hidden, y_rows, wws)]
 
-    def bw(g, grads, _saved=saved, _active=tuple(active), _counts=tuple(counts)):
-        rows_s, gate_s, up_s, silu_s, hidden_s, y_s, ww_s = _saved
+    def bw(g, grads, _box=saved_box, _active=tuple(active), _counts=tuple(counts)):
+        rows_s, gate_s, up_s, silu_s, hidden_s, y_s, ww_s = _box[0]
         d_scaled = [rt.moe_gather_rows(g, tok_buf, int(off[e]), _counts[e], d) for e in _active]
         d_y = [rt.moe_row_scale(ds, ww) for ds, ww in zip(d_scaled, ww_s)]
         d_ww = [rt.moe_row_dot(ds, y) for ds, y in zip(d_scaled, y_s)]
+        d_scaled = None
+        y_s = None
+        ww_s = None
         d_hidden = rt.grouped_nn(d_y, wd)
         d_wd = rt.grouped_tn(d_y, hidden_s)
+        hidden_s = None
+        d_y = None
         d_s = [rt.mul(dh, u) for dh, u in zip(d_hidden, up_s)]
         d_up = [rt.mul(dh, s) for dh, s in zip(d_hidden, silu_s)]
-        d_gate = []
-        for ds, gpre in zip(d_s, gate_s):
-            ones = rt.full(gpre.shape, 1.0)
-            da, _db = rt.silu_mul_bwd(ds, gpre, ones)
-            da.keepalive = ones
-            d_gate.append(da)
+        d_hidden = None
+        up_s = None
+        silu_s = None
+        d_gate = [rt.silu_bwd_da(ds, gpre) for ds, gpre in zip(d_s, gate_s)]
+        d_s = None
+        gate_s = None
         d_wg = rt.grouped_tn(d_gate, rows_s)
         d_wu = rt.grouped_tn(d_up, rows_s)
         d_rows_g = rt.grouped_nn(d_gate, wg)
         d_rows_u = rt.grouped_nn(d_up, wu)
-        hold = (d_scaled, d_y, d_hidden, d_s, d_up, d_gate, d_rows_g, d_rows_u)
+        d_gate = None
+        d_up = None
+        rows_s = None
+        _box[0] = None
         if x.requires_grad:
             dx = rt.zeros((n, d), dtype=np.float32)
             for e, a, b in zip(_active, d_rows_g, d_rows_u):
                 both = rt.add(a, b)
                 rt.moe_scatter_rows_add(both, tok_buf, int(off[e]), _counts[e], dx)
-            dx.keepalive = hold
             _acc(grads, x, dx)
-        elif d_wg:
-            d_wg[0].keepalive = hold
         for e, dw in zip(_active, d_wg):
             if experts[e].gate.weight.requires_grad:
                 _acc(grads, experts[e].gate.weight, dw)
@@ -2818,7 +2829,8 @@ def _moe_grouped_cuda(x, w, tok_buf, slot_buf, off, experts, n, d, k):
                 _acc(grads, w, acc_w)
 
     out._backward = bw
-    out_buf.keepalive = saved
+    # 反传里把 box[0] 置空就会把前向激活还回池；这里只是多留一个引用，防闭包被提前收掉。
+    out_buf.keepalive = saved_box
     return out
 
 

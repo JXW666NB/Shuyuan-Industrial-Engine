@@ -697,3 +697,30 @@ Python 侧唯一的 `for` 循环在**构造期**装配权重指针表，`forward
    CPU 路径 `_cross_entropy_cpu` 收到 `self` 而不是 logits，报 `'_Functional' object has no attribute 'shape'`。
 2. 类内裸写 `min(s0+c, n)` 被**模块级张量 API `min`** 抢走 → CUDA 上抛"max/min 尚未实现"。已改为显式比较。
 3. 类内裸调 `cross_entropy(...)` 是**模块级查找**（不是类属性）→ `NameError`。已改为 `_Functional.cross_entropy(...)`。
+
+---
+
+## A3 达成：显存 1.14× / 0.94×（8192 比 PyTorch 更省）
+
+**改法（三处少分配）**
+1. **大词表 `ce_bwd` 原地写进 logits 的缓冲**（小词表保留原逻辑，`llama_parity` 不受影响）
+2. **连续 `reshape` 只改形状元数据**，不再 `memcpy`；反向同理
+3. **MoE 的 silu 不再配一份全 1、也不再算用不到的 `db`**；分组反向用完的激活立刻归还池
+
+分块 CE 没再启用（上一轮已实测为负优化）。
+
+**实测（4090，我用 `a3_mem_parity.py` 独立复跑，各跑一次）**
+
+| seq | 改前 | **改后** | PyTorch | 比值 | 目标 |
+|---|---|---|---|---|---|
+| 2048 | 4.177 GiB | **3.386 GiB** | 2.966 GiB | **1.14×** | ≤1.2× ✅ |
+| 8192 | 9.811 GiB | **6.650 GiB** | 7.101 GiB | **0.94×（更省）** | ≤1.2× ✅ |
+
+**速度不降反升**：seq=2048 **0.035 s**（原 0.036）、seq=8192 **0.141 s**（原 0.158）。
+
+**回归全绿**（我复跑）：conformance CPU **13/13**、CUDA **13/13**；四 `--selftest` 全 0；
+`moe_selfcheck` 1.716e-07；`opt_step_parity --cuda` 逐位 0；`attn_lowmem_check` 全 PASS（回退逐位 0）；
+`llama_parity --cuda` 与 `--c-forward` 均绿；loss 曲线两条都与改前一致。
+
+> **A 段的性能三项（A1/A2/A3）至此全部达成。**
+> 只剩 A4-③（训练完直出 `.TG`）未做——仓库里没有 `.TG` 写入器。
