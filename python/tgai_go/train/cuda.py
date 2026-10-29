@@ -373,6 +373,12 @@ extern "C" __global__ void ewise_recip(const float* a, float* c, int n) {
     if (i < n) c[i] = __fdiv_rn(1.f, a[i]);
 }
 
+/* 标量指数。GPT-2 的 sigmoid / LayerNorm 用 x**(-1) 和 x**(-0.5)。 */
+extern "C" __global__ void ewise_pow(const float* a, float p, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = powf(a[i], p);
+}
+
 /* One block, 256 threads. The launch site must use that block size. */
 extern "C" __global__ void reduce_sum(const float* a, float* out, int n) {
     __shared__ float smem[256];
@@ -2913,6 +2919,19 @@ class CudaRuntime:
             grid, block = self._ewise_grid(a.n)
             self.launch("ewise_recip", grid, block, [
                 self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def pow_scalar(self, a, p):
+        """逐元素 a ** p。p 是 Python 标量，在核里按 float32 使用。"""
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            if int(a.n) > 2147483647:
+                raise CudaError("pow 元素个数超过 int32")
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_pow", grid, block, [
+                self._ptr(a), (float(p), ctypes.c_float), self._ptr(out),
+                (int(a.n), ctypes.c_int),
             ])
         return out
 

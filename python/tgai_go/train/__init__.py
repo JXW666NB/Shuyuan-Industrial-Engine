@@ -468,6 +468,26 @@ class no_grad:
         return False
 
 
+def _broadcast_shape(sa, sb):
+    """右对齐广播后的形状，规则与 numpy 相同，最高 8 维。"""
+    sa = tuple(int(s) for s in sa)
+    sb = tuple(int(s) for s in sb)
+    ndim = len(sa) if len(sa) > len(sb) else len(sb)
+    if ndim > 8:
+        raise NotImplementedError("CUDA 广播最高 8 维，收到 %s 与 %s" % (sa, sb))
+    pa = (1,) * (ndim - len(sa)) + sa
+    pb = (1,) * (ndim - len(sb)) + sb
+    out = []
+    for x, y in zip(pa, pb):
+        if x == y or x == 1:
+            out.append(y if x == 1 else x)
+        elif y == 1:
+            out.append(x)
+        else:
+            raise ValueError("形状不能广播: %s vs %s" % (sa, sb))
+    return tuple(out)
+
+
 def _unbroadcast(grad, shape):
     """把广播后的梯度还原到原形状（torch 的 sum_to_size 语义）。"""
     if grad.shape == shape:
@@ -694,19 +714,31 @@ class Tensor:
             other = _as_tensor(other)
         if self.device != "cuda" or other.device != "cuda":
             raise RuntimeError("mul 不能混用 CPU 和 CUDA 张量")
-        if self.shape != other.shape:
-            raise NotImplementedError(
-                "CUDA mul 目前只支持同形状，收到 %s * %s" % (self.shape, other.shape))
-        buf = rt.mul(self._gpu, other._gpu)
+        a_shape = tuple(int(s) for s in self.shape)
+        b_shape = tuple(int(s) for s in other.shape)
+        a, b = self._gpu, other._gpu
+        if a_shape == b_shape:
+            buf = rt.mul(a, b)
+            out_shape = a_shape
+        else:
+            out_shape = _broadcast_shape(a_shape, b_shape)
+            aa = a if a_shape == out_shape else rt.broadcast_to(a, out_shape)
+            bb = b if b_shape == out_shape else rt.broadcast_to(b, out_shape)
+            buf = rt.mul(aa, bb)
         rg = self.requires_grad or other.requires_grad
         out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
-        a, b = self._gpu, other._gpu
 
         def bw(g, grads):
             if self.requires_grad:
-                _acc(grads, self, rt.mul(g, b))
+                rhs = b if b_shape == out_shape else rt.broadcast_to(b, out_shape)
+                prod = rt.mul(g, rhs)
+                src = prod if a_shape == out_shape else rt.unbroadcast(prod, a_shape)
+                _acc(grads, self, src)
             if other.requires_grad:
-                _acc(grads, other, rt.mul(g, a))
+                lhs = a if a_shape == out_shape else rt.broadcast_to(a, out_shape)
+                prod = rt.mul(g, lhs)
+                src = prod if b_shape == out_shape else rt.unbroadcast(prod, b_shape)
+                _acc(grads, other, src)
         out._backward = bw
         return out
 
@@ -975,6 +1007,8 @@ class Tensor:
         return out
 
     def __pow__(self, p):
+        if self.device == "cuda":
+            return self._pow_cuda(p)
         out = Tensor(self.data ** p, requires_grad=self.requires_grad, _parents=(self,))
 
         def bw(g, grads):
@@ -982,14 +1016,53 @@ class Tensor:
         out._backward = bw
         return out
 
+    def _pow_cuda(self, p):
+        """标量指数。前向 powf，反向 g * p * x**(p-1)，与 CPU 同一公式。"""
+        if isinstance(p, Tensor):
+            raise NotImplementedError("CUDA pow 的指数目前只支持标量，不支持张量")
+        if isinstance(p, (bool, np.bool_)):
+            raise TypeError("pow 的指数不能是 bool")
+        if not isinstance(p, (int, float, np.floating, np.integer)):
+            raise NotImplementedError("CUDA pow 的指数目前只支持标量，收到 %r" % (type(p).__name__,))
+        pf = float(p)
+        rt = _cuda()
+        x = self._gpu
+        buf = rt.pow_scalar(x, pf)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+        in_shape = tuple(int(s) for s in self.shape)
+
+        def bw(g, grads, _p=pf, _x=x, _shape=in_shape):
+            if not self.requires_grad:
+                return
+            # p==0 时 x**(p-1) 会变成无穷，梯度按定义是 0。
+            if _p == 0.0:
+                _acc(grads, self, rt.zeros(_shape))
+                return
+            xp = rt.pow_scalar(_x, _p - 1.0)
+            _acc(grads, self, rt.scale(rt.mul(g, xp), _p))
+        out._backward = bw
+        return out
+
     def exp(self):
         if self.device == "cuda":
-            self._cpu_only("exp")
+            return self._exp_cuda()
         e = np.exp(self.data)
         out = Tensor(e, requires_grad=self.requires_grad, _parents=(self,))
 
         def bw(g, grads):
             _acc(grads, self, g * e)
+        out._backward = bw
+        return out
+
+    def _exp_cuda(self):
+        rt = _cuda()
+        buf = rt.exp(self._gpu)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+        y = buf
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.mul(g, y))
         out._backward = bw
         return out
 
@@ -1005,9 +1078,9 @@ class Tensor:
 
     def sum(self, axis=None, keepdims=False):
         if self.device == "cuda":
-            if axis is not None or keepdims:
-                raise NotImplementedError("CUDA sum 目前只支持全归约")
-            return self._sum_cuda()
+            if axis is None and not keepdims:
+                return self._sum_cuda()
+            return self._sum_axis_cuda(axis, keepdims)
         out = Tensor(self.data.sum(axis=axis, keepdims=keepdims),
                      requires_grad=self.requires_grad, _parents=(self,))
         shape = self.shape
@@ -1032,9 +1105,66 @@ class Tensor:
         out._backward = bw
         return out
 
+    def _sum_axis_cuda(self, axis, keepdims):
+        """单轴求和，或 keepdims 的全归约。反向把梯度广播回原形状。"""
+        rt = _cuda()
+        shape = tuple(int(s) for s in self.shape)
+        nd = len(shape)
+        if isinstance(axis, (tuple, list)):
+            raise NotImplementedError("CUDA sum 目前只支持单轴或全归约，收到 %r" % (axis,))
+        if axis is None:
+            buf = rt.sum_all(self._gpu)
+            if keepdims and nd:
+                buf = rt.reshape(buf, (1,) * nd)
+            out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+
+            def bw_all(g, grads):
+                if self.requires_grad:
+                    _acc(grads, self, rt.full(shape, rt.read_scalar(g)))
+            out._backward = bw_all
+            return out
+        ax = int(axis)
+        if ax < 0:
+            ax += nd
+        if nd == 0 or ax < 0 or ax >= nd:
+            raise ValueError("sum 轴 %s 越界（shape=%s）" % (axis, shape))
+        buf = rt.sum_axis(self._gpu, ax, keepdims=bool(keepdims))
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+        dropped = not bool(keepdims)
+
+        def bw(g, grads, _ax=ax, _drop=dropped, _shape=shape):
+            if not self.requires_grad:
+                return
+            gg = g
+            if _drop:
+                gs = [int(s) for s in g.shape]
+                gs.insert(_ax, 1)
+                gg = rt.reshape(g, tuple(gs))
+            if tuple(int(s) for s in gg.shape) != _shape:
+                gg = rt.broadcast_to(gg, _shape)
+            _acc(grads, self, gg)
+        out._backward = bw
+        return out
+
     def mean(self, axis=None, keepdims=False):
         if self.device == "cuda":
-            self._cpu_only("mean")
+            if isinstance(axis, (tuple, list)):
+                raise NotImplementedError("CUDA mean 目前只支持单轴或全归约，收到 %r" % (axis,))
+            shape = tuple(int(s) for s in self.shape)
+            if axis is None:
+                n = 1
+                for s in shape:
+                    n *= int(s)
+            else:
+                ax = int(axis)
+                if ax < 0:
+                    ax += len(shape)
+                if not shape or ax < 0 or ax >= len(shape):
+                    raise ValueError("mean 轴 %s 越界（shape=%s）" % (axis, shape))
+                n = int(shape[ax])
+            if n == 0:
+                raise ValueError("mean 的归约长度是 0（shape=%s, axis=%s）" % (shape, axis))
+            return self.sum(axis=axis, keepdims=keepdims) * (1.0 / float(n))
         n = self.data.size if axis is None else self.data.shape[axis]
         return self.sum(axis=axis, keepdims=keepdims) * (1.0 / n)
 

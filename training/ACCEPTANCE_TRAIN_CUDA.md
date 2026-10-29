@@ -724,3 +724,40 @@ Python 侧唯一的 `for` 循环在**构造期**装配权重指针表，`forward
 
 > **A 段的性能三项（A1/A2/A3）至此全部达成。**
 > 只剩 A4-③（训练完直出 `.TG`）未做——仓库里没有 `.TG` 写入器。
+
+---
+
+## B2：GPT-2 预设 —— CPU 与 CUDA 都与 PyTorch 对齐
+
+**新增**：\`training/harness/gpt2_ref.py\`（薄定义）+ \`training/harness/gpt2_parity.py\`（判分台）。
+与 llama 的差异正是"一套核心、多套架构"要覆盖的点：
+**LayerNorm（带 gamma/beta 偏置）**、**GELU-tanh（gelu_new）**、**学习式位置 wpe**、
+**所有线性层带 bias**、MHA（无 GQA）、**untied 输出头**（\`tie=True\` 可切换成真实 GPT-2 的共享头）。
+
+**实测（我独立复跑，4090）**
+
+| 模式 | logits 相对误差 | 梯度最差 | 判定 |
+|---|---|---|---|
+| 自证（CPU vs CPU） | **0.000e+00** | — | ✅ 必须为 0 |
+| **CPU** vs PyTorch | **1.905e-07** | 3.852e-07 | ✅ |
+| **CUDA** vs PyTorch | **1.857e-07** | 4.321e-07 | ✅ |
+
+判据 logits<1e-4、梯度<1e-3，两边都远好于要求。
+
+### 为跑通 GPT-2 补上的 CUDA 算子（也是普通用户能用的）
+| 算子 | 说明 |
+|---|---|
+| \`mean(axis, keepdims)\` | 单轴/全归约 + 反向（除以轴长后广播回去）；与 numpy 最大绝对误差 **1.19e-07** |
+| \`sum(axis)\` | 单轴归约（反向广播） |
+| \`exp\` | 用已有 \`expf\`；与 CPU 差约 2e-6（float32 舍入，不是公式错） |
+| \`pow\`（标量指数） | 新内核 \`ewise_pow\` |
+| **广播乘法** | 之前 CUDA 的 \`mul\` 只支持同形状，现支持广播 |
+
+> 这批算子补上后，**用户可以在 CUDA 上自己写 LayerNorm / GELU / 任意 mean-pow 组合**，
+> 不再受"只有 RMSNorm/SiLU"限制。
+
+**回归（我复跑）**：conformance CPU **13/13**、CUDA **13/13**；四 \`--selftest\` 全 0；
+\`moe_selfcheck\` 1.716e-07；\`opt_step_parity --cuda\` 逐位 0；\`attn_lowmem_check\` 5 项全 PASS；
+\`llama_parity --cuda\` 与 \`--c-forward\` 绿；性能 **0.035 / 0.144 s**、显存 **6.650 GiB** 均未退。
+
+**B2 尚缺**：加载**真实 GPT-2 权重**对齐 logits（需要下载官方权重 + 其 BPE，属于另一步）。
