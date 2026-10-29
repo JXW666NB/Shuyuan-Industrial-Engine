@@ -1,71 +1,41 @@
 # -*- coding: utf-8 -*-
-"""考试一：只输出「鹈鹕骑自行车」或「自行车骑行鹈鹕」的模型（**非预设架构**）。
+"""考试一（重做版）：只输出「鹈鹕骑自行车」或「自行车骑行鹈鹕」的非预设架构模型。
 
-本文件与 `exam1_pelican_torch.py` 的区别**只有两处**：
-  ① 文件头的导入 / 保存实现（SHIM 段）
-  ② 无其它差异 —— 模型定义、前向、训练循环、生成校验逐字节相同。
+TGAI 版与 PyTorch 版**只有 SHIM 段不同**（导入 + 保存格式），其余逐字节相同。
 
-用 diff 验证：
-    diff exam1_pelican_tgai.py exam1_pelican_torch.py
+产物：
+  pelican.TG           模型（TGAI 格式）
+  pelican.tokens.txt   TGAI GO 训出来的分词表（`id<TAB>token`）
+  pelican.TG.meta.json 训练元信息
+  log_e1_*.csv         逐步 loss / ppl / 耗时
 """
 import argparse
+import json
 import os
 import sys
+import time
 
 import numpy as np
 
-# ═══════════════ SHIM ①：导入（PyT 版就换成 torch）═══════════════
+# === SHIM-IMPORT-BEGIN ===
 import tgai_go.train as torch
-# ══════════════════════════════════════════════════════════════
+# === SHIM-END ===
 
 T = torch
-# 两边都成立：torch 走 nn.functional，TGAI 回落到 functional
 F = getattr(getattr(T, "nn", None), "functional", None) or getattr(T, "functional")
 
-# ★ 引擎 add_bos 加的是 id 0（pad），不是我们的 <bos>=1；
-#   引擎对空 prompt 给的是 [0, 0]，所以训练必须**从这个上下文出发**。
-#
-# ★★ 关键：两句话如果共用同一个前缀 [0,0]，位置 1 的"下一词"有歧义
-#    （可能是"鹈"也可能是"自"）⇒ 模型只能折中输出 <pad>，永远学不出来。
-#    ⇒ 主句（鹈鹕骑自行车）从 [0,0] 出发；第二句用"喂首字"的方式单独成一条。
-PREFIX = [0, 0]                                   # 引擎 encode("", add_bos=True) -> [0, 0]
-PRIMED = [("", "鹈鹕骑自行车<eos>"),               # 空 prompt ⇒ 这句
-          ("鹈鹕骑", "自行车<eos>")]               # 喂 "鹈鹕骑" ⇒ 接着说出"自行车"
+# 引擎 encode("", add_bos=True) == [0, 0]；两句话共用同一前缀会让位置 1 有歧义，
+# 所以主句独占 [0,0]，第二句用"喂首字"的方式单独成一条。
+PREFIX = [0, 0]
+PRIMED = [("", "鹈鹕骑自行车<eos>"),
+          ("鹈鹕骑", "自行车<eos>")]
 
-
-# ═══════════════ SHIM ②：保存（.TG 只有 TGAI 能写）═══════════════
-def save_artifacts(path, params, vocab, meta):
-    import os as _os
-    from tgai_go.train.export import save_tg
-    # TG_NEXP：把单专家复制成 N 份（用于验证引擎是否支持 n_experts==1）
-    ne = int(_os.environ.get("TG_NEXP", "1"))
-    if ne > 1:
-        for i in range(meta["L"]):
-            src = "blocks.%d.moe.experts.0." % i
-            for e in range(1, ne):
-                for w in ("w1", "w2", "w3"):
-                    params["blocks.%d.moe.experts.%d.%s.weight" % (i, e, w)] = params[src + w + ".weight"]
-    import os as _os2
-    _pv = int(_os2.environ.get("TG_PAD_VOCAB", "0"))
-    if _pv and len(vocab) < _pv:
-        add = _pv - len(vocab)
-        vocab = list(vocab) + ["<x%d>" % i for i in range(add)]
-        w = params["token_embedding.weight"]
-        params["token_embedding.weight"] = np.vstack(
-            [w, np.zeros((add, w.shape[1]), np.float32)])
-        meta = dict(meta, V=_pv)
-        print("词表补齐: %d -> %d" % (_pv - add, _pv))
-    save_tg(path, params, n_layers=meta["L"], d_model=meta["D"], n_heads=meta["NH"],
-            d_ff=meta["FF"], vocab_tokens=vocab, merges=[], max_seq=64,   # ★ 不能只写训练长度 9：
-            #   引擎按 max_seq 决定 RoPE 表长度，太短会拒绝 generate(max_tokens>max_seq)
-            n_experts=ne, n_activated=1, rope_theta=10000.0,
-            special_ids=[0, 1, 2, 3], weight_dtype=0)
-# ══════════════════════════════════════════════════════════════
+CFG = dict(D=128, NH=4, L=2, FF=256)
 
 
 def build_vocab():
     chars = sorted(set("".join(pm + tx for pm, tx in PRIMED)
-                    .replace("<eos>", "").replace("<bos>", "")))
+                       .replace("<eos>", "").replace("<bos>", "")))
     toks = ["<pad>", "<bos>", "<eos>", "<unk>"] + chars
     return toks, {c: i for i, c in enumerate(toks)}
 
@@ -91,22 +61,23 @@ def silu(x):
     return x * ((T.tensor(np.array([1.0], np.float32)) + (-x).exp()) ** -1.0)
 
 
-def rope(x, cos, sin):
-    """**交错式** RoPE：out[2k] = -x[2k+1], out[2k+1] = x[2k]。
+_ROPE_CACHE = {}
 
-    引擎（V3 血统）用交错式；之前用"半切"时引擎能跑但输出错句
-    （'自行车骑自行车' 而不是 '鹈鹕骑自行车'）—— 这就是约定不一致。
-    用置换矩阵实现：rot = x @ P，两个后端都支持、且可求导。
+
+def rope(x, cos, sin, dh):
+    """交错式 RoPE，用置换矩阵实现（两个后端都支持、可求导）。
+
+    ★ 必须是 x @ P.T —— 用 x @ P 会得到半切配对，和引擎对不上（上一轮定位到的真 BUG）。
     """
-    dh = int(x.shape[-1])
-    P = np.zeros((dh, dh), np.float32)
-    for j in range(dh):
-        if j % 2 == 0:
-            P[j, j + 1] = -1.0
-        else:
-            P[j, j - 1] = 1.0
-    rot = x @ T.tensor(P.T.copy())   # ★ P 的转置：x@P 是半切配对，x@P.T 才是交错配对
-    return x * cos + rot * sin
+    if dh not in _ROPE_CACHE:
+        P = np.zeros((dh, dh), np.float32)
+        for j in range(dh):
+            if j % 2 == 0:
+                P[j + 1, j] = -1.0
+            else:
+                P[j - 1, j] = 1.0
+        _ROPE_CACHE[dh] = T.tensor(P)
+    return x * cos + (x @ _ROPE_CACHE[dh]) * sin
 
 
 def make_model(cfg, rng):
@@ -138,8 +109,8 @@ def forward(p, ids, cfg):
     D, NH, L, S, V = cfg["D"], cfg["NH"], cfg["L"], cfg["S"], cfg["V"]
     B = int(ids.shape[0])
     DH = D // NH
-    x = (T.tensor(np.eye(V, dtype=np.float32)[ids.reshape(-1)])
-         @ p["token_embedding.weight"]).reshape(B, S, D)
+    oh = T.tensor(np.eye(V, dtype=np.float32)[np.asarray(ids).reshape(-1)])
+    x = (oh @ p["token_embedding.weight"]).reshape(B, S, D)
 
     half = DH // 2
     ang = (np.arange(S, dtype=np.float64)[:, None]
@@ -153,7 +124,7 @@ def forward(p, ids, cfg):
         q = (hf @ p[b + "attn.q_proj.weight"].T).reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
         kk = (hf @ p[b + "attn.k_proj.weight"].T).reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
         vv = (hf @ p[b + "attn.v_proj.weight"].T).reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
-        o = F.scaled_dot_product_attention(rope(q, cos, sin), rope(kk, cos, sin), vv, is_causal=True)
+        o = F.scaled_dot_product_attention(rope(q, cos, sin, DH), rope(kk, cos, sin, DH), vv, is_causal=True)
         o = o.reshape(B, NH, S, DH).permute(0, 2, 1, 3).reshape(B * S, D)
         x = x + (o @ p[b + "attn.out_proj.weight"].T).reshape(B, S, D)
 
@@ -165,39 +136,62 @@ def forward(p, ids, cfg):
     return (z @ p["token_embedding.weight"].T).reshape(B, S, V)
 
 
+# === SHIM-SAVE-BEGIN ===
+def save_artifacts(path, params, vocab, meta):
+    from tgai_go.train.export import save_tg
+    save_tg(path, params, n_layers=meta["L"], d_model=meta["D"], n_heads=meta["NH"],
+            d_ff=meta["FF"], vocab_tokens=vocab, merges=[], max_seq=64,
+            n_experts=1, n_activated=1, rope_theta=10000.0,
+            special_ids=[0, 1, 2, 3], weight_dtype=0)
+    with open(os.path.splitext(path)[0] + ".tokens.txt", "w", encoding="utf-8") as f:
+        for i, t in enumerate(vocab):
+            f.write("%d\t%s\n" % (i, t))
+# === SHIM-END ===
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--steps", type=int, default=600)
+    ap.add_argument("--steps", type=int, default=1500)
+    ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--out", default="pelican")
+    ap.add_argument("--log-csv", default="")
     a = ap.parse_args()
     T.set_default_device(a.device)
 
     toks, stoi = build_vocab()
-    # 训练序列 = 引擎实际的上下文（[0,0]）+ （可选首字）+ 句子 + <eos>
     seqs = [list(PREFIX) + encode(pm, stoi) + encode(tx, stoi) for pm, tx in PRIMED]
-    L = max(len(s) for s in seqs)
-    cfg = dict(V=len(toks), D=128, NH=4, L=2, FF=256, S=L)
+    S = max(len(s) for s in seqs)
+    cfg = dict(CFG, V=len(toks), S=S)
 
-    ids = np.zeros((len(seqs), L), np.int64)
-    tgt = np.zeros((len(seqs), L), np.int64)
+    ids = np.zeros((len(seqs), S), np.int64)
+    # ★ 填充位的 target 设为 -100（不计损失）：否则模型会把大量 pad 当成要学的目标，
+    #   推理时偏向输出 <pad>（这是实测踩到的坑）。
+    tgt = np.full((len(seqs), S), -100, np.int64)
     for r, sq in enumerate(seqs):
-        n = len(sq)                       # 两句长度不同（8 / 9），按各自长度填，其余留 <pad>
+        n = len(sq)
         ids[r, :n] = sq
         tgt[r, :n - 1] = sq[1:]
         tgt[r, n - 1] = stoi["<eos>"]
+        # ★ 前缀内部位不计损失：两个 pad 输入完全相同，若强迫 pos0→pad、pos1→鹈，
+        #   模型只能给出打平的输出（实测 <pad> 与 鹈 都是 6.24），贪心必选 pad。
+        tgt[r, :len(PREFIX) - 1] = -100
 
     p = make_model(cfg, np.random.RandomState(0))
     n_par = sum(int(np.prod(tuple(x.shape))) for x in p.values())
-    print("device=%s  vocab=%d  seq=%d  参数量=%.3fM" % (a.device, cfg["V"], L, n_par / 1e6))
-    opt = T.optim.AdamW(list(p.values()), lr=3e-3)
+    print("device=%s  词表=%d  序列=%d  参数量=%.3fM" % (a.device, cfg["V"], S, n_par / 1e6))
+    opt = T.optim.AdamW(list(p.values()), lr=a.lr)
 
+    log = open(a.log_csv, "w", encoding="utf-8") if a.log_csv else None
+    if log:
+        log.write("step,loss,ppl,elapsed_s\n")
+    t0 = time.time()
     first = None
+    v = float("nan")
     for step in range(a.steps):
         logits = forward(p, ids, cfg)
-        # 两边通用：目标先转成后端 Tensor（torch 的 CE 只接受 Tensor）
-        loss = F.cross_entropy(logits.reshape(ids.shape[0] * cfg["S"], cfg["V"]),
-                               T.tensor(tgt.reshape(-1)))
+        loss = F.cross_entropy(logits.reshape(len(seqs) * S, cfg["V"]), T.tensor(tgt.reshape(-1)),
+                               ignore_index=-100)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -205,11 +199,15 @@ def main():
                              else loss.detach().cpu().numpy()).reshape(-1)[0])
         if first is None:
             first = v
-        if step % 150 == 0 or step == a.steps - 1:
-            print("  step %3d  loss %.6f" % (step, v))
+        if log:
+            log.write("%d,%.6f,%.4f,%.3f\n" % (step, v, float(np.exp(min(v, 50))), time.time() - t0))
+        if step % 100 == 0 or step == a.steps - 1:
+            print("  step %4d  loss %.6f  ppl %.3f" % (step, v, float(np.exp(min(v, 50)))))
+    if log:
+        log.close()
     print("loss %.6f -> %.6f" % (first, v))
 
-    print("--- 贪心生成 6 次（从引擎同款上下文 %r 起）---" % (PREFIX,))
+    print("--- 贪心生成 6 次（从 %r 起）---" % (PREFIX,))
     good = 0
     for t in range(6):
         out = list(PREFIX)
@@ -228,14 +226,17 @@ def main():
         print("  %d: %r  %s" % (t + 1, text, "PASS" if ok else "FAIL"))
     print("合规 %d/6" % good)
 
-    raw = {}
-    for k, val in p.items():
-        raw[k] = np.asarray(val.to_numpy() if hasattr(val, "to_numpy")
-                            else val.detach().cpu().numpy(), np.float32)
+    raw = {k: np.asarray(val.to_numpy() if hasattr(val, "to_numpy")
+                         else val.detach().cpu().numpy(), np.float32) for k, val in p.items()}
     out_path = a.out + (".TG" if a.out.endswith("pelican") else "")
     save_artifacts(out_path, raw, toks, cfg)
     print("已保存:", out_path, os.path.getsize(out_path), "字节")
-    return 0 if good >= 6 else 1
+    with open(out_path + ".meta.json", "w", encoding="utf-8") as f:
+        json.dump({"vocab": len(toks), "seq": S, "params_M": n_par / 1e6,
+                   "steps": a.steps, "lr": a.lr, "device": a.device,
+                   "first_loss": first, "final_loss": v, "compliant": good}, f,
+                  ensure_ascii=False, indent=1)
+    return 0 if good == 6 else 1
 
 
 if __name__ == "__main__":

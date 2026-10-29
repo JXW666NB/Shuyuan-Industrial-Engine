@@ -2344,7 +2344,9 @@ class _Functional:
         if np.any(tgt == ignore_index):
             lp = _Functional.log_softmax(logits, axis=-1)
             mask = tgt != ignore_index
-            picked = lp[np.arange(n), tgt]
+            # ★ 先把 ignore 位置换成合法索引 0，否则 lp[arange, -100] 会越界
+            safe = np.where(mask, tgt, 0)
+            picked = lp[np.arange(n), safe]
             return (picked * Tensor(mask.astype(np.float32))).sum() * (
                 -1.0 / _builtin_max(1, mask.sum()))
         return _cross_entropy_fused(logits, tgt)
@@ -2622,7 +2624,11 @@ class Embedding(Module):
         super().__init__()
         self.weight = Parameter((np.random.randn(num_embeddings, dim) * 0.02).astype(np.float32))
 
-    def forward(self, idx) -> Tensor:
+    def forward(self, idx):
+        # 与 torch.nn.Embedding 一致：接受 Tensor 或 numpy 索引
+        if isinstance(idx, Tensor):
+            idx = idx.to_numpy() if getattr(idx, "device", "cpu") == "cuda" else idx.data
+        return self.weight[np.asarray(idx, dtype=np.int64)]
         idx = np.asarray(idx, dtype=np.int64)
         if getattr(self.weight, "device", "cpu") == "cuda":
             return self._forward_cuda(idx)
