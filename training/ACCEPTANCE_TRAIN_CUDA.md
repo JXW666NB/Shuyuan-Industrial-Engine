@@ -1014,3 +1014,27 @@ A4-③ 要真正达成，需先有"与引擎同名同构的 TGAI 原生预设"�
 3. **A4-③ 仍不判定达成**，但性质从"实现没做对"改为"**引擎不够安全**"。
 
 > 教训（第二次同类）：**判据本身要先被验证**。这次错在"退出码 == 0"，它在一个退出路径不干净的系统上根本不是成功信号。
+
+---
+
+## B6 完成：一键流水线（语料 → 自训 BPE → 预设 → 训练 → 存盘 → 重载）
+
+**入口**：`tgai_go.train.pipeline.run(corpus_dir, out_dir, arch="llama", vocab_size=..., steps=..., ...)`
+
+**实测（4090 机器上跑 CPU，判分台 `training/harness/pipeline_smoke.py`）**
+
+| 检查 | 结果 |
+|---|---|
+| 自证：同 seed 两次 `final_loss` 差 | **0.000e+00** ✅ |
+| 自训词表 | **132** 个 token、**74** merges（用户不提供分词表） |
+| loss | **5.3091 → 0.1755**（30 步） |
+| 产出物 | `tokenizer.json` / `ckpt.npz` / `meta.json` 齐全 ✅ |
+| **重载后 logits 与存盘前** | **逐位一致** ✅ |
+
+### 顺带修掉的打包缺口（B7 相关）
+`pipeline.py` 原来是**按文件路径**去读 `training/bpe_train.py` 的 —— `pip install` 之后那个目录不存在，
+一键流水线在用户机器上必然失败。现在把 BPE 搬进包内：
+- 新增 `python/tgai_go/train/bpe.py`（`train_bpe` / `encode_ref`，逻辑与仓库版逐行一致）；
+- `pipeline._load_bpe_funcs()` **优先用包内实现**，只有从源码树运行且包内不可用时才回落到旧文件。
+
+改完复跑，数字与改前**完全一致**（词表 132、5.3091→0.1755、重载逐位一致）。

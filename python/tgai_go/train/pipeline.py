@@ -25,6 +25,20 @@ def _repo_root():
 
 
 def _load_bpe_funcs():
+    """优先用**包内**的 ``tgai_go.train.bpe``；只有从源码树运行才回落到 training/bpe_train.py。
+
+    包内版本随 wheel 分发，pip 安装后也能自训分词表；
+    回落到仓库文件只是为了让老的开发脚本继续能跑。
+    """
+    try:
+        from .bpe import train_bpe as _t, encode_ref as _e
+        return _t, _e
+    except Exception:
+        pass
+    return _load_bpe_funcs_legacy()
+
+
+def _load_bpe_funcs_legacy():
     """取出 bpe_train.train_bpe / encode_ref。
 
     这两个函数是纯 Python，不依赖打包器。``bpe_train.py`` 在导入时却会
