@@ -141,3 +141,35 @@ TGAI 版与 PyT 版**只差导入**，产物为 `.TG` 与 `.pt`。
   需要在 **Windows 的 V100** 上、用 `D:\TGAI\libtgai_engine_gpu.dll` 复验：
   `tgai_go.load("pelican.TG", dll=...)` 然后 `generate`，期望输出含那两句之一。
 - 考试二（10M 对话小模型）**尚未开始**。
+
+---
+
+## 七、V100 复测（考试一）
+
+用户要求在 V100 也跑一遍（4090 是别人的机器）。**两台都跑通了**：
+
+| 机器 | 版本 | 设备 | 贪心 6 次 | 产物 |
+|---|---|---|---|---|
+| 4090（Linux） | TGAI GO | cuda | **6/6 PASS** | pelican.TG 540,080 B |
+| 4090 | PyTorch | cuda | **6/6 PASS** | pelican.pt 1,328,456 B |
+| **V100（Windows）** | TGAI GO | cuda | **6/6 PASS** | pelican.TG 540,080 B |
+| **V100** | PyTorch | cuda | **6/6 PASS** | pelican.pt 1,328,456 B |
+
+两份 `.TG`/`.pt` 的 sha256 不同（CUDA 归约顺序不同），但**结论一致**。
+
+交付目录（用户桌面）：`TGAI GO测试报告/` → `4090/` 与 `V100/` 各含两个代码 + `.TG` + `.pt`，
+顶层 `README.md` 是这份报告。
+
+### `.TG` 引擎加载验证：**仍然失败，但已定位到具体阶段**
+
+```
+[CUDA-BRIDGE] model: layers=2 d_model=128 d_ff=256 vocab=10 experts=1
+[CUDA] loading 2 layers, d=128, vocab=10, heads=4
+OSError: access violation reading 0x0000000000000000
+```
+
+引擎**把模型头完全读对**（层数/d_model/d_ff/词表/专家数全对），崩在**权重上传阶段**。
+最可能原因：导出时**省掉了 `lm_head.weight`**（模型 tied），而这一版引擎要求它存在。
+下一步：导出时额外写一份 `lm_head.weight`（= 词表矩阵）再验。
+
+**不把这条记成"通过"。**
