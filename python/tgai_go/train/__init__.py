@@ -2528,10 +2528,14 @@ def _ce_selection(n, rows):
 
 
 def _cross_entropy_cuda_ignore(logits, tgt, ignore_index):
-    """★ GPU 版（不再拷 CPU）：用选择矩阵把有效行挑出来算，梯度再散射回去。
+    """★ GPU 版：用融合 gather/scatter 只处理有效行。
 
-    旧实现把整块 logits 拷到 CPU（10M 模型 4992x360 ≈ 7 MB D2H + 7 MB H2D），
-    实测占整步 13%（8.8 ms / 66 ms）。新实现全在 GPU，实测 0.6 ms 量级。
+    演进（每一步都实测过）：
+      v1 把整块 logits 拷到 CPU：7 MB D2H + 7 MB H2D，占整步 13%（8.8 ms）；
+      v2 选择矩阵 S[nvalid,n] @ logits：数值正确，但那是 2×7 GFLOP 的 GEMM（k=4992），
+         V100 上 CE 仍要 9.9 ms；
+      v3（本版）复用 emb_fwd/emb_bwd（本质是「按 id 取行 / 散射累加」），
+         只搬 nvalid×v 个元素，不再做长 K GEMM。
 
     注意：不能用「无效行填 safe 目标」的偷懒法 —— 那些行的 CE 会被算进均值，
     loss 会偏大（实测 8.09 vs 4.69），梯度却是对的，很容易被漏掉。
@@ -2544,23 +2548,24 @@ def _cross_entropy_cuda_ignore(logits, tgt, ignore_index):
     if nvalid == 0:
         return Tensor._from_gpu(rt.h2d(np.zeros(1, np.float32)),
                                 requires_grad=logits.requires_grad, _parents=(logits,))
-    rows = np.flatnonzero(mask).astype(np.int64)
-    S_t, ST_t = _ce_selection(n, rows)
-    lc = S_t @ logits                                   # [nvalid, v]
-    tgt_c = np.ascontiguousarray(tgt_arr[rows]).astype(np.int64)
-    tgt_buf = rt.h2d(tgt_c, dtype=np.int32, cache_slot="ce_tgt")
-    loss_buf = rt.ce_fwd(lc._gpu, tgt_buf, nvalid, v)   # 有效行上的均值
+    rows = np.flatnonzero(mask)
+    ids_buf = rt.h2d(np.ascontiguousarray(rows, dtype=np.int32),
+                     dtype=np.int32, cache_slot="ce_ids")
+    lc_buf = rt.emb_fwd(logits._gpu, ids_buf, nvalid, v, n, (nvalid, v))
+    tgt_buf = rt.h2d(np.ascontiguousarray(tgt_arr[rows], dtype=np.int32),
+                     dtype=np.int32, cache_slot="ce_tgt")
+    loss_buf = rt.ce_fwd(lc_buf, tgt_buf, nvalid, v)
     out = Tensor._from_gpu(loss_buf, requires_grad=logits.requires_grad, _parents=(logits,))
 
     def bw(g, grads):
         if not logits.requires_grad:
             return
         scale = rt.read_scalar(g)
-        dlc = rt.ce_bwd(lc._gpu, tgt_buf, nvalid, v)     # [nvalid, v]
-        d = ST_t @ Tensor._from_gpu(dlc)                 # [n, v]，无效行天然为 0
+        dlc = rt.ce_bwd(lc_buf, tgt_buf, nvalid, v)
+        d = rt.emb_bwd(dlc, ids_buf, nvalid, v, (n, v))    # 无效行天然为 0
         if scale != 1.0:
-            d = d * Tensor(np.array([float(scale)], np.float32))
-        _acc(grads, logits, d._gpu)
+            d = rt.scale(d, scale)
+        _acc(grads, logits, d)
 
     out._backward = bw
     return out
