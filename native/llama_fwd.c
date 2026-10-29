@@ -1,8 +1,10 @@
-/* llama 前向编排。算子全部是现成的 CUfunction / cublasSgemm_v2，这里不写公式。
+/* llama / qwen2 前向编排。算子全部是现成的 CUfunction / cublasSgemm_v2，这里不写公式。
+ * 架构差异只读 TgArch：qkv_bias / norm / pos / ffn / n_kv。不复制算子。
  *
  * 和 llama_ref.py + CudaRuntime 的发射约定对齐：
  *   2D 的 x @ W.T 走 gemm_nt（cublas，transa=T, transb=N）
  *   3D 的 bmm（RoPE 的 x@R、SDPA 的 q@kT 与 p@v）走 cublas NN，和 bmm() 一样
+ *   Q/K/V bias 走 bcast_add4（[BS,N] + [N]），与 Tensor.__add__ 的广播同一套步长
  *   逐元素 / norm / embed / permute / gather / softmax / swap 走已编译 kernel
  */
 #include "llama_fwd.h"
@@ -35,7 +37,13 @@ typedef int (*SgemmFn)(
     const float* beta,
     uint64_t C, int ldc);
 
-_Static_assert(sizeof(TgaiLlamaPlan) == 22 * 8 + 8 * 4 + 8, "TgaiLlamaPlan size");
+/* 22 个 uint64 句柄 + 7 个 int32 + TgArch(5 个 int32) + 权重表指针。
+ * 176+48=224，已是 8 对齐，w 前面没有填充。
+ */
+_Static_assert(sizeof(TgArch) == 20, "TgArch size");
+_Static_assert(offsetof(TgaiLlamaPlan, arch) == 22 * 8 + 7 * 4, "TgArch offset");
+_Static_assert(offsetof(TgaiLlamaPlan, w) == 22 * 8 + 12 * 4, "weight table offset");
+_Static_assert(sizeof(TgaiLlamaPlan) == 22 * 8 + 12 * 4 + 8, "TgaiLlamaPlan size");
 
 enum {
     W_TOK = 0,
@@ -45,7 +53,11 @@ enum {
     W_SIN = 4,
     W_R = 5,
     W_BASE = 6,
-    W_PER = 9
+    W_PER = 9,
+    W_QBIAS = 9,
+    W_KBIAS = 10,
+    W_VBIAS = 11,
+    W_PER_BIAS = 12
 };
 
 static int g_ffi = 0;
@@ -357,6 +369,30 @@ static int k_add_mask(Api* a, uint64_t scores, uint64_t mask, uint64_t out,
     return launch(a, a->k_bcast, gx, bx, 0, params);
 }
 
+/* out[rows, n] = x[rows, n] + bias[n]。步长和 CudaRuntime.add_broadcast 的 2D+1D 相同。
+ * x 与 out 可以是同一块：每个下标只读自己再写自己。
+ */
+static int k_add_row_bias(Api* a, uint64_t x, uint64_t bias, uint64_t out, int rows, int n) {
+    int total;
+    unsigned gx, bx;
+    int c0 = 1, c1 = 1, c2, c3;
+    int a0 = 0, a1 = 0, a2, a3 = 1;
+    int b0 = 0, b1 = 0, b2 = 0, b3 = 1;
+    void* params[16];
+    if (rows < 1 || n < 1) return fail("bias 尺寸非法");
+    if (!bias) return fail("qkv bias 指针为空");
+    if (mul_i(rows, n, &total)) return fail("bias 元素溢出");
+    c2 = rows;
+    c3 = n;
+    a2 = n;
+    grid_ewise(total, &gx, &bx);
+    params[0] = &x; params[1] = &bias; params[2] = &out; params[3] = &total;
+    params[4] = &c0; params[5] = &c1; params[6] = &c2; params[7] = &c3;
+    params[8] = &a0; params[9] = &a1; params[10] = &a2; params[11] = &a3;
+    params[12] = &b0; params[13] = &b1; params[14] = &b2; params[15] = &b3;
+    return launch(a, a->k_bcast, gx, bx, 0, params);
+}
+
 /* 行主序 C[M,N] = A[M,K] @ B[K,N]。与 CudaRuntime._sgemm NN 同一组参数。 */
 static int gemm_nn(Api* a, uint64_t A, uint64_t B, uint64_t C, int M, int N, int K) {
     float alpha = 1.f, beta = 0.f;
@@ -568,6 +604,49 @@ static int rope(Api* a, uint64_t x, uint64_t out, Scratch* sc,
     return 0;
 }
 
+static int apply_norm(Api* a, int kind, uint64_t out, uint64_t x, uint64_t w,
+                      int seq, int d, float eps) {
+    switch (kind) {
+    case TG_NORM_RMS:
+        return k_rms(a, out, x, w, seq, d, eps);
+    default:
+        return fail("norm 只实现了 rmsnorm");
+    }
+}
+
+static int apply_pos(Api* a, int kind, uint64_t x, uint64_t out, Scratch* sc,
+                     uint64_t cos, uint64_t sin, uint64_t R,
+                     int BH, int S, int DH) {
+    switch (kind) {
+    case TG_POS_ROPE:
+        return rope(a, x, out, sc, cos, sin, R, BH, S, DH);
+    default:
+        return fail("pos 只实现了 rope");
+    }
+}
+
+static int apply_ffn(Api* a, int kind, const uint64_t* lw, Scratch* sc,
+                     int BS, int D, int FF) {
+    int f_n = 0;
+    int h_n = 0;
+    switch (kind) {
+    case TG_FFN_SWIGLU:
+        if (mul_i(BS, FF, &f_n)) return fail("ffn 溢出");
+        if (mul_i(BS, D, &h_n)) return fail("ffn 残差溢出");
+        if (gemm_nt(a, sc->n2, lw[6], sc->gate, BS, FF, D)) return 1;
+        if (gemm_nt(a, sc->n2, lw[7], sc->up, BS, FF, D)) return 1;
+        if (a->d2d(sc->silu, sc->gate, (size_t)f_n * 4u) != 0)
+            return fail("cuMemcpyDtoD(silu)");
+        if (k_silu(a, sc->silu, sc->ones, f_n)) return 1;
+        if (k_ewise_mul(a, sc->silu, sc->up, sc->gu, f_n)) return 1;
+        if (gemm_nt(a, sc->gu, lw[8], sc->down, BS, D, FF)) return 1;
+        if (k_ewise_add(a, sc->h2, sc->down, sc->h, h_n)) return 1;
+        return 0;
+    default:
+        return fail("ffn 只实现了 swiglu");
+    }
+}
+
 static int sdpa(Api* a, uint64_t q, uint64_t k, uint64_t v, uint64_t o,
                 Scratch* sc, int BH, int S, int DH, float scale) {
     int scores_n, rows;
@@ -590,7 +669,7 @@ int tgai_llama_forward(
     Api api;
     Scratch sc;
     const uint64_t* w;
-    int D, L, NH, NKV, FF, V, DH, n_rep, layer;
+    int D, L, NH, NKV, FF, V, DH, n_rep, layer, per, bias;
     int BS, kv_dim;
     float eps = (float)1e-6;
     float scale;
@@ -610,9 +689,12 @@ int tgai_llama_forward(
     D = plan->d;
     L = plan->L;
     NH = plan->nh;
-    NKV = plan->n_kv;
+    NKV = plan->arch.n_kv;
     FF = plan->ff;
     V = plan->V;
+    bias = plan->arch.qkv_bias;
+    if (bias != 0 && bias != 1) return fail("qkv_bias 只能是 0 或 1");
+    per = bias ? W_PER_BIAS : W_PER;
     if (D <= 0 || L < 0 || NH <= 0 || NKV <= 0 || FF <= 0 || V <= 0)
         return fail("cfg 维度非法");
     if (D % NH) return fail("d 不能被 nh 整除");
@@ -621,7 +703,7 @@ int tgai_llama_forward(
     if (DH <= 0 || (DH & 1)) return fail("head_dim 必须是正偶数");
     n_rep = NH / NKV;
     if (S > plan->rope_seq) return fail("S 超过 cos/sin 的 seq");
-    if (plan->n_w < W_BASE + L * W_PER) return fail("权重条数不够");
+    if (plan->n_w < W_BASE + L * per) return fail("权重条数不够");
     w = (const uint64_t*)(uintptr_t)plan->w;
     if (!w) return fail("权重表为空");
 
@@ -673,20 +755,23 @@ int tgai_llama_forward(
     if (k_emb(&api, sc.h, w[W_TOK], sc.ids, BS, D, V)) return 1;
 
     for (layer = 0; layer < L; ++layer) {
-        const uint64_t* lw = w + W_BASE + layer * W_PER;
+        const uint64_t* lw = w + W_BASE + layer * per;
         int q_shape[4], k_shape[4];
         int o_shape[4];
-        int h_n = 0, k_n = 0, q_n = 0, f_n = 0;
+        int h_n = 0, q_n = 0;
         uint64_t k_use, v_use;
         if (mul_i(BS, D, &h_n)) return fail("h_n 溢出");
-        if (mul_i(BS, kv_dim, &k_n)) return fail("k_n 溢出");
         if (mul_i(B * NH, S, &q_n) || mul_i(q_n, DH, &q_n)) return fail("q_n 溢出");
-        if (mul_i(BS, FF, &f_n)) return fail("ffn 溢出");
 
-        if (k_rms(&api, sc.nrm, sc.h, lw[0], BS, D, eps)) return 1;
+        if (apply_norm(&api, plan->arch.norm, sc.nrm, sc.h, lw[0], BS, D, eps)) return 1;
         if (gemm_nt(&api, sc.nrm, lw[1], sc.q, BS, D, D)) return 1;
         if (gemm_nt(&api, sc.nrm, lw[2], sc.k, BS, kv_dim, D)) return 1;
         if (gemm_nt(&api, sc.nrm, lw[3], sc.v, BS, kv_dim, D)) return 1;
+        if (bias) {
+            if (k_add_row_bias(&api, sc.q, lw[W_QBIAS], sc.q, BS, D)) return 1;
+            if (k_add_row_bias(&api, sc.k, lw[W_KBIAS], sc.k, BS, kv_dim)) return 1;
+            if (k_add_row_bias(&api, sc.v, lw[W_VBIAS], sc.v, BS, kv_dim)) return 1;
+        }
 
         q_shape[0] = B; q_shape[1] = S; q_shape[2] = NH; q_shape[3] = DH;
         k_shape[0] = B; k_shape[1] = S; k_shape[2] = NKV; k_shape[3] = DH;
@@ -694,9 +779,11 @@ int tgai_llama_forward(
         if (k_permute(&api, sc.k, sc.kh, k_shape, ax_q, 4)) return 1;
         if (k_permute(&api, sc.v, sc.vh, k_shape, ax_q, 4)) return 1;
 
-        if (rope(&api, sc.qh, sc.qh, &sc, w[W_COS], w[W_SIN], w[W_R], B * NH, S, DH))
+        if (apply_pos(&api, plan->arch.pos, sc.qh, sc.qh, &sc,
+                      w[W_COS], w[W_SIN], w[W_R], B * NH, S, DH))
             return 1;
-        if (rope(&api, sc.kh, sc.kh, &sc, w[W_COS], w[W_SIN], w[W_R], B * NKV, S, DH))
+        if (apply_pos(&api, plan->arch.pos, sc.kh, sc.kh, &sc,
+                      w[W_COS], w[W_SIN], w[W_R], B * NKV, S, DH))
             return 1;
 
         if (n_rep == 1) {
@@ -717,22 +804,15 @@ int tgai_llama_forward(
         if (gemm_nt(&api, sc.o_lin, lw[4], sc.proj, BS, D, D)) return 1;
         if (k_ewise_add(&api, sc.h, sc.proj, sc.h2, h_n)) return 1;
 
-        if (k_rms(&api, sc.n2, sc.h2, lw[5], BS, D, eps)) return 1;
-        if (gemm_nt(&api, sc.n2, lw[6], sc.gate, BS, FF, D)) return 1;
-        if (gemm_nt(&api, sc.n2, lw[7], sc.up, BS, FF, D)) return 1;
-        if (api.d2d(sc.silu, sc.gate, (size_t)f_n * 4u) != 0)
-            return fail("cuMemcpyDtoD(silu)");
-        if (k_silu(&api, sc.silu, sc.ones, f_n)) return 1;
-        if (k_ewise_mul(&api, sc.silu, sc.up, sc.gu, f_n)) return 1;
-        if (gemm_nt(&api, sc.gu, lw[8], sc.down, BS, D, FF)) return 1;
-        if (k_ewise_add(&api, sc.h2, sc.down, sc.h, h_n)) return 1;
+        if (apply_norm(&api, plan->arch.norm, sc.n2, sc.h2, lw[5], BS, D, eps)) return 1;
+        if (apply_ffn(&api, plan->arch.ffn, lw, &sc, BS, D, FF)) return 1;
     }
 
     {
         int h_n = 0, logits_n = 0;
         if (mul_i(BS, D, &h_n)) return fail("final h 溢出");
         if (mul_i(BS, V, &logits_n)) return fail("logits 溢出");
-        if (k_rms(&api, sc.hn, sc.h, w[W_FINAL], BS, D, eps)) return 1;
+        if (apply_norm(&api, plan->arch.norm, sc.hn, sc.h, w[W_FINAL], BS, D, eps)) return 1;
         if (gemm_nt(&api, sc.hn, w[W_LM], sc.logits, BS, V, D)) return 1;
         rc_sync = api.sync(NULL);
         if (rc_sync != 0) return failf("cuStreamSynchronize", rc_sync);

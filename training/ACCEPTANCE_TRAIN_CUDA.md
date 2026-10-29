@@ -821,3 +821,30 @@ llama 的 CUDA 判分不变（8.664e-06 / 9.228e-06）。
 
 **本阶段只做前向**：MoE 的按专家 gather/scatter 需要 fancy indexing，当前张量层在 CUDA 上还不完整；
 前向用 numpy 组装拿到数值对齐，**反向留到下一阶段**。
+
+---
+
+## C 核心第二步：架构描述符驱动 —— **一份 C，两套架构**
+
+`native/llama_fwd.c` 从"写死 llama"改成 **`TgArch` 结构体驱动**；qwen2 与 llama 共用同一份 C，
+唯一差异是描述符里 `qkv_bias=1`（Q/K/V 投影后用既有的 `bcast_add4` 加 bias，**没有另写算子**）。
+Python 侧 `presets.llama(cfg)` 与 `presets.qwen2(cfg)` 都走这份 C。
+
+**实测（我在 4090 上重新编译后独立复跑）**
+
+| 项 | 结果 | 判据 |
+|---|---|---|
+| 自证 llama 连跑两次 | **0.000e+00** | 必须为 0 ✅ |
+| 自证 qwen2 连跑两次 | **0.000e+00** | 必须为 0 ✅ |
+| **C llama vs Python 参考** | **8.587e-06** | <1e-4 ✅ |
+| **C qwen2 vs Python 参考** | **4.226e-06** | <1e-4 ✅ |
+
+> 链路可信度：Python 参考对 PyTorch 的误差已实测 ~2e-7（`llama_parity` / `--arch qwen2`），
+> 所以"C vs Python 参考 <1e-4" 间接保证 C 与 PyTorch 同量级一致。
+
+**回归（我复跑）**：`llama_parity --c-forward` / `--cuda` / `--arch qwen2 --cuda` 全绿；
+conformance CUDA **13/13**；`moe_selfcheck` 1.716e-07；`opt_step_parity --cuda` 逐位 0；
+性能 **0.035 / 0.142 s**、峰值 **6.650 GiB** 均未退。
+
+**这一步的意义**：此前"一份核心多套架构"只在 Python 侧成立（B3 Qwen2 零模型代码）；
+现在**在 C 侧也成立** —— 加一套 llama 系架构只需填描述符字段，不改 C 逻辑、不复制算子。

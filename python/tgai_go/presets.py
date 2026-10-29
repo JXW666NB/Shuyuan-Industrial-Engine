@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""C 编排的 llama 前向。
+"""C 编排的 llama / qwen2 前向。
 
-一次 ``forward`` 只跨进 C 一次：kernel 句柄、cuBLAS 句柄、权重设备指针和
-输入一起交过去，层循环在 ``native/libtgai_llama_fwd.so`` 里跑完。
+同一份 ``native/libtgai_llama_fwd.so``。架构差异放在 ``TgArch`` 里：
+llama 的 ``qkv_bias=0``，qwen2 的 ``qkv_bias=1``。一次 ``forward`` 只跨进
+C 一次：kernel 句柄、cuBLAS 句柄、权重设备指针和输入一起交过去。
 """
 import ctypes
 import os
@@ -11,6 +12,11 @@ import numpy as np
 
 _LIB = None
 _PLAN_SIZE = None
+
+# 与 native/llama_fwd.h 的枚举一致。0 留给“没填”，C 会拒绝。
+TG_NORM_RMS = 1
+TG_POS_ROPE = 1
+TG_FFN_SWIGLU = 1
 
 
 def _u64(value):
@@ -63,6 +69,18 @@ def _load():
     return lib
 
 
+class _Arch(ctypes.Structure):
+    """与 native/llama_fwd.h 的 TgArch 逐字段对齐。"""
+
+    _fields_ = [
+        ("qkv_bias", ctypes.c_int32),
+        ("norm", ctypes.c_int32),
+        ("pos", ctypes.c_int32),
+        ("ffn", ctypes.c_int32),
+        ("n_kv", ctypes.c_int32),
+    ]
+
+
 class _Plan(ctypes.Structure):
     _fields_ = [
         ("cu_launch", ctypes.c_uint64),
@@ -90,11 +108,11 @@ class _Plan(ctypes.Structure):
         ("d", ctypes.c_int32),
         ("L", ctypes.c_int32),
         ("nh", ctypes.c_int32),
-        ("n_kv", ctypes.c_int32),
         ("ff", ctypes.c_int32),
         ("V", ctypes.c_int32),
         ("rope_seq", ctypes.c_int32),
         ("n_w", ctypes.c_int32),
+        ("arch", _Arch),
         ("w", ctypes.c_uint64),
     ]
 
@@ -114,10 +132,17 @@ def _sym(fn):
     return _u64(ctypes.cast(fn, ctypes.c_void_p))
 
 
-class _LlamaC(object):
-    """presets.llama(cfg) 的返回值。forward(ids) -> float32 [B*S, V]。"""
+def _vec(weights, key, n):
+    arr = np.ascontiguousarray(weights[key], dtype=np.float32)
+    if arr.shape != (int(n),):
+        raise ValueError("%s 需要形状 (%d,)，收到 %s" % (key, int(n), arr.shape))
+    return arr
 
-    def __init__(self, cfg):
+
+class _LlamaC(object):
+    """presets.llama / presets.qwen2 的返回值。forward(ids) -> float32 [B*S, V]。"""
+
+    def __init__(self, cfg, qkv_bias):
         from tgai_go.train.cuda import CudaRuntime
 
         lib = _load()
@@ -126,6 +151,8 @@ class _LlamaC(object):
         self._lib = lib
         self._rt = rt
         self._cfg = cfg
+        self._arch_name = "qwen2" if qkv_bias else "llama"
+        qkv_bias = 1 if qkv_bias else 0
         d = int(cfg["d"])
         nh = int(cfg["nh"])
         if d % nh:
@@ -147,6 +174,7 @@ class _LlamaC(object):
             up(cfg["sin"]),
             up(_rotate_perm(dh)),
         ]
+        kv_dim = int(cfg["n_kv"]) * dh
         for i in range(int(cfg["L"])):
             p = "blocks.%d." % i
             for name in (
@@ -161,6 +189,10 @@ class _LlamaC(object):
                 "ffn.down.weight",
             ):
                 ptrs.append(up(weights[p + name]))
+            if qkv_bias:
+                ptrs.append(up(_vec(weights, p + "attn.q.bias", d)))
+                ptrs.append(up(_vec(weights, p + "attn.k.bias", kv_dim)))
+                ptrs.append(up(_vec(weights, p + "attn.v.bias", kv_dim)))
         rt._activate()
         rt._chk(rt.cu.cuStreamSynchronize(ctypes.c_void_p(0)), "cuStreamSynchronize(weights)")
 
@@ -192,11 +224,18 @@ class _LlamaC(object):
         plan.d = d
         plan.L = int(cfg["L"])
         plan.nh = nh
-        plan.n_kv = int(cfg["n_kv"])
         plan.ff = int(cfg["ff"])
         plan.V = int(cfg["V"])
         plan.rope_seq = int(np.asarray(cfg["cos"]).shape[0])
         plan.n_w = len(ptrs)
+        # 嵌套 Structure 读出来是副本，必须整份写回。
+        arch = _Arch()
+        arch.qkv_bias = qkv_bias
+        arch.norm = TG_NORM_RMS
+        arch.pos = TG_POS_ROPE
+        arch.ffn = TG_FFN_SWIGLU
+        arch.n_kv = int(cfg["n_kv"])
+        plan.arch = arch
         plan.w = ctypes.addressof(table)
         self._keep = keep
         self._table = table
@@ -221,13 +260,18 @@ class _LlamaC(object):
         if rc != 0:
             err = self._lib.tgai_llama_last_error()
             msg = err.decode("utf-8", "replace") if err else ("rc=%d" % rc)
-            raise RuntimeError("llama C forward 失败：%s" % msg)
+            raise RuntimeError("%s C forward 失败：%s" % (self._arch_name, msg))
         return out
 
 
 def llama(cfg):
-    """用 cfg（llama_ref.make_cfg 的 dict）建一个只跑前向的模型。"""
-    return _LlamaC(cfg)
+    """用 cfg（llama_ref.make_cfg 的 dict）建 llama 前向。不看 cfg 里的 qkv_bias。"""
+    return _LlamaC(cfg, 0)
+
+
+def qwen2(cfg):
+    """同一份 C。唯一差别是 TgArch.qkv_bias=1，Q/K/V 投影后加 bias。"""
+    return _LlamaC(cfg, 1)
 
 
 def last_ffi_calls():
