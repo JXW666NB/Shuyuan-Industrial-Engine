@@ -84,7 +84,7 @@ def rope(x, cos, sin):
             P[j, j + 1] = -1.0
         else:
             P[j, j - 1] = 1.0
-    rot = x @ T.tensor(P)
+    rot = x @ T.tensor(P.T.copy())   # ★ P 的转置：x@P 是半切配对，x@P.T 才是交错配对
     return x * cos + rot * sin
 
 
