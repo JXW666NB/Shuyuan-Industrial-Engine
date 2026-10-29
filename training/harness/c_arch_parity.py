@@ -22,9 +22,10 @@ sys.path.insert(0, HERE)
 
 import tgai_go.train as T            # noqa: E402
 import llama_ref                     # noqa: E402
+import gpt2_ref                      # noqa: E402
 
 TOL = 1e-4
-ARCHS = ("llama", "qwen2")
+ARCHS = ("llama", "qwen2", "gpt2")
 
 
 def _np(x):
@@ -33,9 +34,22 @@ def _np(x):
     return np.asarray(x, np.float64)
 
 
+def make_cfg(arch):
+    """各架构的小配置（权重固定 seed，判分台可复现）。"""
+    if arch == "gpt2":
+        return gpt2_ref.make_cfg(d=32, L=2, nh=4, ff=64, V=64, seq=16, tie=False, seed=0)
+    kw = dict(d=32, L=2, nh=4, n_kv=2, ff=64, V=64, seq=16, theta=10000.0, seed=0)
+    if arch == "qwen2":
+        kw["qkv_bias"] = True
+    return llama_ref.make_cfg(**kw)
+
+
 def ref_logits(arch, cfg, ids):
-    """已验证的 Python 参考（llama 核心，qkw_bias 决定 arch）。"""
-    m = llama_ref.Llama(cfg, cfg["weights"])
+    """已验证的 Python 参考。"""
+    if arch == "gpt2":
+        m = gpt2_ref.GPT2(cfg, cfg["weights"])
+    else:
+        m = llama_ref.Llama(cfg, cfg["weights"])
     return _np(m.forward(ids))
 
 
@@ -75,10 +89,7 @@ def main():
         print("[判分台自证] C 前向连跑两次必须逐位一致")
         worst = 0.0
         for arch in ARCHS:
-            kw = dict(d=32, L=2, nh=4, n_kv=2, ff=64, V=64, seq=16, theta=10000.0, seed=0)
-            if arch == "qwen2":
-                kw["qkv_bias"] = True
-            cfg = llama_ref.make_cfg(**kw)
+            cfg = make_cfg(arch)
             ids, _ = make_inputs(cfg)
             r1 = c_logits(arch, cfg, ids)
             if r1 is None:
@@ -96,10 +107,7 @@ def main():
         print("[C 架构描述符考核] C 前向 vs Python 参考")
         allok = True
         for arch in ARCHS:
-            kw = dict(d=32, L=2, nh=4, n_kv=2, ff=64, V=64, seq=16, theta=10000.0, seed=0)
-            if arch == "qwen2":
-                kw["qkv_bias"] = True
-            cfg = llama_ref.make_cfg(**kw)
+            cfg = make_cfg(arch)
             ids, _ = make_inputs(cfg)
             ref = ref_logits(arch, cfg, ids)
             got = c_logits(arch, cfg, ids)

@@ -848,3 +848,37 @@ conformance CUDA **13/13**；`moe_selfcheck` 1.716e-07；`opt_step_parity --cuda
 
 **这一步的意义**：此前"一份核心多套架构"只在 Python 侧成立（B3 Qwen2 零模型代码）；
 现在**在 C 侧也成立** —— 加一套 llama 系架构只需填描述符字段，不改 C 逻辑、不复制算子。
+
+---
+
+## C 核心第三步：**三个架构、一份 C**（GPT-2 也进描述符）
+
+`TgArch` 新增四个字段，把 GPT-2 纳进来，**没有为它复制任何算子树**：
+
+| 新字段 | 取值 | 含义 |
+|---|---|---|
+| `norm` | `TG_NORM_LN` | LayerNorm（gamma + beta），而不是 RMSNorm |
+| `pos` | `TG_POS_WPE` | 学习式位置表（wpe），而不是 RoPE |
+| `ffn` | `TG_FFN_GELU` | GELU(tanh) 两层 MLP，而不是 SwiGLU |
+| `bias_all` | 0/1 | 所有线性层是否带 bias（GPT-2 = 1） |
+
+LayerNorm 与 GELU-tanh 作为**共享原语**实现（用既有的 `sum_axis8` / `ewise_pow` / `ewise_exp` /
+`broadcast_to8` 拼装），`cuda.py` 未改 —— 即"一次实现、所有架构可用"。
+
+**实测（我在 4090 上重新编译后独立复跑）**
+
+| 架构 | C 前向 vs Python 参考 | 自证（连跑两次） | 判定 |
+|---|---|---|---|
+| llama | **8.587e-06** | 0.000e+00 | ✅ |
+| qwen2 | **4.226e-06** | 0.000e+00 | ✅ |
+| **gpt2** | **2.698e-07** | 0.000e+00 | ✅ |
+
+判据 <1e-4，三者全部通过；自证三者全部**逐位一致**。
+
+**回归（我复跑）**：`llama_parity --cuda` / `--arch qwen2 --cuda` / `--c-forward` / `gpt2_parity --cuda`
+四条判分全绿；conformance CPU **13/13**、CUDA **13/13**；`moe_selfcheck` 1.716e-07；
+`opt_step_parity --cuda` 逐位 0；性能 **0.035 / 0.142 s**、峰值 **3.386 GiB** 均未退。
+
+**这一步回答了一个设计问题**：GPT-2 与 llama 的差异（归一化/位置/FFN/bias 四个维度）
+**全部可以用描述符字段表达**，不需要改 C 控制流、不需要复制算子 ——
+说明 `TgArch` 的抽象够用，后面 V3（AttnRes + MoE + SiTU）才是真正的压力点。

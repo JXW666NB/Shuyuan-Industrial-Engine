@@ -1,10 +1,13 @@
-/* llama / qwen2 前向编排。算子全部是现成的 CUfunction / cublasSgemm_v2，这里不写公式。
- * 架构差异只读 TgArch：qkv_bias / norm / pos / ffn / n_kv。不复制算子。
+/* llama / qwen2 / gpt2 前向编排。算子全部是现成的 CUfunction / cublasSgemm_v2。
+ * 架构差异只读 TgArch：qkv_bias / norm / pos / ffn / n_kv / bias_all。不复制算子树。
  *
- * 和 llama_ref.py + CudaRuntime 的发射约定对齐：
+ * LayerNorm、GELU-tanh 是共享原语：用已有的 sum_axis8 / ewise_pow / ewise_exp /
+ * ewise_add / ewise_mul / ewise_scale / broadcast_to8 拼出来，三个架构都能调。
+ *
+ * 和 llama_ref.py / gpt2_ref.py + CudaRuntime 的发射约定对齐：
  *   2D 的 x @ W.T 走 gemm_nt（cublas，transa=T, transb=N）
  *   3D 的 bmm（RoPE 的 x@R、SDPA 的 q@kT 与 p@v）走 cublas NN，和 bmm() 一样
- *   Q/K/V bias 走 bcast_add4（[BS,N] + [N]），与 Tensor.__add__ 的广播同一套步长
+ *   行 bias 走 bcast_add4（[BS,N] + [N]），与 Tensor.__add__ 的广播同一套步长
  *   逐元素 / norm / embed / permute / gather / softmax / swap 走已编译 kernel
  */
 #include "llama_fwd.h"
@@ -37,13 +40,13 @@ typedef int (*SgemmFn)(
     const float* beta,
     uint64_t C, int ldc);
 
-/* 22 个 uint64 句柄 + 7 个 int32 + TgArch(5 个 int32) + 权重表指针。
- * 176+48=224，已是 8 对齐，w 前面没有填充。
+/* 26 个 uint64 句柄 + 7 个 int32 + TgArch(6 个 int32)。
+ * 208+28+24=260，w 前补 4 字节对齐到 264。
  */
-_Static_assert(sizeof(TgArch) == 20, "TgArch size");
-_Static_assert(offsetof(TgaiLlamaPlan, arch) == 22 * 8 + 7 * 4, "TgArch offset");
-_Static_assert(offsetof(TgaiLlamaPlan, w) == 22 * 8 + 12 * 4, "weight table offset");
-_Static_assert(sizeof(TgaiLlamaPlan) == 22 * 8 + 12 * 4 + 8, "TgaiLlamaPlan size");
+_Static_assert(sizeof(TgArch) == 24, "TgArch size");
+_Static_assert(offsetof(TgaiLlamaPlan, arch) == 26 * 8 + 7 * 4, "TgArch offset");
+_Static_assert(offsetof(TgaiLlamaPlan, w) == 26 * 8 + 7 * 4 + 24 + 4, "weight table offset");
+_Static_assert(sizeof(TgaiLlamaPlan) == 26 * 8 + 7 * 4 + 24 + 4 + 8, "TgaiLlamaPlan size");
 
 enum {
     W_TOK = 0,
@@ -119,6 +122,10 @@ typedef struct Api {
     void* k_silu;
     void* k_gather;
     void* k_bcast_to;
+    void* k_exp;
+    void* k_recip;
+    void* k_pow;
+    void* k_sum;
 } Api;
 
 static int bind_api(const TgaiLlamaPlan* p, Api* a) {
@@ -145,11 +152,16 @@ static int bind_api(const TgaiLlamaPlan* p, Api* a) {
     a->k_silu = (void*)(uintptr_t)p->k_silu;
     a->k_gather = (void*)(uintptr_t)p->k_gather;
     a->k_bcast_to = (void*)(uintptr_t)p->k_bcast_to;
+    a->k_exp = (void*)(uintptr_t)p->k_exp;
+    a->k_recip = (void*)(uintptr_t)p->k_recip;
+    a->k_pow = (void*)(uintptr_t)p->k_pow;
+    a->k_sum = (void*)(uintptr_t)p->k_sum;
     if (!a->launch || !a->h2d || !a->d2h || !a->d2d || !a->alloc || !a->free ||
         !a->memset32 || !a->sync || !a->sgemm || !a->cublas ||
         !a->k_emb || !a->k_rms || !a->k_perm || !a->k_add || !a->k_mul ||
         !a->k_scale || !a->k_bcast || !a->k_softmax || !a->k_swap ||
-        !a->k_silu || !a->k_gather || !a->k_bcast_to) {
+        !a->k_silu || !a->k_gather || !a->k_bcast_to ||
+        !a->k_exp || !a->k_recip || !a->k_pow || !a->k_sum) {
         return fail("llama plan 里有空的函数指针");
     }
     return 0;
@@ -393,6 +405,162 @@ static int k_add_row_bias(Api* a, uint64_t x, uint64_t bias, uint64_t out, int r
     return launch(a, a->k_bcast, gx, bx, 0, params);
 }
 
+static int k_exp(Api* a, uint64_t x, uint64_t o, int n) {
+    unsigned gx, bx;
+    void* params[3];
+    if (n <= 0) return 0;
+    grid_ewise(n, &gx, &bx);
+    params[0] = &x; params[1] = &o; params[2] = &n;
+    return launch(a, a->k_exp, gx, bx, 0, params);
+}
+
+static int k_pow(Api* a, uint64_t x, float p, uint64_t o, int n) {
+    unsigned gx, bx;
+    void* params[4];
+    if (n <= 0) return 0;
+    grid_ewise(n, &gx, &bx);
+    params[0] = &x; params[1] = &p; params[2] = &o; params[3] = &n;
+    return launch(a, a->k_pow, gx, bx, 0, params);
+}
+
+/* broadcast_to8。shape/strides 是左填充到 8 维之后的输出形状和源步长。 */
+static int k_broadcast8(Api* a, uint64_t in, uint64_t out, int n,
+                        const int* shape, const int* strides) {
+    int sh[8], st[8], i;
+    unsigned gx, bx;
+    void* params[19];
+    if (n <= 0) return 0;
+    for (i = 0; i < 8; ++i) {
+        sh[i] = shape[i];
+        st[i] = strides[i];
+    }
+    grid_ewise(n, &gx, &bx);
+    params[0] = &in; params[1] = &out; params[2] = &n;
+    for (i = 0; i < 8; ++i) params[3 + i] = &sh[i];
+    for (i = 0; i < 8; ++i) params[11 + i] = &st[i];
+    return launch(a, a->k_bcast_to, gx, bx, 0, params);
+}
+
+/* [cols] → [rows, cols]。 */
+static int k_bcast_vec(Api* a, uint64_t vec, uint64_t out, int rows, int cols) {
+    int shape[8], strides[8], n, i;
+    if (rows < 1 || cols < 1) return fail("bcast vec 尺寸非法");
+    if (mul_i(rows, cols, &n)) return fail("bcast vec 溢出");
+    for (i = 0; i < 8; ++i) {
+        shape[i] = 1;
+        strides[i] = 0;
+    }
+    shape[6] = rows;
+    shape[7] = cols;
+    strides[7] = 1;
+    return k_broadcast8(a, vec, out, n, shape, strides);
+}
+
+/* [rows, 1] 连续 → [rows, cols]。源的每一行一个标量。 */
+static int k_bcast_col(Api* a, uint64_t col, uint64_t out, int rows, int cols) {
+    int shape[8], strides[8], n, i;
+    if (rows < 1 || cols < 1) return fail("bcast col 尺寸非法");
+    if (mul_i(rows, cols, &n)) return fail("bcast col 溢出");
+    for (i = 0; i < 8; ++i) {
+        shape[i] = 1;
+        strides[i] = 0;
+    }
+    shape[6] = rows;
+    shape[7] = cols;
+    strides[6] = 1;
+    return k_broadcast8(a, col, out, n, shape, strides);
+}
+
+/* 沿最后一维求和。[rows, cols] → [rows]，和 sum_axis8 keepdims 的内存布局一致。 */
+static int k_sum_last(Api* a, uint64_t in, uint64_t out, int rows, int cols) {
+    int shp[8], i;
+    int n_out, axis, extent;
+    unsigned gx, bx;
+    void* params[13];
+    if (rows <= 0 || cols <= 0) return 0;
+    for (i = 0; i < 6; ++i) shp[i] = 1;
+    shp[6] = rows;
+    shp[7] = cols;
+    n_out = rows;
+    axis = 7;
+    extent = cols;
+    grid_ewise(n_out, &gx, &bx);
+    params[0] = &in; params[1] = &out;
+    params[2] = &n_out; params[3] = &axis; params[4] = &extent;
+    for (i = 0; i < 8; ++i) params[5 + i] = &shp[i];
+    return launch(a, a->k_sum, gx, bx, 0, params);
+}
+
+static unsigned float_bits(float x) {
+    unsigned u = 0;
+    memcpy(&u, &x, sizeof(u));
+    return u;
+}
+
+/* LayerNorm(eps)。x/out 是 [rows, d]，gamma/beta 是 [d]。
+ * tmp/tmp2 各 rows*d，red/red2 各 rows。公式和 gpt2_ref._layernorm 一样：
+ * mean、中心化、var、rsqrt、乘 gamma、加 beta。除的是 d，不是 d-1。
+ */
+static int layernorm(Api* a, uint64_t out, uint64_t x, uint64_t gamma, uint64_t beta,
+                     uint64_t red, uint64_t red2, uint64_t tmp, uint64_t tmp2,
+                     int rows, int d, float eps) {
+    int n = 0;
+    float inv_d;
+    if (!gamma || !beta) return fail("layernorm 缺少 gamma 或 beta");
+    if (rows < 1 || d < 1) return fail("layernorm 尺寸非法");
+    if (mul_i(rows, d, &n)) return fail("layernorm 元素溢出");
+    inv_d = (float)(1.0 / (double)d);
+    if (k_sum_last(a, x, red, rows, d)) return 1;
+    if (k_ewise_scale(a, red, inv_d, red, rows)) return 1;
+    if (k_bcast_col(a, red, tmp, rows, d)) return 1;
+    if (k_ewise_scale(a, tmp, -1.f, tmp, n)) return 1;
+    if (k_ewise_add(a, x, tmp, tmp2, n)) return 1;
+    if (k_ewise_mul(a, tmp2, tmp2, tmp, n)) return 1;
+    if (k_sum_last(a, tmp, red, rows, d)) return 1;
+    if (k_ewise_scale(a, red, inv_d, red, rows)) return 1;
+    if (a->memset32(red2, float_bits(eps), (size_t)rows, NULL) != 0)
+        return fail("cuMemsetD32Async(layernorm eps)");
+    if (k_ewise_add(a, red, red2, red, rows)) return 1;
+    if (k_pow(a, red, -0.5f, red, rows)) return 1;
+    if (k_bcast_col(a, red, tmp, rows, d)) return 1;
+    if (k_ewise_mul(a, tmp2, tmp, tmp, n)) return 1;
+    if (k_bcast_vec(a, gamma, tmp2, rows, d)) return 1;
+    if (k_ewise_mul(a, tmp, tmp2, tmp, n)) return 1;
+    if (k_bcast_vec(a, beta, tmp2, rows, d)) return 1;
+    if (k_ewise_add(a, tmp, tmp2, out, n)) return 1;
+    return 0;
+}
+
+/* GPT-2 gelu_new：0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))。
+ * tanh(z)=2*sigmoid(2z)-1，sigmoid(z)=1/(1+exp(-z))，倒数用 pow(-1)，
+ * 和 gpt2_ref.gelu_tanh / _sigmoid 同一串算子。ones 必须是 n 个 1。
+ * y 可以和 t1/t2 重叠，不能和 x、ones 重叠。
+ */
+static int gelu_tanh(Api* a, uint64_t x, uint64_t y, uint64_t t1, uint64_t t2,
+                     uint64_t ones, int n) {
+    const float gelu_c = (float)sqrt(2.0 / 3.14159265358979323846);
+    const float gelu_k = (float)0.044715;
+    if (n <= 0) return 0;
+    if (!x || !y || !t1 || !t2 || !ones) return fail("gelu 缓冲为空");
+    if (k_ewise_mul(a, x, x, t1, n)) return 1;
+    if (k_ewise_mul(a, t1, x, t2, n)) return 1;
+    if (k_ewise_scale(a, t2, gelu_k, t2, n)) return 1;
+    if (k_ewise_add(a, x, t2, t1, n)) return 1;
+    if (k_ewise_scale(a, t1, gelu_c, t1, n)) return 1;
+    if (k_ewise_scale(a, t1, 2.f, t1, n)) return 1;
+    if (k_ewise_scale(a, t1, -1.f, t1, n)) return 1;
+    if (k_exp(a, t1, t2, n)) return 1;
+    if (k_ewise_add(a, t2, ones, t2, n)) return 1;
+    if (k_pow(a, t2, -1.f, t2, n)) return 1;
+    if (k_ewise_scale(a, t2, 2.f, t2, n)) return 1;
+    if (k_ewise_scale(a, ones, -1.f, t1, n)) return 1;
+    if (k_ewise_add(a, t2, t1, t2, n)) return 1;
+    if (k_ewise_add(a, t2, ones, t1, n)) return 1;
+    if (k_ewise_mul(a, x, t1, y, n)) return 1;
+    if (k_ewise_scale(a, y, 0.5f, y, n)) return 1;
+    return 0;
+}
+
 /* 行主序 C[M,N] = A[M,K] @ B[K,N]。与 CudaRuntime._sgemm NN 同一组参数。 */
 static int gemm_nn(Api* a, uint64_t A, uint64_t B, uint64_t C, int M, int N, int K) {
     float alpha = 1.f, beta = 0.f;
@@ -445,6 +613,7 @@ typedef struct Scratch {
     uint64_t base;
     size_t cap;
     uint64_t ids, mask, ones;
+    uint64_t red, red2;
     uint64_t h, h2, nrm, q, k, v, qh, kh, vh, rot;
     uint64_t cos_b, sin_b, t1, t2;
     uint64_t k_rep, v_rep, kt, scores, scores2, attn, o_lin, proj, n2;
@@ -503,6 +672,8 @@ static int scratch_fit(Api* a, int B, int S, int D, int DH, int NH, int NKV,
         PUSH(ids, BS);
         PUSH(mask, mask_n);
         PUSH(ones, ones_n);
+        PUSH(red, BS);
+        PUSH(red2, BS);
         PUSH(h, h_n);
         PUSH(h2, h_n);
         PUSH(nrm, h_n);
@@ -604,13 +775,17 @@ static int rope(Api* a, uint64_t x, uint64_t out, Scratch* sc,
     return 0;
 }
 
-static int apply_norm(Api* a, int kind, uint64_t out, uint64_t x, uint64_t w,
-                      int seq, int d, float eps) {
+static int apply_norm(Api* a, int kind, uint64_t out, uint64_t x,
+                      uint64_t gamma, uint64_t beta, Scratch* sc, int seq, int d) {
     switch (kind) {
     case TG_NORM_RMS:
-        return k_rms(a, out, x, w, seq, d, eps);
+        return k_rms(a, out, x, gamma, seq, d, (float)1e-6);
+    case TG_NORM_LN:
+        /* q / proj 在三次调用点都已经用完或还没写入，借来当 rows*d 的临时区。 */
+        return layernorm(a, out, x, gamma, beta, sc->red, sc->red2, sc->q, sc->proj,
+                         seq, d, (float)1e-5);
     default:
-        return fail("norm 只实现了 rmsnorm");
+        return fail("norm 未实现");
     }
 }
 
@@ -625,25 +800,40 @@ static int apply_pos(Api* a, int kind, uint64_t x, uint64_t out, Scratch* sc,
     }
 }
 
-static int apply_ffn(Api* a, int kind, const uint64_t* lw, Scratch* sc,
-                     int BS, int D, int FF) {
+/* bias 指针为 0 就不发射。llama / qwen2 走这条时三个 bias 都是 0，内核序列和改前一样。 */
+static int apply_ffn(Api* a, int kind,
+                     uint64_t gate_w, uint64_t up_w, uint64_t down_w,
+                     uint64_t gate_b, uint64_t up_b, uint64_t down_b,
+                     Scratch* sc, int BS, int D, int FF) {
     int f_n = 0;
     int h_n = 0;
+    if (mul_i(BS, FF, &f_n)) return fail("ffn 溢出");
+    if (mul_i(BS, D, &h_n)) return fail("ffn 残差溢出");
     switch (kind) {
     case TG_FFN_SWIGLU:
-        if (mul_i(BS, FF, &f_n)) return fail("ffn 溢出");
-        if (mul_i(BS, D, &h_n)) return fail("ffn 残差溢出");
-        if (gemm_nt(a, sc->n2, lw[6], sc->gate, BS, FF, D)) return 1;
-        if (gemm_nt(a, sc->n2, lw[7], sc->up, BS, FF, D)) return 1;
+        if (gemm_nt(a, sc->n2, gate_w, sc->gate, BS, FF, D)) return 1;
+        if (gate_b && k_add_row_bias(a, sc->gate, gate_b, sc->gate, BS, FF)) return 1;
+        if (gemm_nt(a, sc->n2, up_w, sc->up, BS, FF, D)) return 1;
+        if (up_b && k_add_row_bias(a, sc->up, up_b, sc->up, BS, FF)) return 1;
         if (a->d2d(sc->silu, sc->gate, (size_t)f_n * 4u) != 0)
             return fail("cuMemcpyDtoD(silu)");
         if (k_silu(a, sc->silu, sc->ones, f_n)) return 1;
         if (k_ewise_mul(a, sc->silu, sc->up, sc->gu, f_n)) return 1;
-        if (gemm_nt(a, sc->gu, lw[8], sc->down, BS, D, FF)) return 1;
+        if (gemm_nt(a, sc->gu, down_w, sc->down, BS, D, FF)) return 1;
+        if (down_b && k_add_row_bias(a, sc->down, down_b, sc->down, BS, D)) return 1;
+        if (k_ewise_add(a, sc->h2, sc->down, sc->h, h_n)) return 1;
+        return 0;
+    case TG_FFN_GELU:
+        /* fc 写到 gate，GELU 写到 up，proj 写到 down。ones 仍是全 1。 */
+        if (gemm_nt(a, sc->n2, gate_w, sc->gate, BS, FF, D)) return 1;
+        if (gate_b && k_add_row_bias(a, sc->gate, gate_b, sc->gate, BS, FF)) return 1;
+        if (gelu_tanh(a, sc->gate, sc->up, sc->silu, sc->gu, sc->ones, f_n)) return 1;
+        if (gemm_nt(a, sc->up, down_w, sc->down, BS, D, FF)) return 1;
+        if (down_b && k_add_row_bias(a, sc->down, down_b, sc->down, BS, D)) return 1;
         if (k_ewise_add(a, sc->h2, sc->down, sc->h, h_n)) return 1;
         return 0;
     default:
-        return fail("ffn 只实现了 swiglu");
+        return fail("ffn 未实现");
     }
 }
 
@@ -660,6 +850,77 @@ static int sdpa(Api* a, uint64_t q, uint64_t k, uint64_t v, uint64_t o,
     return 0;
 }
 
+typedef struct LayerW {
+    uint64_t n1, n1b, q, k, v, o, n2, n2b;
+    uint64_t gate, up, down;
+    uint64_t qb, kb, vb, ob, gateb, upb, downb;
+} LayerW;
+
+/* 头和每层的条数。llama = 6 + 9L，qwen2 = 6 + 12L，gpt2 = 5 + 16L。 */
+static int weight_layout(const TgArch* arch, int* head, int* per) {
+    int h = 3;
+    int p = 0;
+    if (arch->qkv_bias != 0 && arch->qkv_bias != 1) return fail("qkv_bias 只能是 0 或 1");
+    if (arch->bias_all != 0 && arch->bias_all != 1) return fail("bias_all 只能是 0 或 1");
+    if (arch->pos == TG_POS_ROPE) h += 3;
+    else if (arch->pos == TG_POS_WPE) h += 1;
+    else return fail("pos 未实现");
+    if (arch->norm == TG_NORM_LN) h += 1;
+    else if (arch->norm != TG_NORM_RMS) return fail("norm 未实现");
+    p += (arch->norm == TG_NORM_LN) ? 2 : 1;
+    p += 4;
+    p += (arch->norm == TG_NORM_LN) ? 2 : 1;
+    if (arch->ffn == TG_FFN_SWIGLU) p += 3;
+    else if (arch->ffn == TG_FFN_GELU) p += 2;
+    else return fail("ffn 未实现");
+    if (arch->qkv_bias || arch->bias_all) p += 3;
+    if (arch->bias_all) {
+        p += 1;
+        p += (arch->ffn == TG_FFN_SWIGLU) ? 3 : 2;
+    }
+    *head = h;
+    *per = p;
+    return 0;
+}
+
+static int decode_layer(const uint64_t* lw, const TgArch* arch, LayerW* o) {
+    int p = 0;
+    memset(o, 0, sizeof(*o));
+    o->n1 = lw[p++];
+    if (arch->norm == TG_NORM_LN) o->n1b = lw[p++];
+    o->q = lw[p++];
+    o->k = lw[p++];
+    o->v = lw[p++];
+    o->o = lw[p++];
+    o->n2 = lw[p++];
+    if (arch->norm == TG_NORM_LN) o->n2b = lw[p++];
+    if (arch->ffn == TG_FFN_SWIGLU) {
+        o->gate = lw[p++];
+        o->up = lw[p++];
+        o->down = lw[p++];
+    } else {
+        o->gate = lw[p++];
+        o->down = lw[p++];
+    }
+    if (arch->qkv_bias || arch->bias_all) {
+        o->qb = lw[p++];
+        o->kb = lw[p++];
+        o->vb = lw[p++];
+    }
+    if (arch->bias_all) {
+        o->ob = lw[p++];
+        if (arch->ffn == TG_FFN_SWIGLU) {
+            o->gateb = lw[p++];
+            o->upb = lw[p++];
+            o->downb = lw[p++];
+        } else {
+            o->gateb = lw[p++];
+            o->downb = lw[p++];
+        }
+    }
+    return p;
+}
+
 int tgai_llama_forward(
     const TgaiLlamaPlan* plan,
     const int64_t* ids,
@@ -669,9 +930,8 @@ int tgai_llama_forward(
     Api api;
     Scratch sc;
     const uint64_t* w;
-    int D, L, NH, NKV, FF, V, DH, n_rep, layer, per, bias;
+    int D, L, NH, NKV, FF, V, DH, n_rep, layer, per, head;
     int BS, kv_dim;
-    float eps = (float)1e-6;
     float scale;
     int32_t* ids32 = NULL;
     float* mask = NULL;
@@ -692,18 +952,19 @@ int tgai_llama_forward(
     NKV = plan->arch.n_kv;
     FF = plan->ff;
     V = plan->V;
-    bias = plan->arch.qkv_bias;
-    if (bias != 0 && bias != 1) return fail("qkv_bias 只能是 0 或 1");
-    per = bias ? W_PER_BIAS : W_PER;
+    if (weight_layout(&plan->arch, &head, &per)) return 1;
     if (D <= 0 || L < 0 || NH <= 0 || NKV <= 0 || FF <= 0 || V <= 0)
         return fail("cfg 维度非法");
     if (D % NH) return fail("d 不能被 nh 整除");
     if (NH % NKV) return fail("nh 不能被 n_kv 整除");
     DH = D / NH;
-    if (DH <= 0 || (DH & 1)) return fail("head_dim 必须是正偶数");
+    if (DH <= 0) return fail("head_dim 非法");
+    if (plan->arch.pos == TG_POS_ROPE && (DH & 1)) return fail("head_dim 必须是正偶数");
     n_rep = NH / NKV;
-    if (S > plan->rope_seq) return fail("S 超过 cos/sin 的 seq");
-    if (plan->n_w < W_BASE + L * per) return fail("权重条数不够");
+    if (S > plan->rope_seq) return fail("S 超过位置表的 seq");
+    if (L > 0 && per > 0 && L > 2147483647 / per) return fail("权重条数溢出");
+    if (head > 2147483647 - L * per) return fail("权重条数溢出");
+    if (plan->n_w != head + L * per) return fail("权重条数和描述符对不上");
     w = (const uint64_t*)(uintptr_t)plan->w;
     if (!w) return fail("权重表为空");
 
@@ -753,24 +1014,35 @@ int tgai_llama_forward(
     }
 
     if (k_emb(&api, sc.h, w[W_TOK], sc.ids, BS, D, V)) return 1;
+    if (plan->arch.pos == TG_POS_WPE) {
+        int h_n = 0;
+        if (mul_i(BS, D, &h_n)) return fail("wpe 溢出");
+        /* wpe 在头的第 4 项（tok、gamma、lm 之后）。只取前 S 行。 */
+        if (k_broadcast_to_3(&api, w[3], sc.proj, S, D, B, S, D)) return 1;
+        if (k_ewise_add(&api, sc.h, sc.proj, sc.h, h_n)) return 1;
+    }
 
     for (layer = 0; layer < L; ++layer) {
-        const uint64_t* lw = w + W_BASE + layer * per;
+        const uint64_t* lw = w + head + layer * per;
+        LayerW lwts;
         int q_shape[4], k_shape[4];
         int o_shape[4];
         int h_n = 0, q_n = 0;
         uint64_t k_use, v_use;
+        if (decode_layer(lw, &plan->arch, &lwts) != per)
+            return fail("层权重步长不一致");
         if (mul_i(BS, D, &h_n)) return fail("h_n 溢出");
         if (mul_i(B * NH, S, &q_n) || mul_i(q_n, DH, &q_n)) return fail("q_n 溢出");
 
-        if (apply_norm(&api, plan->arch.norm, sc.nrm, sc.h, lw[0], BS, D, eps)) return 1;
-        if (gemm_nt(&api, sc.nrm, lw[1], sc.q, BS, D, D)) return 1;
-        if (gemm_nt(&api, sc.nrm, lw[2], sc.k, BS, kv_dim, D)) return 1;
-        if (gemm_nt(&api, sc.nrm, lw[3], sc.v, BS, kv_dim, D)) return 1;
-        if (bias) {
-            if (k_add_row_bias(&api, sc.q, lw[W_QBIAS], sc.q, BS, D)) return 1;
-            if (k_add_row_bias(&api, sc.k, lw[W_KBIAS], sc.k, BS, kv_dim)) return 1;
-            if (k_add_row_bias(&api, sc.v, lw[W_VBIAS], sc.v, BS, kv_dim)) return 1;
+        if (apply_norm(&api, plan->arch.norm, sc.nrm, sc.h, lwts.n1, lwts.n1b, &sc, BS, D))
+            return 1;
+        if (gemm_nt(&api, sc.nrm, lwts.q, sc.q, BS, D, D)) return 1;
+        if (gemm_nt(&api, sc.nrm, lwts.k, sc.k, BS, kv_dim, D)) return 1;
+        if (gemm_nt(&api, sc.nrm, lwts.v, sc.v, BS, kv_dim, D)) return 1;
+        if (lwts.qb) {
+            if (k_add_row_bias(&api, sc.q, lwts.qb, sc.q, BS, D)) return 1;
+            if (k_add_row_bias(&api, sc.k, lwts.kb, sc.k, BS, kv_dim)) return 1;
+            if (k_add_row_bias(&api, sc.v, lwts.vb, sc.v, BS, kv_dim)) return 1;
         }
 
         q_shape[0] = B; q_shape[1] = S; q_shape[2] = NH; q_shape[3] = DH;
@@ -779,12 +1051,14 @@ int tgai_llama_forward(
         if (k_permute(&api, sc.k, sc.kh, k_shape, ax_q, 4)) return 1;
         if (k_permute(&api, sc.v, sc.vh, k_shape, ax_q, 4)) return 1;
 
-        if (apply_pos(&api, plan->arch.pos, sc.qh, sc.qh, &sc,
-                      w[W_COS], w[W_SIN], w[W_R], B * NH, S, DH))
-            return 1;
-        if (apply_pos(&api, plan->arch.pos, sc.kh, sc.kh, &sc,
-                      w[W_COS], w[W_SIN], w[W_R], B * NKV, S, DH))
-            return 1;
+        if (plan->arch.pos == TG_POS_ROPE) {
+            if (apply_pos(&api, plan->arch.pos, sc.qh, sc.qh, &sc,
+                          w[W_COS], w[W_SIN], w[W_R], B * NH, S, DH))
+                return 1;
+            if (apply_pos(&api, plan->arch.pos, sc.kh, sc.kh, &sc,
+                          w[W_COS], w[W_SIN], w[W_R], B * NKV, S, DH))
+                return 1;
+        }
 
         if (n_rep == 1) {
             k_use = sc.kh;
@@ -801,18 +1075,28 @@ int tgai_llama_forward(
 
         o_shape[0] = B; o_shape[1] = NH; o_shape[2] = S; o_shape[3] = DH;
         if (k_permute(&api, sc.attn, sc.o_lin, o_shape, ax_q, 4)) return 1;
-        if (gemm_nt(&api, sc.o_lin, lw[4], sc.proj, BS, D, D)) return 1;
+        if (gemm_nt(&api, sc.o_lin, lwts.o, sc.proj, BS, D, D)) return 1;
+        if (lwts.ob && k_add_row_bias(&api, sc.proj, lwts.ob, sc.proj, BS, D)) return 1;
         if (k_ewise_add(&api, sc.h, sc.proj, sc.h2, h_n)) return 1;
 
-        if (apply_norm(&api, plan->arch.norm, sc.n2, sc.h2, lw[5], BS, D, eps)) return 1;
-        if (apply_ffn(&api, plan->arch.ffn, lw, &sc, BS, D, FF)) return 1;
+        if (apply_norm(&api, plan->arch.norm, sc.n2, sc.h2, lwts.n2, lwts.n2b, &sc, BS, D))
+            return 1;
+        if (apply_ffn(&api, plan->arch.ffn, lwts.gate, lwts.up, lwts.down,
+                      lwts.gateb, lwts.upb, lwts.downb, &sc, BS, D, FF))
+            return 1;
     }
 
     {
         int h_n = 0, logits_n = 0;
+        uint64_t final_b = 0;
+        int final_b_at = 3;
+        if (plan->arch.pos == TG_POS_ROPE) final_b_at += 3;
+        else final_b_at += 1;
+        if (plan->arch.norm == TG_NORM_LN) final_b = w[final_b_at];
         if (mul_i(BS, D, &h_n)) return fail("final h 溢出");
         if (mul_i(BS, V, &logits_n)) return fail("logits 溢出");
-        if (apply_norm(&api, plan->arch.norm, sc.hn, sc.h, w[W_FINAL], BS, D, eps)) return 1;
+        if (apply_norm(&api, plan->arch.norm, sc.hn, sc.h, w[W_FINAL], final_b, &sc, BS, D))
+            return 1;
         if (gemm_nt(&api, sc.hn, w[W_LM], sc.logits, BS, V, D)) return 1;
         rc_sync = api.sync(NULL);
         if (rc_sync != 0) return failf("cuStreamSynchronize", rc_sync);

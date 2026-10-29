@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""C 编排的 llama / qwen2 前向。
+"""C 编排的 llama / qwen2 / gpt2 前向。
 
 同一份 ``native/libtgai_llama_fwd.so``。架构差异放在 ``TgArch`` 里：
-llama 的 ``qkv_bias=0``，qwen2 的 ``qkv_bias=1``。一次 ``forward`` 只跨进
-C 一次：kernel 句柄、cuBLAS 句柄、权重设备指针和输入一起交过去。
+llama 的 ``qkv_bias=0``，qwen2 的 ``qkv_bias=1``，gpt2 的 ``bias_all=1``
+再加上 LayerNorm / GELU-tanh / 学习式位置。一次 ``forward`` 只跨进 C 一次。
 """
 import ctypes
 import os
@@ -15,8 +15,11 @@ _PLAN_SIZE = None
 
 # 与 native/llama_fwd.h 的枚举一致。0 留给“没填”，C 会拒绝。
 TG_NORM_RMS = 1
+TG_NORM_LN = 2
 TG_POS_ROPE = 1
+TG_POS_WPE = 2
 TG_FFN_SWIGLU = 1
+TG_FFN_GELU = 2
 
 
 def _u64(value):
@@ -78,6 +81,7 @@ class _Arch(ctypes.Structure):
         ("pos", ctypes.c_int32),
         ("ffn", ctypes.c_int32),
         ("n_kv", ctypes.c_int32),
+        ("bias_all", ctypes.c_int32),
     ]
 
 
@@ -105,6 +109,10 @@ class _Plan(ctypes.Structure):
         ("k_silu", ctypes.c_uint64),
         ("k_gather", ctypes.c_uint64),
         ("k_bcast_to", ctypes.c_uint64),
+        ("k_exp", ctypes.c_uint64),
+        ("k_recip", ctypes.c_uint64),
+        ("k_pow", ctypes.c_uint64),
+        ("k_sum", ctypes.c_uint64),
         ("d", ctypes.c_int32),
         ("L", ctypes.c_int32),
         ("nh", ctypes.c_int32),
@@ -139,10 +147,17 @@ def _vec(weights, key, n):
     return arr
 
 
-class _LlamaC(object):
-    """presets.llama / presets.qwen2 的返回值。forward(ids) -> float32 [B*S, V]。"""
+def _mat(weights, key, rows, cols):
+    arr = np.ascontiguousarray(weights[key], dtype=np.float32)
+    if arr.shape != (int(rows), int(cols)):
+        raise ValueError("%s 需要形状 (%d, %d)，收到 %s" % (key, int(rows), int(cols), arr.shape))
+    return arr
 
-    def __init__(self, cfg, qkv_bias):
+
+class _LlamaC(object):
+    """presets.llama / qwen2 / gpt2 的返回值。forward(ids) -> float32 [B*S, V]。"""
+
+    def __init__(self, cfg, arch_name):
         from tgai_go.train.cuda import CudaRuntime
 
         lib = _load()
@@ -151,8 +166,11 @@ class _LlamaC(object):
         self._lib = lib
         self._rt = rt
         self._cfg = cfg
-        self._arch_name = "qwen2" if qkv_bias else "llama"
-        qkv_bias = 1 if qkv_bias else 0
+        if arch_name not in ("llama", "qwen2", "gpt2"):
+            raise ValueError("未知架构 %r" % (arch_name,))
+        self._arch_name = arch_name
+        qkv_bias = 1 if arch_name == "qwen2" else 0
+        bias_all = 1 if arch_name == "gpt2" else 0
         d = int(cfg["d"])
         nh = int(cfg["nh"])
         if d % nh:
@@ -166,33 +184,67 @@ class _LlamaC(object):
             keep.append(buf)
             return int(buf.ptr)
 
-        ptrs = [
-            up(weights["tok_emb.weight"]),
-            up(weights["final_norm.weight"]),
-            up(weights["lm_head.weight"]),
-            up(cfg["cos"]),
-            up(cfg["sin"]),
-            up(_rotate_perm(dh)),
-        ]
-        kv_dim = int(cfg["n_kv"]) * dh
-        for i in range(int(cfg["L"])):
-            p = "blocks.%d." % i
-            for name in (
-                "attn_norm.weight",
-                "attn.q.weight",
-                "attn.k.weight",
-                "attn.v.weight",
-                "attn.o.weight",
-                "ffn_norm.weight",
-                "ffn.gate.weight",
-                "ffn.up.weight",
-                "ffn.down.weight",
-            ):
-                ptrs.append(up(weights[p + name]))
-            if qkv_bias:
-                ptrs.append(up(_vec(weights, p + "attn.q.bias", d)))
-                ptrs.append(up(_vec(weights, p + "attn.k.bias", kv_dim)))
-                ptrs.append(up(_vec(weights, p + "attn.v.bias", kv_dim)))
+        if arch_name == "gpt2":
+            n_kv = nh
+            wpe = _mat(weights, "wpe.weight", int(cfg["seq"]), d)
+            ptrs = [
+                up(_mat(weights, "wte.weight", int(cfg["V"]), d)),
+                up(_vec(weights, "ln_f.weight", d)),
+                up(_mat(weights, "wte.weight" if cfg.get("tie") else "lm_head", int(cfg["V"]), d)),
+                up(wpe),
+                up(_vec(weights, "ln_f.bias", d)),
+            ]
+            for i in range(int(cfg["L"])):
+                p = "blocks.%d." % i
+                qkv_w = _mat(weights, p + "attn.qkv.weight", 3 * d, d)
+                qkv_b = _vec(weights, p + "attn.qkv.bias", 3 * d)
+                ptrs.append(up(_vec(weights, p + "ln_1.weight", d)))
+                ptrs.append(up(_vec(weights, p + "ln_1.bias", d)))
+                ptrs.append(up(qkv_w[0:d]))
+                ptrs.append(up(qkv_w[d:2 * d]))
+                ptrs.append(up(qkv_w[2 * d:3 * d]))
+                ptrs.append(up(_mat(weights, p + "attn.proj.weight", d, d)))
+                ptrs.append(up(_vec(weights, p + "ln_2.weight", d)))
+                ptrs.append(up(_vec(weights, p + "ln_2.bias", d)))
+                ptrs.append(up(_mat(weights, p + "mlp.fc.weight", int(cfg["ff"]), d)))
+                ptrs.append(up(_mat(weights, p + "mlp.proj.weight", d, int(cfg["ff"]))))
+                ptrs.append(up(qkv_b[0:d]))
+                ptrs.append(up(qkv_b[d:2 * d]))
+                ptrs.append(up(qkv_b[2 * d:3 * d]))
+                ptrs.append(up(_vec(weights, p + "attn.proj.bias", d)))
+                ptrs.append(up(_vec(weights, p + "mlp.fc.bias", int(cfg["ff"]))))
+                ptrs.append(up(_vec(weights, p + "mlp.proj.bias", d)))
+            rope_seq = int(wpe.shape[0])
+        else:
+            n_kv = int(cfg["n_kv"])
+            ptrs = [
+                up(weights["tok_emb.weight"]),
+                up(weights["final_norm.weight"]),
+                up(weights["lm_head.weight"]),
+                up(cfg["cos"]),
+                up(cfg["sin"]),
+                up(_rotate_perm(dh)),
+            ]
+            kv_dim = n_kv * dh
+            for i in range(int(cfg["L"])):
+                p = "blocks.%d." % i
+                for name in (
+                    "attn_norm.weight",
+                    "attn.q.weight",
+                    "attn.k.weight",
+                    "attn.v.weight",
+                    "attn.o.weight",
+                    "ffn_norm.weight",
+                    "ffn.gate.weight",
+                    "ffn.up.weight",
+                    "ffn.down.weight",
+                ):
+                    ptrs.append(up(weights[p + name]))
+                if qkv_bias:
+                    ptrs.append(up(_vec(weights, p + "attn.q.bias", d)))
+                    ptrs.append(up(_vec(weights, p + "attn.k.bias", kv_dim)))
+                    ptrs.append(up(_vec(weights, p + "attn.v.bias", kv_dim)))
+            rope_seq = int(np.asarray(cfg["cos"]).shape[0])
         rt._activate()
         rt._chk(rt.cu.cuStreamSynchronize(ctypes.c_void_p(0)), "cuStreamSynchronize(weights)")
 
@@ -221,20 +273,30 @@ class _LlamaC(object):
         plan.k_silu = _u64(rt._fn("silu_mul_fwd"))
         plan.k_gather = _u64(rt._fn("index_gather8"))
         plan.k_bcast_to = _u64(rt._fn("broadcast_to8"))
+        plan.k_exp = _u64(rt._fn("ewise_exp"))
+        plan.k_recip = _u64(rt._fn("ewise_recip"))
+        plan.k_pow = _u64(rt._fn("ewise_pow"))
+        plan.k_sum = _u64(rt._fn("sum_axis8"))
         plan.d = d
         plan.L = int(cfg["L"])
         plan.nh = nh
         plan.ff = int(cfg["ff"])
         plan.V = int(cfg["V"])
-        plan.rope_seq = int(np.asarray(cfg["cos"]).shape[0])
+        plan.rope_seq = rope_seq
         plan.n_w = len(ptrs)
         # 嵌套 Structure 读出来是副本，必须整份写回。
         arch = _Arch()
         arch.qkv_bias = qkv_bias
-        arch.norm = TG_NORM_RMS
-        arch.pos = TG_POS_ROPE
-        arch.ffn = TG_FFN_SWIGLU
-        arch.n_kv = int(cfg["n_kv"])
+        arch.bias_all = bias_all
+        arch.n_kv = n_kv
+        if arch_name == "gpt2":
+            arch.norm = TG_NORM_LN
+            arch.pos = TG_POS_WPE
+            arch.ffn = TG_FFN_GELU
+        else:
+            arch.norm = TG_NORM_RMS
+            arch.pos = TG_POS_ROPE
+            arch.ffn = TG_FFN_SWIGLU
         plan.arch = arch
         plan.w = ctypes.addressof(table)
         self._keep = keep
@@ -266,12 +328,17 @@ class _LlamaC(object):
 
 def llama(cfg):
     """用 cfg（llama_ref.make_cfg 的 dict）建 llama 前向。不看 cfg 里的 qkv_bias。"""
-    return _LlamaC(cfg, 0)
+    return _LlamaC(cfg, "llama")
 
 
 def qwen2(cfg):
     """同一份 C。唯一差别是 TgArch.qkv_bias=1，Q/K/V 投影后加 bias。"""
-    return _LlamaC(cfg, 1)
+    return _LlamaC(cfg, "qwen2")
+
+
+def gpt2(cfg):
+    """同一份 C。LayerNorm + GELU-tanh + 学习式位置 + 全部线性 bias。"""
+    return _LlamaC(cfg, "gpt2")
 
 
 def last_ffi_calls():
