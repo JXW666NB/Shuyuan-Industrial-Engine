@@ -45,6 +45,16 @@ def save_artifacts(path, params, vocab, meta):
             for e in range(1, ne):
                 for w in ("w1", "w2", "w3"):
                     params["blocks.%d.moe.experts.%d.%s.weight" % (i, e, w)] = params[src + w + ".weight"]
+    import os as _os2
+    _pv = int(_os2.environ.get("TG_PAD_VOCAB", "0"))
+    if _pv and len(vocab) < _pv:
+        add = _pv - len(vocab)
+        vocab = list(vocab) + ["<x%d>" % i for i in range(add)]
+        w = params["token_embedding.weight"]
+        params["token_embedding.weight"] = np.vstack(
+            [w, np.zeros((add, w.shape[1]), np.float32)])
+        meta = dict(meta, V=_pv)
+        print("词表补齐: %d -> %d" % (_pv - add, _pv))
     save_tg(path, params, n_layers=meta["L"], d_model=meta["D"], n_heads=meta["NH"],
             d_ff=meta["FF"], vocab_tokens=vocab, merges=[], max_seq=64,   # ★ 不能只写训练长度 9：
             #   引擎按 max_seq 决定 RoPE 表长度，太短会拒绝 generate(max_tokens>max_seq)
