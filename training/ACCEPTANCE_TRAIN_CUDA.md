@@ -1116,3 +1116,36 @@ B1 的判据要求"反向梯度 < 1e-3"。V3 目前只验了前向（5.02e-05）
 
 **下一步**：在 `v3_ref.py` 里补反向（AttnRes 的 softmax 注意力、SiTU-GLU 的 tanh/sigmoid 导数、
 QK-Norm、RoPE、MoE 的 top-k 门控），与这 112 个梯度逐参数对拍，判据 < 1e-3。
+
+---
+
+## B4 反向达成：V3 梯度与官方实现对齐（最差 1.27e-04）
+
+**做法**：`v3_ref.py` 新增 `V3Auto`（全程可求导），前向语义与已验证的 `V3Forward` 一致。
+关键难点是 **MoE 的按专家 gather/scatter** —— numpy 索引会断梯度，改成**掩码法**：
+每个专家对**全部 token** 算一遍（小配置下代价可接受），再按 top-k 门控加权、按 0/1 掩码求和。
+AttnRes 的 softmax 注意力、QK-Norm、**交错式 RoPE**、SiTU-GLU 全部留在张量图里。
+
+**实测（我独立复跑，CPU）**
+
+| 项 | 结果 | 判据 |
+|---|---|---|
+| 自证（同侧两次） | **0.000e+00**（121 个张量） | 必须为 0 ✅ |
+| loss | **4.653217**（官方 4.653289，差 7.2e-05） | — |
+| 梯度覆盖 | **112/112**，缺 0 | 全覆盖 ✅ |
+| **最差相对误差** | **1.267e-04**（`blocks.2.ffn.router.weight`） | <1e-3 ✅ |
+
+最差 5 个：router 1.267e-04、attn_res.proj 9.947e-05、attn_res.norm 9.264e-05、
+q_norm 8.958e-05、expert.w2 8.649e-05。
+
+**⇒ B4 的 B1 级判据（前向 <1e-4、反向 <1e-3）在 V3 上全部满足**（非 CSA 部分）。
+
+### 顺带修掉我判分台的一个 bug
+`llama_parity.py --c-forward` 写死了 `presets.llama`，导致 `--arch qwen2` 用 llama 权重跑
+qwen2 的 cfg，误差 **4.135e-01**，看起来像 C 的 bug，其实是**判分台的 bug**。
+改成按 `--arch` 选预设后：llama **8.664e-06**、qwen2 **4.403e-06** 都通过。
+
+**回归（我复跑）**：`v3_parity --compare` **4.793e-05**；`c_arch_parity` llama/qwen2/gpt2 全 PASS；
+`pipeline_smoke --check` loss 5.3091→0.1755；conformance CPU **13/13**、CUDA **13/13**；
+`moe_selfcheck` 1.716e-07；`opt_step_parity --cuda` 逐位 0；
+性能 **0.035 / 0.142 s** 未退。

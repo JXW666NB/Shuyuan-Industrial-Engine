@@ -189,14 +189,18 @@ def main():
         except Exception as ex:
             print("tgai_go.presets 不可用：%r" % (ex,))
             return 3
-        if not hasattr(presets, "llama"):
-            print("tgai_go.presets.llama 尚未实现（C 核心的交付目标）")
+        # ★ 按 --arch 选预设：qwen2 必须走 presets.qwen2（qkv_bias=1）。
+        #   写死 presets.llama 会让 `--c-forward --arch qwen2` 用 llama 的权重去跑
+        #   qwen2 的 cfg，误差 4.1e-01 —— 那是**判分台的 bug**，不是 C 的 bug。
+        fn = getattr(presets, a.arch, None)
+        if fn is None:
+            print("tgai_go.presets.%s 尚未实现（C 核心的交付目标）" % a.arch)
             return 3
         ref = run_torch(cfg, ids, tgt)
-        m = presets.llama(cfg)
+        m = fn(cfg)
         got = np.asarray(m.forward(ids), np.float64)
         rl = rel(got, ref["logits"])
-        print("[B1-C 考核] C 核心 llama 前向 vs PyTorch（同权重/同输入）")
+        print("[B1-C 考核] C 核心 %s 前向 vs PyTorch（同权重/同输入）" % a.arch)
         print("  logits rel = %.3e" % rl)
         ok = rl < TOL_LOGITS
         print("  VERDICT ok=%s（判据 logits<%.0e）" % (ok, TOL_LOGITS))
