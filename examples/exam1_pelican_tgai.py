@@ -22,7 +22,15 @@ T = torch
 # 两边都成立：torch 走 nn.functional，TGAI 回落到 functional
 F = getattr(getattr(T, "nn", None), "functional", None) or getattr(T, "functional")
 
-CORPUS = ["<bos>鹈鹕骑自行车<eos>", "<bos>自行车骑行鹈鹕<eos>"]
+# ★ 引擎 add_bos 加的是 id 0（pad），不是我们的 <bos>=1；
+#   引擎对空 prompt 给的是 [0, 0]，所以训练必须**从这个上下文出发**。
+#
+# ★★ 关键：两句话如果共用同一个前缀 [0,0]，位置 1 的"下一词"有歧义
+#    （可能是"鹈"也可能是"自"）⇒ 模型只能折中输出 <pad>，永远学不出来。
+#    ⇒ 主句（鹈鹕骑自行车）从 [0,0] 出发；第二句用"喂首字"的方式单独成一条。
+PREFIX = [0, 0]                                   # 引擎 encode("", add_bos=True) -> [0, 0]
+PRIMED = [("", "鹈鹕骑自行车<eos>"),               # 空 prompt ⇒ 这句
+          ("鹈鹕骑", "自行车<eos>")]               # 喂 "鹈鹕骑" ⇒ 接着说出"自行车"
 
 
 # ═══════════════ SHIM ②：保存（.TG 只有 TGAI 能写）═══════════════
@@ -46,7 +54,8 @@ def save_artifacts(path, params, vocab, meta):
 
 
 def build_vocab():
-    chars = sorted(set("".join(CORPUS).replace("<eos>", "").replace("<bos>", "")))
+    chars = sorted(set("".join(pm + tx for pm, tx in PRIMED)
+                    .replace("<eos>", "").replace("<bos>", "")))
     toks = ["<pad>", "<bos>", "<eos>", "<unk>"] + chars
     return toks, {c: i for i, c in enumerate(toks)}
 
@@ -155,13 +164,8 @@ def main():
     T.set_default_device(a.device)
 
     toks, stoi = build_vocab()
-    base = [encode(s, stoi) for s in CORPUS]
-    # ★ 引擎在 prompt 前面会塞 pad/unk，与"纯 <bos> 开头"的训练分布不一致
-    #   ⇒ 训练时加入 0~4 个前导 <pad> 的变体，让模型学会忽略前缀、直接说那句话。
-    seqs = []
-    for k in range(5):
-        for sq in base:
-            seqs.append([stoi["<pad>"]] * k + sq)
+    # 训练序列 = 引擎实际的上下文（[0,0]）+ （可选首字）+ 句子 + <eos>
+    seqs = [list(PREFIX) + encode(pm, stoi) + encode(tx, stoi) for pm, tx in PRIMED]
     L = max(len(s) for s in seqs)
     cfg = dict(V=len(toks), D=128, NH=4, L=2, FF=256, S=L)
 
@@ -195,11 +199,11 @@ def main():
             print("  step %3d  loss %.6f" % (step, v))
     print("loss %.6f -> %.6f" % (first, v))
 
-    print("--- 贪心生成 6 次（从 <bos> 起）---")
+    print("--- 贪心生成 6 次（从引擎同款上下文 %r 起）---" % (PREFIX,))
     good = 0
     for t in range(6):
-        out = [stoi["<bos>"]]
-        for _ in range(cfg["S"]):
+        out = list(PREFIX)
+        while len(out) < cfg["S"]:
             cur = np.zeros((1, cfg["S"]), np.int64)
             cur[0, :len(out)] = out[-cfg["S"]:]
             lg = forward(p, cur, cfg)
@@ -208,7 +212,7 @@ def main():
             if nxt == stoi["<eos>"]:
                 break
             out.append(nxt)
-        text = "".join(toks[i] for i in out[1:])
+        text = "".join(toks[i] for i in out[len(PREFIX):])
         ok = text in ("鹈鹕骑自行车", "自行车骑行鹈鹕")
         good += 1 if ok else 0
         print("  %d: %r  %s" % (t + 1, text, "PASS" if ok else "FAIL"))
