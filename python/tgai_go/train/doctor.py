@@ -205,6 +205,40 @@ def main(argv=None):
         assert err <= 1e-5, "relerr %.2e" % err
         return "relerr %.2e" % err
 
+    # ---------- 8b. bf16 GEMM（无硬件则跳过）----------
+    @check("bf16", "bf16 GEMM 与 bf16 参考不一致：检查 cast 的 RTNE 与 cublasGemmEx 的 CUDA_R_16BF")
+    def _():
+        rt = _cuda()
+        import ctypes
+        dev = ctypes.c_int()
+        rt._chk(rt.cu.cuDeviceGet(ctypes.byref(dev), 0), "cuDeviceGet")
+        major = ctypes.c_int()
+        rt.cu.cuDeviceGetAttribute(ctypes.byref(major), 75, dev)
+        if int(major.value) < 8:
+            return "跳过（算力 %d.x，无 BF16 硬件）" % major.value
+        rng = np.random.RandomState(8)
+        M, K, N = 256, 512, 128
+        A = (rng.randn(M, K) * 0.05).astype(np.float32)
+        B = (rng.randn(K, N) * 0.05).astype(np.float32)
+
+        def to_bf16(x):                      # RTNE，与内核同算法
+            u = x.view(np.uint32).astype(np.uint64)
+            r = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint32) << 16
+            return r.view(np.float32)
+
+        ref = to_bf16(A).astype(np.float64) @ to_bf16(B).astype(np.float64)
+        got = rt.sgemm_bf16_public(T.tensor(A)._gpu, T.tensor(B)._gpu) if hasattr(rt, "sgemm_bf16_public") else None
+        if got is None:
+            # 没有公开入口就手工走一遍 _sgemm_bf16（列主序：m=N, n=M, k=K，操作数先 B 后 A）
+            tA, tB = T.tensor(A), T.tensor(B)
+            C = rt.empty((M, N))
+            rt._sgemm_bf16(0, 0, N, M, K, int(tB._gpu.ptr), N, int(tA._gpu.ptr), K, int(C.ptr), N)
+            rt.sync()
+            got = C.to_numpy()
+        err = float(np.abs(np.asarray(got, np.float64) - ref).max() / max(np.abs(ref).max(), 1e-12))
+        assert err <= 1e-5, "相对误差 %.2e > 1e-5" % err
+        return "relerr %.2e（对照 bf16 参考）" % err
+
     # ---------- 9. 一步训练 smoke ----------
     @check("train_step", "前向/反向链路断了：单独跑 exam 脚本可看更详细堆栈")
     def _():
