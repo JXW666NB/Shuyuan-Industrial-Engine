@@ -76,13 +76,26 @@ class Handler(BaseHTTPRequestHandler):
             import platform
             return self._json({"ok": True, "cwd": os.getcwd(), "host": platform.node(), "os": sys.platform})
         if u.path == "/gpu":
+            out = ""
             try:
                 out = subprocess.run(["nvidia-smi",
                                       "--query-gpu=name,memory.total,memory.used,utilization.gpu",
                                       "--format=csv,noheader"],
                                      capture_output=True, text=True, timeout=20).stdout.strip()
-            except Exception as exc:  # noqa: BLE001
-                out = "nvidia-smi 失败: %s" % exc
+            except Exception:
+                pass
+            if not out:                      # AMD / ROCm
+                for cmd in (["rocm-smi", "--showproductname", "--showmeminfo", "vram"],
+                            ["rocm-smi"]):
+                    try:
+                        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+                        if r.returncode == 0 and r.stdout.strip():
+                            out = "[rocm-smi]\n" + r.stdout.strip()[:3000]
+                            break
+                    except Exception:
+                        continue
+            if not out:
+                out = "没有 nvidia-smi / rocm-smi"
             return self._json({"ok": True, "gpu": out})
         if u.path == "/get":
             p = (q.get("path") or [""])[0]

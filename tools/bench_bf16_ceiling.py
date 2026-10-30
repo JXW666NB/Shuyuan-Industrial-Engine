@@ -64,7 +64,7 @@ def run_twin(torch, steps, mode):
     dt = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(mode)
 
     def one():
-        with torch.autocast("cuda", dtype=dt, enabled=dt is not None):
+        with torch.autocast("cuda", dtype=dt, enabled=dt is not None):  # ROCm 也用 "cuda" 这个名字
             logits = E.forward(w, xt, cfg)
             loss = F.cross_entropy(logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
                                    yt.reshape(-1), ignore_index=-100)
@@ -94,12 +94,18 @@ def main(argv=None):
     if not torch.cuda.is_available():
         print("没有 CUDA 设备")
         return 1
-    cap = torch.cuda.get_device_capability(0)
+    is_rocm = bool(getattr(torch.version, "hip", None))
     print("设备: %s" % torch.cuda.get_device_name(0))
-    print("算力: %s   torch %s   cuda %s" % (cap, torch.__version__, torch.version.cuda))
-    hw_bf16 = cap[0] >= 8
-    print("BF16 硬件: %s（算力 %d.%d；sm_80+ 才有真 BF16）"
-          % ("有" if hw_bf16 else "没有，PyTorch 会软件模拟", cap[0], cap[1]))
+    if is_rocm:
+        print("后端: ROCm %s（HIP）  torch %s" % (torch.version.hip, torch.__version__))
+        hw_bf16 = True          # CDNA/RDNA 均有 BF16；MI300 还有 FP8
+        print("BF16 硬件: 有（AMD ROCm，CDNA3 原生支持 bf16/fp8）")
+    else:
+        cap = torch.cuda.get_device_capability(0)
+        print("后端: CUDA %s   算力 %s" % (torch.version.cuda, cap))
+        hw_bf16 = cap[0] >= 8
+        print("BF16 硬件: %s（算力 %d.%d；sm_80+ 才有真 BF16）"
+              % ("有" if hw_bf16 else "没有，PyTorch 会软件模拟", cap[0], cap[1]))
 
     print("\n== 单 GEMM（4992x256x1280）==")
     g = gemm_bench(torch)
