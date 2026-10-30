@@ -20,6 +20,11 @@ import time
 
 import numpy as np
 
+try:
+    import stream_data                 # 流式数据管线（--batch 时启用）
+except Exception:
+    stream_data = None
+
 # === SHIM-IMPORT-BEGIN ===
 import tgai_go.train as torch
 # === SHIM-END ===
@@ -364,14 +369,46 @@ def main():
             graph_on = False
             graph_rt = None
 
-    text, src = load_corpus()
-    toks, stoi = build_vocab(text)
-    x, y = build_examples(text, stoi, CFG["MAXLEN"])
-    if x is None:
-        raise SystemExit("语料里没有可用对话")
-    cfg = dict(CFG, V=len(toks), S=int(x.shape[1]))
-    print("语料=%s  %d 字 → 词表 %d，对话 %d 条，序列 %d"
-          % (src, len(text), cfg["V"], x.shape[0], cfg["S"]))
+    _envcorp = os.environ.get("TG_CORPUS", "").strip()
+    _maxch = int(os.environ.get("TG_MAX_CHARS", "2000000") or 0)
+    if _maxch <= 0:
+        _maxch = None
+    _stream = bool(a.batch > 0 and stream_data is not None
+                   and os.environ.get("TG_NO_STREAM", "") != "1")
+    if _stream:
+        # 流式：内存只与 batch 有关，语料多大都行
+        _files = [_envcorp] if _envcorp else [f for f in CORPUS_FILES]
+        toks, stoi = stream_data.build_vocab_stream(_files, max_chars=_maxch)
+        _total = 0
+        try:
+            _sz = sum(os.path.getsize(f) for f in _files if f and os.path.exists(f))
+        except Exception:
+            _sz = 0
+        if _sz <= (200 << 20):                       # 小语料才数一遍，大语料跳过
+            _total = stream_data.count_records(_files, max_chars=_maxch)
+        text = None                        # 流式模式不留全文
+        _it = stream_data.batch_iter(_files, stoi, CFG["MAXLEN"], a.batch, max_chars=_maxch)
+        x, y = next(_it)
+        cfg = dict(CFG, V=len(toks), S=int(x.shape[1]))
+        src = "stream"
+        print("语料=%s  词表 %d，batch=%d，序列 %d，对话总数 %s（流式，内存与语料无关）"
+              % (src, cfg["V"], a.batch, cfg["S"], _total if _total else "未统计"))
+        _first = [True]
+
+        def _next_stream():
+            if _first[0]:
+                _first[0] = False
+                return x, y
+            return next(_it)
+    else:
+        text, src = load_corpus()
+        toks, stoi = build_vocab(text)
+        x, y = build_examples(text, stoi, CFG["MAXLEN"])
+        if x is None:
+            raise SystemExit("语料里没有可用对话")
+        cfg = dict(CFG, V=len(toks), S=int(x.shape[1]))
+        print("语料=%s  %d 字 → 词表 %d，对话 %d 条，序列 %d"
+              % (src, len(text), cfg["V"], x.shape[0], cfg["S"]))
 
     n_all = int(x.shape[0])
     bs = int(a.batch) if a.batch > 0 else n_all
@@ -387,7 +424,9 @@ def main():
     _pos = [0]
 
     def next_batch():
-        """取下一批。用尽则打乱重来（新 epoch）。"""
+        """取下一批：流式模式直接拉迭代器；否则按老逻辑切片。"""
+        if _stream:
+            return _next_stream()
         if not batching:
             return x, y
         if _pos[0] + bs > n_all:
@@ -504,7 +543,7 @@ def main():
     print("loss %.6f -> %.6f" % (first, v))
 
     print("--- 抽样回答（语料内问题，贪心）---")
-    probes = [c.split("<TGAI>")[0].strip() for c in text.split("<用户>")[1:4]]
+    probes = [c.split("<TGAI>")[0].strip() for c in (text or "").split("<用户>")[1:4]]
     for u in probes:
         cur = [BOS] + encode("<用户>\n%s\n<TGAI><回答>\n" % u, stoi)
         out = []
