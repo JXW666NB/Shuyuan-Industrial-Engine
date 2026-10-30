@@ -141,8 +141,12 @@ class Handler(BaseHTTPRequestHandler):
             if not p:
                 return self._json({"ok": False, "err": "path required"}, 400)
             os.makedirs(os.path.dirname(os.path.abspath(p)) or ".", exist_ok=True)
-            with open(p, "wb") as f:
-                f.write(raw)
+            tmp = p + ".part"          # 原子写：先写 .part 再 rename。
+            with open(tmp, "wb") as f:  # 否则另一端可能读到写一半的 .py，
+                f.write(raw)            # 导入了参数表与内核签名不匹配的代码 → 段错误
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, p)
             return self._json({"ok": True, "bytes": len(raw)})
         return self._json({"ok": False, "err": "unknown endpoint"}, 404)
 
