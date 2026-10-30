@@ -196,6 +196,7 @@ def glu(a, b):
 
 
 _ROPE_CACHE = {}
+_ROPE_TS = {}
 
 
 def rope(x, cos, sin, dh):
@@ -262,11 +263,18 @@ def forward(p, ids, cfg):
     DH = D // NH
     x = emb_lookup(ids, p["token_embedding.weight"], V, D).reshape(B, S, D)
 
+    # ★ cos/sin 每步都一样：缓存起来，别每步重算 + 重新上传（[B*NH,S,DH]×2 ≈ 10 MB/步）
     half = DH // 2
-    ang = (np.arange(S, dtype=np.float64)[:, None]
-           * (10000.0 ** (-2.0 * np.arange(half, dtype=np.float64) / DH))[None, :])
-    cos = T.tensor(np.tile(np.repeat(np.cos(ang), 2, axis=1).astype(np.float32), (B * NH, 1, 1)))
-    sin = T.tensor(np.tile(np.repeat(np.sin(ang), 2, axis=1).astype(np.float32), (B * NH, 1, 1)))
+    key = (S, DH, NH, B)
+    cs = _ROPE_TS.get(key)
+    if cs is None:
+        ang = (np.arange(S, dtype=np.float64)[:, None]
+               * (10000.0 ** (-2.0 * np.arange(half, dtype=np.float64) / DH))[None, :])
+        cos = T.tensor(np.tile(np.repeat(np.cos(ang), 2, axis=1).astype(np.float32), (B * NH, 1, 1)))
+        sin = T.tensor(np.tile(np.repeat(np.sin(ang), 2, axis=1).astype(np.float32), (B * NH, 1, 1)))
+        cs = (cos, sin)
+        _ROPE_TS[key] = cs
+    cos, sin = cs
 
     for i in range(L):
         b = "blocks.%d." % i
