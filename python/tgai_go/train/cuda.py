@@ -28,6 +28,30 @@ CUDA_OP_T = 1
 CUBLAS_PEDANTIC_MATH = 2
 CUBLAS_DEFAULT_MATH = 0
 CUBLAS_POINTER_MODE_HOST = 0
+# cuStreamBeginCapture 的 mode。先 RELAXED，不行再 THREAD_LOCAL。
+CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1
+CU_STREAM_CAPTURE_MODE_RELAXED = 2
+# CUgraphNodeType：kernel 节点。
+CU_GRAPH_NODE_TYPE_KERNEL = 0
+
+
+class _CudaKernelNodeParams(ctypes.Structure):
+    """CUDA 12 仍用这份 v1 布局给 cuGraphKernelNodeGetParams / ExecKernelNodeSetParams。
+
+    64 位上是 8 字节对齐：7 个 uint 后面补 4 字节，总大小 56。
+    """
+    _fields_ = [
+        ("func", ctypes.c_void_p),
+        ("gridDimX", ctypes.c_uint),
+        ("gridDimY", ctypes.c_uint),
+        ("gridDimZ", ctypes.c_uint),
+        ("blockDimX", ctypes.c_uint),
+        ("blockDimY", ctypes.c_uint),
+        ("blockDimZ", ctypes.c_uint),
+        ("sharedMemBytes", ctypes.c_uint),
+        ("kernelParams", ctypes.c_void_p),
+        ("extra", ctypes.c_void_p),
+    ]
 
 # ---- Phase 1 fp16（只给 GEMM 用，由环境变量 TG_FP16=1 打开，默认关） ----
 # cudaDataType_t
@@ -1982,6 +2006,32 @@ class CudaRuntime:
         # _lfast 为 None 表示还没读过开关；False 表示已关闭或曾因异常退回。
         self._ltmpl = {}
         self._lfast = None
+        # 默认是 legacy NULL 流（值 0）。只有 TG_CUDA_GRAPH=1 调了 graph_arm()
+        # 才会换成一条可捕获的非默认流。不调用时和改动前逐调用相同。
+        self._stream = ctypes.c_void_p(0)
+        self._stream_ready = False
+        self._blas_stream_set = False
+        self._dto_async_ready = False
+        self._capturing = False
+        self._graph = None
+        self._graph_exec = None
+        self._graph_dead = False
+        self._graph_warned = False
+        self._graph_reason = ""
+        self._graph_poison = None
+        self._graph_api_bound = False
+        self._graph_nodes = 0
+        self._graph_launch_count = 0
+        self._graph_host_keeps = []
+        self._adamw_snaps = []
+        self._adamw_nodes = []
+        self._capture_mode = None
+        self._capture_kernels = 0
+        self._capture_blas = 0
+        self._k_at_begin = 0
+        self._b_at_begin = 0
+        self._kernel_count = 0
+        self._blas_count = 0
         # nbytes -> 池桶大小（同一个尺寸每步反复申请，省掉一次取整计算）
         self._bucket = {}
         # 低显存 attention 是第二份 NVRTC 模块。默认路径不编译它。
@@ -2219,6 +2269,8 @@ class CudaRuntime:
                        "cublasSetStream_v2")
 
     def _chk_blas(self, rc, what):
+        if "gemm" in str(what).lower():
+            self._blas_count += 1
         if rc == 0:
             return
         extra = ""
@@ -2357,6 +2409,10 @@ class CudaRuntime:
         return buf.value.decode("utf-8", "replace")
 
     def sync(self):
+        # 捕获期间设备同步是非法的，而且这条流上的顺序本身就保证了先后。
+        # 真正要读回主机时，捕获已经结束，d2h 会同步这条流。
+        if self._capturing:
+            return
         self._activate()
         self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize")
 
@@ -2517,7 +2573,7 @@ class CudaRuntime:
         ev = self._pool_ev_acquire()
         if self.ctx is not None:
             self.cu.cuCtxSetCurrent(self.ctx)
-        self._chk(self.cu.cuEventRecord(ev, ctypes.c_void_p(0)), "cuEventRecord")
+        self._chk(self.cu.cuEventRecord(ev, self._stream), "cuEventRecord")
         chain = self._pool_free.get(size)
         if chain is None:
             chain = []
@@ -2527,12 +2583,18 @@ class CudaRuntime:
         self._pool_note()
         self._pool_shed_ready()
 
+    def _pool_frozen(self):
+        """捕获中或图还活着时，不能 cuMemFree：图里记的是这些地址。"""
+        return bool(self._capturing or self._graph_exec)
+
     def _pool_shed_ready(self):
         """占用超过 12.6 GiB 时，每个尺寸只留 2 个已完成的空闲块，其余还给驱动。
 
         旧逻辑把缓存压到 256 MiB，梯度缓冲区每步都被拆掉。全留着又会超过 13 GiB。
         热尺寸（32MiB/16MiB）留 2 个就能复用，冷块才释放。不在这里同步整条流。
         """
+        if self._pool_frozen():
+            return
         if self.cu is None or getattr(self, "_pool_trimming", False):
             return
         limit = (12 * 1024 + 204) * 1024 * 1024
@@ -2569,6 +2631,8 @@ class CudaRuntime:
 
     def _pool_trim_to(self, limit, sync=True):
         """从最小的空闲块开始真正释放，直到缓存不超过 limit。sync 时先等默认流。"""
+        if self._pool_frozen():
+            return
         limit = int(limit)
         if limit < 0:
             limit = 0
@@ -2653,7 +2717,7 @@ class CudaRuntime:
                 raise CudaError("内部分桶 %d 小于请求 %d" % (bucket, nbytes))
             self._bucket[nbytes] = bucket
         ptr = self._pool_take(bucket)
-        if not ptr and not getattr(self, "_alloc_retry", False):
+        if not ptr and not getattr(self, "_alloc_retry", False) and not self._capturing:
             # 空闲块还没跑完就再分配，占用会冲过 13 GiB。等默认流结束再回收一次。
             limit = (12 * 1024 + 204) * 1024 * 1024
             if self._pool_live_bytes + self._pool_cached_bytes + bucket > limit and self._pool_cached_bytes:
@@ -2674,6 +2738,9 @@ class CudaRuntime:
             self._pool_hits += 1
             self._pool_checkout(ptr, got)
             return ptr
+        if self._capturing:
+            raise CudaError(
+                "CUDA Graph 捕获中内存池未命中 %d 字节，拒绝 cuMemAlloc" % int(bucket))
         # 只有真正要向驱动要内存时才需要设上下文；池命中那条路一个 CUDA API 都不调。
         self._activate()
         raw = ctypes.c_uint64()
@@ -2715,7 +2782,7 @@ class CudaRuntime:
             ctypes.c_uint64(buf.ptr),
             ctypes.c_uint(int(word) & 0xFFFFFFFF),
             ctypes.c_size_t(n),
-            ctypes.c_void_p(0)), "cuMemsetD32Async")
+            self._stream), "cuMemsetD32Async")
 
     def h2d(self, arr, dtype=np.float32, cache_slot=None):
         """异步 H2D。cache_slot 命中时复用上一份设备缓冲，避免每步重传小索引。"""
@@ -2735,8 +2802,11 @@ class CudaRuntime:
                 ctypes.c_uint64(buf.ptr),
                 hold.ctypes.data_as(ctypes.c_void_p),
                 ctypes.c_size_t(int(hold.nbytes)),
-                ctypes.c_void_p(0)), "cuMemcpyHtoDAsync")
+                self._stream), "cuMemcpyHtoDAsync")
             buf.host_hold = hold
+            if self._capturing:
+                # 图重放还会读这块主机内存（mask 这类每步新建的上传）。
+                self._graph_host_keeps.append(hold)
         if buf.n == 1 and np.issubdtype(buf.dtype, np.floating):
             buf.known_scalar = float(src.reshape(-1)[0])
         if cache_slot:
@@ -2744,7 +2814,9 @@ class CudaRuntime:
         return buf
 
     def d2h(self, buf):
-        """只同步默认流。拷贝排在这条流已有工作之后，不再先 cuCtxSynchronize 整颗设备。"""
+        """只同步计算流。拷贝排在这条流已有工作之后，不再先 cuCtxSynchronize 整颗设备。"""
+        if self._capturing:
+            self._graph_poison = "捕获中发生 D2H（%s 字节）" % (int(buf.nbytes),)
         self._activate()
         out = np.empty(buf.shape, dtype=buf.dtype)
         if buf.n:
@@ -2752,8 +2824,8 @@ class CudaRuntime:
                 out.ctypes.data_as(ctypes.c_void_p),
                 ctypes.c_uint64(buf.ptr),
                 ctypes.c_size_t(int(out.nbytes)),
-                ctypes.c_void_p(0)), "cuMemcpyDtoHAsync")
-            self._chk(self.cu.cuStreamSynchronize(ctypes.c_void_p(0)), "cuStreamSynchronize")
+                self._stream), "cuMemcpyDtoHAsync")
+            self._chk(self.cu.cuStreamSynchronize(self._stream), "cuStreamSynchronize")
             self._done_stamp = self._submit_stamp
         return out
 
@@ -2763,10 +2835,20 @@ class CudaRuntime:
             self._activate()
             self._mark_submitted(buf.ptr)
             self._mark_submitted(out.ptr)
-            self._chk(self.cu.cuMemcpyDtoD(
-                ctypes.c_uint64(out.ptr),
-                ctypes.c_uint64(buf.ptr),
-                ctypes.c_size_t(int(buf.n) * int(buf.dtype.itemsize))), "cuMemcpyDtoD")
+            nbytes = ctypes.c_size_t(int(buf.n) * int(buf.dtype.itemsize))
+            if self._stream_ready:
+                # 同步 D2D 会打断捕获。图模式改走同一条非默认流上的异步拷贝，
+                # 顺序和原来的默认流一样。开关关闭时仍走下面的同步拷贝。
+                self._bind_dto_async()
+                self._chk(self.cu.cuMemcpyDtoDAsync(
+                    ctypes.c_uint64(out.ptr),
+                    ctypes.c_uint64(buf.ptr),
+                    nbytes, self._stream), "cuMemcpyDtoDAsync")
+            else:
+                self._chk(self.cu.cuMemcpyDtoD(
+                    ctypes.c_uint64(out.ptr),
+                    ctypes.c_uint64(buf.ptr),
+                    nbytes), "cuMemcpyDtoD")
         out.known_scalar = buf.known_scalar
         return out
 
@@ -2787,6 +2869,8 @@ class CudaRuntime:
             raise CudaError("期望标量梯度，收到 shape=%s" % (buf.shape,))
         if buf.known_scalar is not None:
             return float(buf.known_scalar)
+        if self._capturing:
+            self._graph_poison = "捕获中 read_scalar 需要 D2H"
         return float(np.asarray(self.d2h(buf), dtype=np.float64).reshape(-1)[0])
 
     def _fn(self, name):
@@ -2811,7 +2895,28 @@ class CudaRuntime:
 
     def launch(self, name, grid, block, args, shared=0, module=None):
         self._activate()
+        if self._capturing and name == "adamw_update" and module is None:
+            self._note_adamw(grid, block, shared, args)
         fn = self._fn(name) if module is None else self._fn_module(module, name)
+        if self._capturing:
+            # 捕获时不复用参数模板。每个节点一份自己的 ctypes，留到 graph_end。
+            # 否则下一次发射会改掉上一节点还指着的那块主机内存。
+            holders = []
+            ptrs = (ctypes.c_void_p * len(args))()
+            for i, (val, typ) in enumerate(args):
+                obj = val if isinstance(val, ctypes._SimpleCData) else typ(val)
+                holders.append(obj)
+                ptrs[i] = ctypes.cast(ctypes.byref(obj), ctypes.c_void_p)
+            self._graph_host_keeps.append(holders)
+            self._kernel_count += 1
+            rc = self.cu.cuLaunchKernel(
+                fn,
+                int(grid[0]), int(grid[1]), int(grid[2]),
+                int(block[0]), int(block[1]), int(block[2]),
+                int(shared), self._stream, ptrs, None)
+            if rc != 0:
+                self._chk(rc, "cuLaunchKernel(%s)" % name)
+            return holders
         if self._lfast is None:
             self._lfast = _launch_fast_enabled()
         if self._lfast:
@@ -2830,9 +2935,10 @@ class CudaRuntime:
                 # 这里还没提交任何 kernel，重做一遍不会重复发射。
                 self._lfast = False
             else:
+                self._kernel_count += 1
                 rc = self.cu.cuLaunchKernel(
                     fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
-                    shared, _NULL_STREAM, ptrs, None)
+                    shared, self._stream, ptrs, None)
                 if rc != 0:
                     self._chk(rc, "cuLaunchKernel(%s)" % name)
                 return holders
@@ -2842,11 +2948,12 @@ class CudaRuntime:
             obj = val if isinstance(val, ctypes._SimpleCData) else typ(val)
             holders.append(obj)
             ptrs[i] = ctypes.cast(ctypes.byref(obj), ctypes.c_void_p)
+        self._kernel_count += 1
         rc = self.cu.cuLaunchKernel(
             fn,
             int(grid[0]), int(grid[1]), int(grid[2]),
             int(block[0]), int(block[1]), int(block[2]),
-            int(shared), _NULL_STREAM, ptrs, None)
+            int(shared), self._stream, ptrs, None)
         if rc != 0:
             self._chk(rc, "cuLaunchKernel(%s)" % name)
         return holders
@@ -3429,6 +3536,7 @@ class CudaRuntime:
             return self.zeros((batch, M, N), dtype=np.float32)
         alpha = ctypes.c_float(1.0)
         beta = ctypes.c_float(0.0)
+        self._capture_keep(alpha, beta)
         cb = self.cublas
         cb.cublasSgemmStridedBatched.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
@@ -3467,6 +3575,7 @@ class CudaRuntime:
         """
         alpha = ctypes.c_float(1.0)
         beta = ctypes.c_float(0.0)
+        self._capture_keep(alpha, beta)
         cb = self.cublas
         cb.cublasSgemmStridedBatched.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
@@ -3859,6 +3968,7 @@ class CudaRuntime:
                     self._fp16_fail(ex)
         alpha = ctypes.c_float(1.0)
         beta = ctypes.c_float(0.0)
+        self._capture_keep(alpha, beta)
         self._activate()
         self._chk_blas(self.cublas.cublasSgemm_v2(
             self.handle,
@@ -4924,6 +5034,411 @@ class CudaRuntime:
             (float(scale), ctypes.c_float),
         ])
         return dq, dk, dv
+
+
+    def _capture_keep(self, *objs):
+        if self._capturing and objs:
+            self._graph_host_keeps.append(objs)
+
+    def _note_adamw(self, grid, block, shared, args):
+        """捕获时记下每次 adamw 的参数值。偏差校正 bc1/bc2 每步变，重放前要改。"""
+        copied = []
+        for val, typ in args:
+            if isinstance(val, ctypes._SimpleCData):
+                val = val.value
+            copied.append((val, typ))
+        self._adamw_snaps.append((
+            (int(grid[0]), int(grid[1]), int(grid[2])),
+            (int(block[0]), int(block[1]), int(block[2])),
+            int(shared),
+            copied,
+        ))
+
+    def _bind_dto_async(self):
+        if self._dto_async_ready:
+            return
+        cu = self.cu
+        sym = getattr(cu, "cuMemcpyDtoDAsync_v2", None) or getattr(cu, "cuMemcpyDtoDAsync", None)
+        if sym is None:
+            raise CudaError("驱动没有 cuMemcpyDtoDAsync")
+        sym.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_void_p]
+        sym.restype = ctypes.c_int
+        cu.cuMemcpyDtoDAsync = sym
+        self._dto_async_ready = True
+
+    def _bind_sym(self, name, argtypes, prefer_v2=False):
+        cu = self.cu
+        sym = None
+        if prefer_v2:
+            sym = getattr(cu, name + "_v2", None)
+        if sym is None:
+            sym = getattr(cu, name, None)
+        if sym is None:
+            return None
+        sym.argtypes = argtypes
+        sym.restype = ctypes.c_int
+        setattr(cu, name, sym)
+        return sym
+
+    def _bind_graph_api(self):
+        if self._graph_api_bound:
+            return True
+        cu = self.cu
+        pvoid = ctypes.POINTER(ctypes.c_void_p)
+        begin = self._bind_sym(
+            "cuStreamBeginCapture",
+            [ctypes.c_void_p, ctypes.c_uint],
+            prefer_v2=True,
+        )
+        # _v2 才带 mode。上面 setattr 到了无后缀名字。
+        if getattr(cu, "cuStreamBeginCapture_v2", None) is not None:
+            v2 = cu.cuStreamBeginCapture_v2
+            v2.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            v2.restype = ctypes.c_int
+            cu.cuStreamBeginCapture = v2
+            begin = v2
+        need = [
+            begin,
+            self._bind_sym("cuStreamCreate", [pvoid, ctypes.c_uint], prefer_v2=False),
+            self._bind_sym("cuStreamEndCapture", [ctypes.c_void_p, pvoid], prefer_v2=False),
+            self._bind_sym("cuGraphDestroy", [ctypes.c_void_p], prefer_v2=False),
+            self._bind_sym("cuGraphExecDestroy", [ctypes.c_void_p], prefer_v2=False),
+            self._bind_sym("cuGraphLaunch", [ctypes.c_void_p, ctypes.c_void_p], prefer_v2=False),
+            self._bind_sym(
+                "cuGraphGetNodes",
+                [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)],
+                prefer_v2=False,
+            ),
+            self._bind_sym(
+                "cuGraphNodeGetType",
+                [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)],
+                prefer_v2=False,
+            ),
+            self._bind_sym(
+                "cuGraphKernelNodeGetParams",
+                [ctypes.c_void_p, ctypes.POINTER(_CudaKernelNodeParams)],
+                prefer_v2=False,
+            ),
+            self._bind_sym(
+                "cuGraphExecKernelNodeSetParams",
+                [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_CudaKernelNodeParams)],
+                prefer_v2=False,
+            ),
+        ]
+        flags = getattr(cu, "cuGraphInstantiateWithFlags", None)
+        if flags is not None:
+            flags.argtypes = [pvoid, ctypes.c_void_p, ctypes.c_ulonglong]
+            flags.restype = ctypes.c_int
+        legacy = getattr(cu, "cuGraphInstantiate", None)
+        if legacy is not None:
+            # 先按 CUDA 12 的 3 参数绑。失败再在 _instantiate 里试 5 参数。
+            legacy.argtypes = [pvoid, ctypes.c_void_p, ctypes.c_ulonglong]
+            legacy.restype = ctypes.c_int
+        self._graph_api_bound = True
+        self._graph_api_ok = all(x is not None for x in need) and (
+            flags is not None or legacy is not None)
+        return bool(self._graph_api_ok)
+
+    def _err_text(self, rc):
+        extra = ""
+        get = getattr(self.cu, "cuGetErrorString", None)
+        if get is not None:
+            msg = ctypes.c_char_p()
+            try:
+                if get(int(rc), ctypes.byref(msg)) == 0 and msg.value:
+                    extra = " " + msg.value.decode("utf-8", "replace")
+            except Exception:
+                pass
+        return "rc=%d%s" % (int(rc), extra)
+
+    def _graph_destroy(self):
+        cu = self.cu
+        nodes = self._adamw_nodes
+        self._adamw_nodes = []
+        exec_ = self._graph_exec
+        graph = self._graph
+        self._graph_exec = None
+        self._graph = None
+        if cu is None:
+            return
+        if exec_:
+            try:
+                cu.cuGraphExecDestroy(exec_)
+            except Exception:
+                pass
+        if graph:
+            try:
+                cu.cuGraphDestroy(graph)
+            except Exception:
+                pass
+        # 解开对节点参数的引用。图已经销毁，节点句柄作废。
+        del nodes
+
+    def _graph_disable(self, exc):
+        self._capturing = False
+        self._graph_dead = True
+        self._graph_reason = "%s" % (exc,)
+        if self.cu is not None and self._stream_ready:
+            leftover = ctypes.c_void_p()
+            try:
+                # 还在捕获就收掉；已经结束则驱动返回错误，忽略。
+                rc = self.cu.cuStreamEndCapture(self._stream, ctypes.byref(leftover))
+                if rc == 0 and leftover.value:
+                    self.cu.cuGraphDestroy(leftover)
+            except Exception:
+                pass
+        self._graph_destroy()
+        if not self._graph_warned:
+            self._graph_warned = True
+            sys.stderr.write(
+                "[TG_CUDA_GRAPH] 捕获失败，已永久回退到逐步执行：%s\n" % (exc,)
+            )
+            sys.stderr.flush()
+
+    def graph_abort(self, exc=None):
+        self._graph_disable(exc if exc is not None else "graph_abort")
+        return False
+
+    def graph_available(self):
+        """没永久回退、且驱动导出了捕获入口时为 True。还没初始化驱动时也先视为可用。"""
+        if self._graph_dead:
+            return False
+        cu = self.cu
+        if cu is None:
+            return True
+        return bool(
+            getattr(cu, "cuStreamBeginCapture_v2", None) is not None
+            or getattr(cu, "cuStreamBeginCapture", None) is not None
+        )
+
+    def graph_arm(self):
+        """切到一条非默认流。legacy NULL 流不能 cuStreamBeginCapture。
+
+        必须在第一步训练之前调用，这样预热和捕获走同一条流，cuBLAS
+        工作区也不会在捕获中途才分配。开关关闭时不要调用。
+        """
+        if self._graph_dead:
+            return False
+        if self._stream_ready:
+            return True
+        try:
+            self.ensure()
+            if not self._bind_graph_api():
+                raise CudaError("驱动没有完整的 CUDA Graph 入口")
+            self._bind_dto_async()
+            self._activate()
+            st = ctypes.c_void_p()
+            self._chk(self.cu.cuStreamCreate(ctypes.byref(st), 0), "cuStreamCreate")
+            if not st.value:
+                raise CudaError("cuStreamCreate 返回空流")
+            self._stream = st
+            self._stream_ready = True
+            if self.handle is not None:
+                self._chk_blas(
+                    self.cublas.cublasSetStream_v2(self.handle, self._stream),
+                    "cublasSetStream_v2(graph)")
+                self._blas_stream_set = True
+            return True
+        except Exception as ex:
+            self._stream_ready = False
+            self._stream = ctypes.c_void_p(0)
+            self._graph_disable(ex)
+            return False
+
+    def graph_begin(self):
+        """开始捕获当前计算流。先 RELAXED，失败再 THREAD_LOCAL。失败则永久回退。"""
+        if self._graph_dead:
+            return False
+        if self._capturing:
+            return True
+        try:
+            if self._graph_exec is not None or self._graph is not None:
+                # 再捕获一次时丢掉上一张图，否则池会被冻住。
+                self._graph_destroy()
+            if not self._stream_ready and not self.graph_arm():
+                return False
+            if not self._bind_graph_api():
+                raise CudaError("驱动没有完整的 CUDA Graph 入口")
+            # 把预热剩下的工作排空，避免它和捕获缠在一起。此时还没开始捕获，同步是合法的。
+            self.sync()
+            self._adamw_snaps = []
+            self._graph_poison = None
+            self._graph_host_keeps = []
+            self._k_at_begin = int(self._kernel_count)
+            self._b_at_begin = int(self._blas_count)
+            err = None
+            for mode in (CU_STREAM_CAPTURE_MODE_RELAXED, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL):
+                rc = self.cu.cuStreamBeginCapture(self._stream, ctypes.c_uint(mode))
+                if rc == 0:
+                    self._capturing = True
+                    self._capture_mode = int(mode)
+                    return True
+                err = self._err_text(rc)
+            raise CudaError("cuStreamBeginCapture 失败 %s" % (err,))
+        except Exception as ex:
+            self._graph_disable(ex)
+            return False
+
+    def _graph_node_list(self, graph):
+        n = ctypes.c_size_t(0)
+        self._chk(
+            self.cu.cuGraphGetNodes(graph, None, ctypes.byref(n)),
+            "cuGraphGetNodes(count)")
+        count = int(n.value)
+        if count <= 0:
+            return []
+        arr = (ctypes.c_void_p * count)()
+        n = ctypes.c_size_t(count)
+        self._chk(
+            self.cu.cuGraphGetNodes(graph, ctypes.cast(arr, ctypes.c_void_p), ctypes.byref(n)),
+            "cuGraphGetNodes")
+        return [ctypes.c_void_p(int(arr[i])) for i in range(int(n.value))]
+
+    def _instantiate_graph(self, graph):
+        exec_ = ctypes.c_void_p()
+        flags = getattr(self.cu, "cuGraphInstantiateWithFlags", None)
+        errs = []
+        if flags is not None:
+            rc = flags(ctypes.byref(exec_), graph, ctypes.c_ulonglong(0))
+            if rc == 0 and exec_.value:
+                return exec_
+            errs.append("WithFlags %s" % self._err_text(rc))
+            exec_ = ctypes.c_void_p()
+        legacy = getattr(self.cu, "cuGraphInstantiate", None)
+        if legacy is not None:
+            legacy.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_ulonglong,
+            ]
+            legacy.restype = ctypes.c_int
+            rc = legacy(ctypes.byref(exec_), graph, ctypes.c_ulonglong(0))
+            if rc == 0 and exec_.value:
+                return exec_
+            errs.append("3-arg %s" % self._err_text(rc))
+            # CUDA 11 的 5 参数签名。只在 3 参数没成功时试，避免把 3 参数入口叫错。
+            legacy.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_size_t,
+            ]
+            exec_ = ctypes.c_void_p()
+            log = ctypes.create_string_buffer(2048)
+            rc = legacy(
+                ctypes.byref(exec_), graph, None, log, ctypes.c_size_t(2048))
+            if rc == 0 and exec_.value:
+                return exec_
+            tail = log.value.decode("utf-8", "replace") if log.value else ""
+            errs.append("5-arg %s %s" % (self._err_text(rc), tail))
+        raise CudaError("cuGraphInstantiate 失败：%s" % ("; ".join(errs) or "no symbol",))
+
+    def _collect_adamw(self, graph):
+        snaps = list(self._adamw_snaps)
+        if not snaps:
+            self._adamw_nodes = []
+            return
+        want = int(self._fn("adamw_update").value or 0)
+        found = []
+        for node in self._graph_node_list(graph):
+            typ = ctypes.c_int()
+            rc = self.cu.cuGraphNodeGetType(node, ctypes.byref(typ))
+            if rc != 0 or int(typ.value) != CU_GRAPH_NODE_TYPE_KERNEL:
+                continue
+            got = _CudaKernelNodeParams()
+            rc = self.cu.cuGraphKernelNodeGetParams(node, ctypes.byref(got))
+            if rc != 0:
+                continue
+            if int(got.func or 0) == want:
+                found.append(node)
+        if len(found) != len(snaps):
+            raise CudaError(
+                "AdamW 图节点 %d 与捕获时的调用 %d 不一致（struct 大小 %d）"
+                % (len(found), len(snaps), ctypes.sizeof(_CudaKernelNodeParams)))
+        packed = []
+        for node, snap in zip(found, snaps):
+            grid, block, shared, args = snap
+            holders = []
+            ptrs = (ctypes.c_void_p * len(args))()
+            for i, (val, typ) in enumerate(args):
+                obj = typ(val)
+                holders.append(obj)
+                ptrs[i] = ctypes.cast(ctypes.byref(obj), ctypes.c_void_p)
+            if len(holders) < 14:
+                raise CudaError("adamw 参数只有 %d 个" % len(holders))
+            params = _CudaKernelNodeParams()
+            params.func = want
+            params.gridDimX, params.gridDimY, params.gridDimZ = grid
+            params.blockDimX, params.blockDimY, params.blockDimZ = block
+            params.sharedMemBytes = int(shared)
+            params.kernelParams = ctypes.cast(ptrs, ctypes.c_void_p)
+            params.extra = None
+            packed.append((node, params, holders, ptrs))
+        self._adamw_nodes = packed
+
+    def graph_end(self):
+        """结束捕获并实例化。失败则永久回退，返回 False。这一步的 GPU 工作已经真实执行过。"""
+        if self._graph_dead:
+            return False
+        if not self._capturing:
+            return self._graph_exec is not None
+        self._capturing = False
+        graph = ctypes.c_void_p()
+        try:
+            rc = self.cu.cuStreamEndCapture(self._stream, ctypes.byref(graph))
+            if rc != 0 or self._graph_poison:
+                why = self._graph_poison or ""
+                raise CudaError(
+                    "cuStreamEndCapture %s %s" % (self._err_text(rc), why))
+            if not graph.value:
+                raise CudaError("cuStreamEndCapture 没有返回图")
+            self._graph = graph
+            self._graph_exec = self._instantiate_graph(graph)
+            nodes = self._graph_node_list(graph)
+            self._graph_nodes = len(nodes)
+            self._collect_adamw(graph)
+            self._capture_kernels = int(self._kernel_count - self._k_at_begin)
+            self._capture_blas = int(self._blas_count - self._b_at_begin)
+            return True
+        except Exception as ex:
+            self._graph_disable(ex)
+            return False
+
+    def graph_launch(self, bc1=None, bc2=None):
+        """重放已实例化的图。给出 bc1/bc2 时先改写全部 adamw 节点的偏差校正。"""
+        if self._graph_dead or not self._graph_exec:
+            return False
+        try:
+            if bc1 is not None and bc2 is not None and self._adamw_nodes:
+                b1 = float(np.float32(bc1))
+                b2 = float(np.float32(bc2))
+                for node, params, holders, _ptrs in self._adamw_nodes:
+                    holders[12].value = b1
+                    holders[13].value = b2
+                    self._chk(
+                        self.cu.cuGraphExecKernelNodeSetParams(
+                            self._graph_exec, node, ctypes.byref(params)),
+                        "cuGraphExecKernelNodeSetParams")
+            self._activate()
+            self._chk(
+                self.cu.cuGraphLaunch(self._graph_exec, self._stream),
+                "cuGraphLaunch")
+            self._graph_launch_count += 1
+            return True
+        except Exception as ex:
+            self._graph_disable(ex)
+            return False
+
+    def graph_stats(self):
+        return {
+            "kernel_launches": int(self._kernel_count),
+            "blas_launches": int(self._blas_count),
+            "graph_launches": int(self._graph_launch_count),
+            "graph_nodes": int(self._graph_nodes),
+            "adamw_nodes": len(self._adamw_nodes),
+            "capture_kernels": int(self._capture_kernels),
+            "capture_blas": int(self._capture_blas),
+            "dead": bool(self._graph_dead),
+            "reason": self._graph_reason,
+            "mode": self._capture_mode,
+            "armed": bool(self._stream_ready),
+        }
 
 
 _RT = None

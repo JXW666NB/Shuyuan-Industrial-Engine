@@ -317,6 +317,17 @@ def main():
     ap.add_argument("--log-csv", default="")
     a = ap.parse_args()
     T.set_default_device(a.device)
+    # 默认关。打开时：预热 3 步 → 捕获 1 步（前向+反向+优化器）→ 之后只重放。
+    # 任何失败都永久回退，不改这一步已经跑完的数学结果。
+    graph_on = os.environ.get("TG_CUDA_GRAPH", "").strip() == "1" and a.device == "cuda"
+    graph_rt = None
+    if graph_on:
+        graph_rt = T._cuda()
+        if not graph_rt.graph_arm():
+            print("CUDA Graph 无法切流，回退：%s" % graph_rt.graph_stats().get("reason"),
+                  flush=True)
+            graph_on = False
+            graph_rt = None
 
     text, src = load_corpus()
     toks, stoi = build_vocab(text)
@@ -339,15 +350,83 @@ def main():
     t0 = time.time()
     first = None
     v = float("nan")
+    captured_loss = None
     for step in range(a.steps):
-        logits = forward(p, x, cfg)
-        loss = F.cross_entropy(logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
-                               T.tensor(y.reshape(-1)), ignore_index=-100)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        v = float(np.asarray(loss.to_numpy() if hasattr(loss, "to_numpy")
-                             else loss.detach().cpu().numpy()).reshape(-1)[0])
+        did = False
+        if graph_on and captured_loss is not None:
+            t_save = opt.t
+            opt.t = t_save + 1
+            # 与 AdamW.step 同一套 float32 舍入。bc1/bc2 每步变，图里不能烤死。
+            bc1 = float(np.float32(1.0 - (opt.b1 ** opt.t)))
+            bc2 = float(np.float32(1.0 - (opt.b2 ** opt.t)))
+            k_before = graph_rt.graph_stats()["kernel_launches"]
+            if graph_rt.graph_launch(bc1, bc2):
+                v = float(np.asarray(captured_loss.to_numpy()).reshape(-1)[0])
+                did = True
+                if step == 4:
+                    st = graph_rt.graph_stats()
+                    print("CUDA Graph replay step %d  kernel_delta=%d graph_launches=%d"
+                          % (step, st["kernel_launches"] - k_before, st["graph_launches"]),
+                          flush=True)
+            else:
+                opt.t = t_save
+                print("CUDA Graph 重放失败，回退：%s" % graph_rt.graph_stats().get("reason"),
+                      flush=True)
+                graph_on = False
+                captured_loss = None
+        if not did:
+            began = False
+            try:
+                if graph_on and captured_loss is None and step == 3:
+                    began = bool(graph_rt.graph_begin())
+                    if not began:
+                        print("CUDA Graph 开始失败，回退：%s"
+                              % graph_rt.graph_stats().get("reason"), flush=True)
+                        graph_on = False
+                logits = forward(p, x, cfg)
+                tgt = y.reshape(-1)
+                # 捕获时不要把目标再包成 CUDA 张量：那会立刻 D2H，捕获直接作废。
+                # 数值和 T.tensor 再 to_numpy 回来一样（下标都在 float32 精确整数范围内）。
+                if began:
+                    loss = F.cross_entropy(
+                        logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
+                        tgt, ignore_index=-100)
+                else:
+                    loss = F.cross_entropy(
+                        logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
+                        T.tensor(tgt), ignore_index=-100)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                if began:
+                    if graph_rt.graph_end():
+                        captured_loss = loss
+                        st = graph_rt.graph_stats()
+                        print("CUDA Graph captured nodes=%d adamw=%d capture_kernels=%d "
+                              "capture_blas=%d mode=%s"
+                              % (st["graph_nodes"], st["adamw_nodes"], st["capture_kernels"],
+                                 st["capture_blas"], st["mode"]), flush=True)
+                        if st["adamw_nodes"] < 1:
+                            print("CUDA Graph 没有 adamw 节点，回退", flush=True)
+                            graph_rt.graph_abort("no adamw nodes")
+                            graph_on = False
+                            captured_loss = None
+                        elif not graph_rt.graph_launch():
+                            # 捕获只记录不执行。这一步的 bc 已经在图里，必须马上重放一次。
+                            print("CUDA Graph 捕获后首次重放失败：%s"
+                                  % graph_rt.graph_stats().get("reason"), flush=True)
+                            raise SystemExit(2)
+                    else:
+                        print("CUDA Graph 结束失败，回退：%s"
+                              % graph_rt.graph_stats().get("reason"), flush=True)
+                        graph_on = False
+            except Exception as ex:
+                if began:
+                    graph_rt.graph_abort(ex)
+                    print("CUDA Graph 捕获中途失败：%s" % ex, flush=True)
+                raise
+            v = float(np.asarray(loss.to_numpy() if hasattr(loss, "to_numpy")
+                                 else loss.detach().cpu().numpy()).reshape(-1)[0])
         if first is None:
             first = v
         if log:
