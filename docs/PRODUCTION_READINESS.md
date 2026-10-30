@@ -479,3 +479,57 @@ python -m tgai_go.train.doctor --trace  # 失败时打印完整堆栈
 
 按标准判定：**尚在「可用（自用/小团队）」，未达上线门槛（需 L2 全过）**。
 差的只有「所有报错都带上下文」和 Vulkan/ROCm 两个后端。
+
+---
+
+## ★ P0 后端抽象（2026-10-30 完成）
+
+### 先说一个修正：不是 179 个方法
+
+从 `__init__.py` 里所有 `rt.xxx(` 的**实际调用点**提取，训练路径只用到 **79 个**方法，
+其中 17 个是 MoE 专用、8 个是融合核（可回退）。做最小后端（dense、不用 MoE/融合）约 **45 个**。
+
+| 组 | 数量 | 内容 |
+| --- | --- | --- |
+| 内存/拷贝 | 7 | empty/zeros/full/clone/h2d/d2h/sync |
+| 形状/布局 | 5 | reshape/permute/swap_last2/transpose2d/broadcast_to |
+| 归约 | 4 | sum_all/sum_axis/sumsq_sequential/read_scalar |
+| GEMM | 9 | sgemm/gemm_nt/gemm_tn/bmm/三种 strided batched/matmul_general |
+| 逐元素 | 10 | add/add_/mul/scale/scale_inplace/exp/div_scalar/pow_scalar/sub_scale_/unbroadcast |
+| 归一化 | 2 | rmsnorm_fwd/bwd |
+| 注意力 | 7 | softmax/log_softmax 及其反向、attn_nop 分块、ensure_attn_nop |
+| 融合核（可回退） | 8 | silu_mul/silu/rope/mask-softmax 的 fwd+bwd |
+| 嵌入/损失 | 6 | emb_fwd/bwd、ce_fwd/bwd、index_gather/scatter_add |
+| 优化器 | 2 | adamw/muon_momentum |
+| MoE（可选） | 17 | moe_* / grouped_* / cat_* |
+| 内部/调试 | 2 | _fn/_numpy_exact_gemm |
+
+### 做了什么
+
+新增 `python/tgai_go/train/backend.py`：
+
+- `register(name, factory)` / `get(name)` / `available()` / `active_name()`
+- `required_methods()` 与 `missing(inst)` —— 新后端接入时先跑，它会告诉你缺哪些
+- `cache_token()`：热路径只做一次整数比较，避免每次 `rt.xxx` 都查环境变量
+- 语义契约写在模块 docstring（连续行优先、异步/sync、strided batched 的 batch 在外层、NT/TN 定义）
+
+`tgai_go.train._cuda()` 改走工厂，**79 个调用点一行没改**。
+
+### 出口判据（实测，全部达标）
+
+| 判据 | 结果 |
+| --- | --- |
+| 全量回归逐位一致 | doctor **11/11 PASS**（新增 backend 项：CUDA 实现 79/79） |
+| 600 步速度不变 ±2% | 接口化后 **21.6 ms**（接口化前 21.6）；带 Graph **18.9 ms**（与之前完全一致） |
+| 数值 | loss 0.088636（无 graph）/ 0.088539（有 graph），与历史同区间 |
+
+### 下一个后端要接哪里
+
+新后端只需要实现一个类，然后：
+
+    from tgai_go.train import backend
+    backend.register("vulkan", make_vulkan_runtime)
+    rt = backend.get("vulkan")          # missing(rt) 会列出缺口
+    T.set_default_device("vulkan")
+
+⇒ Vulkan/ROCm 不再需要改训练代码，只需要**实现一个类**。
