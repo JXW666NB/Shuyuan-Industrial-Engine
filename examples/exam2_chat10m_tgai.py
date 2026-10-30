@@ -347,6 +347,9 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--out", default="chat10m")
     ap.add_argument("--log-csv", default="")
+    # 0 = 整语料当一批（老行为，只适合小语料）。语料一大必须给一个有限值，
+    # 否则显存随对话数线性爆炸（2M 字符就能把 49 GB 的 4090 撑爆，已实测）。
+    ap.add_argument("--batch", type=int, default=0)
     a = ap.parse_args()
     T.set_default_device(a.device)
     # 默认关。打开时：预热 3 步 → 捕获 1 步（前向+反向+优化器）→ 之后只重放。
@@ -369,6 +372,36 @@ def main():
     cfg = dict(CFG, V=len(toks), S=int(x.shape[1]))
     print("语料=%s  %d 字 → 词表 %d，对话 %d 条，序列 %d"
           % (src, len(text), cfg["V"], x.shape[0], cfg["S"]))
+
+    n_all = int(x.shape[0])
+    bs = int(a.batch) if a.batch > 0 else n_all
+    bs = max(1, min(bs, n_all))
+    batching = bs < n_all
+    if batching and graph_on:
+        print("⚠️ 已开 CUDA Graph 又要求分批：Graph 重放时 Python 不执行，新 batch 传不上显存，"
+              "会一直训第一批。已自动关闭 Graph。", flush=True)
+        graph_on = False
+        graph_rt = None
+    _brng = np.random.RandomState(12345)
+    _order = _brng.permutation(n_all)
+    _pos = [0]
+
+    def next_batch():
+        """取下一批。用尽则打乱重来（新 epoch）。"""
+        if not batching:
+            return x, y
+        if _pos[0] + bs > n_all:
+            _order[:] = _brng.permutation(n_all)
+            _pos[0] = 0
+            _epoch[0] += 1
+        idx = _order[_pos[0]:_pos[0] + bs]
+        _pos[0] += bs
+        return x[idx], y[idx]
+
+    _epoch = [0]
+    if batching:
+        print("batch=%d，语料 %d 条 ⇒ 每 epoch %d 步（打乱，多 epoch）"
+              % (bs, n_all, (n_all + bs - 1) // bs))
 
     p = make_model(cfg, np.random.RandomState(0))
     n_par = sum(int(np.prod(tuple(t.shape))) for t in p.values())
@@ -415,17 +448,18 @@ def main():
                         print("CUDA Graph 开始失败，回退：%s"
                               % graph_rt.graph_stats().get("reason"), flush=True)
                         graph_on = False
-                logits = forward(p, x, cfg)
-                tgt = y.reshape(-1)
+                xb, yb = next_batch()
+                logits = forward(p, xb, cfg)
+                tgt = yb.reshape(-1)
                 # 捕获时不要把目标再包成 CUDA 张量：那会立刻 D2H，捕获直接作废。
                 # 数值和 T.tensor 再 to_numpy 回来一样（下标都在 float32 精确整数范围内）。
                 if began:
                     loss = F.cross_entropy(
-                        logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
+                        logits.reshape(cfg["S"] * xb.shape[0], cfg["V"]),
                         tgt, ignore_index=-100)
                 else:
                     loss = F.cross_entropy(
-                        logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
+                        logits.reshape(cfg["S"] * xb.shape[0], cfg["V"]),
                         T.tensor(tgt), ignore_index=-100)
                 opt.zero_grad()
                 loss.backward()
