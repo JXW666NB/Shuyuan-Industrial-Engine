@@ -47,6 +47,7 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=0, help="0=整语料")
     ap.add_argument("--layers", default="", help="如 1,2,4,8；给了就做每层成本拟合")
     ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--gpu", action="store_true", help="按 kernel 统计 GPU 时间（CUDA event）")
     a = ap.parse_args(argv)
 
     import tgai_go.train as T
@@ -143,6 +144,58 @@ def main(argv=None):
         print("%-26s %7.0f %9.2f" % (name[:26], c / iters, TM[name] * 1e3 / iters))
     print("合计 %.0f 次启动/步，host 侧 %.2f ms/步（%d 步合计 %.1f ms）"
           % (total_launch / iters, sum(TM.values()) * 1e3 / iters, iters, sum(TM.values()) * 1e3))
+
+    # ---------- 按 kernel 的 GPU 时间（CUDA event，事后统一 sync）----------
+    if a.gpu:
+        import ctypes
+        GEV = collections.defaultdict(float)
+        GCNT = collections.Counter()
+        evs = []
+        _orig2 = rt.launch
+
+        def _mk():
+            p_ = ctypes.c_void_p()
+            rc = rt.cu.cuEventCreate(ctypes.byref(p_), 0)   # 默认 flags：计时
+            return p_
+
+        def launch_g(name, grid, block, args, shared=0, module=None):
+            e0, e1 = _mk(), _mk()
+            rt.cu.cuEventRecord(e0, rt._stream)
+            r = _orig2(name, grid, block, args, shared, module)
+            rt.cu.cuEventRecord(e1, rt._stream)
+            evs.append((name, e0, e1))
+            return r
+
+        # 先热身再开测，避免把首次编译算进来
+        rt.launch = launch_g
+        try:
+            for _ in range(a.warmup):
+                lg = E.forward(p, cfg and None or p, cfg) if False else None
+            # 直接复用 stage_times 的循环体做一次计时
+            for _ in range(max(1, a.steps)):
+                logits = E.forward(p, x, cfg)
+                loss = F.cross_entropy(logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
+                                       T.tensor(y.reshape(-1)), ignore_index=-100)
+                opt.zero_grad(); loss.backward(); opt.step()
+        finally:
+            rt.launch = _orig2
+        rt.sync()
+        for name, e0, e1 in evs:
+            ms = ctypes.c_float()
+            if rt.cu.cuEventElapsedTime(ctypes.byref(ms), e0, e1) == 0:
+                GEV[name] += ms.value
+                GCNT[name] += 1
+            rt.cu.cuEventDestroy(e0)
+            rt.cu.cuEventDestroy(e1)
+        steps = float(max(1, a.steps))
+        print("\n==== GPU 时间前 %d（每步，CUDA event 实测）====" % a.top)
+        print("%-26s %8s %10s" % ("kernel", "次数/步", "GPU ms/步"))
+        tot = 0.0
+        for nm, t in sorted(GEV.items(), key=lambda kv: -kv[1])[:a.top]:
+            print("%-26s %8.0f %10.2f" % (nm[:26], GCNT[nm] / steps, t / steps))
+        for nm, t in GEV.items():
+            tot += t
+        print("%-26s %8.0f %10.2f" % ("【全部 kernel 合计】", sum(GCNT.values()) / steps, tot / steps))
 
     # ---------- 每层成本：层数扫描 + 拟合 ----------
     if a.layers:

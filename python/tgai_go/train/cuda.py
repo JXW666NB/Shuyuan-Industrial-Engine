@@ -780,33 +780,48 @@ extern "C" __global__ void bcast_add4(
     c[i] = a[ia] + b[ib];
 }
 
-extern "C" __global__ void softmax_lastdim(const float* x, float* y, int rows, int k) {
-    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-    if (r >= rows || k <= 0) return;
-    const float* row = x + (long long)r * k;
-    float* orow = y + (long long)r * k;
-    float m = row[0];
-    for (int j = 1; j < k; ++j) m = fmaxf(m, row[j]);
-    float sum = 0.f;
-    for (int j = 0; j < k; ++j) {
-        float e = expf(row[j] - m);
-        orow[j] = e;
-        sum += e;
-    }
-    float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
-    for (int j = 0; j < k; ++j) orow[j] *= inv;
+__device__ __forceinline__ float tg_warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ __forceinline__ float tg_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
 }
 
-extern "C" __global__ void softmax_lastdim_bwd(const float* g, const float* y, float* dx,
-                                              int rows, int k) {
-    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-    if (r >= rows || k <= 0) return;
-    const float* grow = g + (long long)r * k;
-    const float* yrow = y + (long long)r * k;
-    float* drow = dx + (long long)r * k;
+/* 一行一个 warp：32 个 lane 覆盖连续的 j（合并访存），shuffle 做归约。
+   旧版是一行一个线程、内部串行跑 3 遍 k —— A10 上实测 8 次调用要 5.31 ms，
+   只有 624 个线程在干活（6144 核），是整步最大的单点开销。 */
+extern "C" __global__ void softmax_lastdim(const float* __restrict__ x,
+                                           float* __restrict__ y, int rows, int k) {
+    int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    int lane = (int)(threadIdx.x & 31u);
+    if (warp >= rows || k <= 0) return;
+    const float* row = x + (long long)warp * k;
+    float* orow = y + (long long)warp * k;
+    float m = -3.402823466e+38f;
+    for (int j = lane; j < k; j += 32) m = fmaxf(m, row[j]);
+    m = tg_warp_max(m);
+    float s = 0.f;
+    for (int j = lane; j < k; j += 32) { float e = __expf(row[j] - m); orow[j] = e; s += e; }
+    s = tg_warp_sum(s);
+    float inv = (s > 0.f) ? (1.f / s) : 0.f;
+    for (int j = lane; j < k; j += 32) orow[j] *= inv;
+}
+
+extern "C" __global__ void softmax_lastdim_bwd(const float* __restrict__ g,
+                                              const float* __restrict__ y,
+                                              float* __restrict__ dx, int rows, int k) {
+    int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    int lane = (int)(threadIdx.x & 31u);
+    if (warp >= rows || k <= 0) return;
+    const float* grow = g + (long long)warp * k;
+    const float* yrow = y + (long long)warp * k;
+    float* drow = dx + (long long)warp * k;
     float dot = 0.f;
-    for (int j = 0; j < k; ++j) dot += grow[j] * yrow[j];
-    for (int j = 0; j < k; ++j) drow[j] = yrow[j] * (grow[j] - dot);
+    for (int j = lane; j < k; j += 32) dot += grow[j] * yrow[j];
+    dot = tg_warp_sum(dot);
+    for (int j = lane; j < k; j += 32) drow[j] = yrow[j] * (grow[j] - dot);
 }
 """
 
@@ -3734,6 +3749,11 @@ class CudaRuntime:
                             B.ptr, N, int(K * N), C, batch, M, N, K)
 
 
+    def _row_grid(self, rows):
+        """一行一个 warp：block 256 线程（8 warp），grid = ceil(rows / 8)。"""
+        wpp = 8
+        return ((int(rows) + wpp - 1) // wpp, 1, 1), (256, 1, 1)
+
     def softmax_lastdim(self, x):
         if len(x.shape) < 1:
             raise CudaError("softmax 需要至少 1 维，收到 %s" % (x.shape,))
@@ -3743,7 +3763,7 @@ class CudaRuntime:
         rows = int(x.n) // k
         out = self.empty(x.shape, dtype=np.float32)
         if rows:
-            grid, block = self._ewise_grid(rows)
+            grid, block = self._row_grid(rows)
             self.launch("softmax_lastdim", grid, block, [
                 self._ptr(x), self._ptr(out),
                 (rows, ctypes.c_int), (k, ctypes.c_int),
@@ -3783,7 +3803,7 @@ class CudaRuntime:
         rows = int(y.n) // k if k else 0
         out = self.empty(y.shape, dtype=np.float32)
         if rows and k:
-            grid, block = self._ewise_grid(rows)
+            grid, block = self._row_grid(rows)
             self.launch("softmax_lastdim_bwd", grid, block, [
                 self._ptr(g), self._ptr(y), self._ptr(out),
                 (rows, ctypes.c_int), (k, ctypes.c_int),
