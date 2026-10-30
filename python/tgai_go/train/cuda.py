@@ -848,6 +848,31 @@ extern "C" __global__ void permute8(
     out[i] = in[src];
 }
 
+/* permute 的 float4 版本：最内层维在源和目的都连续（stride 1）时使用。
+   旧版每个元素要跑 8 次整数除法+取模（8 维通用 gather），实测 64 次调用
+   在 A10 上占 2.55 ms/步 —— 是算除法算死的，不是带宽。
+   这里把最内层维按 4 个一组处理：索引计算量降到 1/4、线程数降到 1/4。 */
+extern "C" __global__ void permute8_v4(
+    const float* __restrict__ in, float* __restrict__ out, int n4,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n4) return;
+    int rem = i;
+    int src = 0;
+    int c = rem % o7; rem /= o7; src += c * 4;          /* 最内层：4 个一组 */
+    c = rem % o6; rem /= o6; src += c * s6;
+    c = rem % o5; rem /= o5; src += c * s5;
+    c = rem % o4; rem /= o4; src += c * s4;
+    c = rem % o3; rem /= o3; src += c * s3;
+    c = rem % o2; rem /= o2; src += c * s2;
+    c = rem % o1; rem /= o1; src += c * s1;
+    src += rem * s0;
+    const float4* pin = (const float4*)(in + src);
+    float4 v = *pin;
+    ((float4*)out)[i] = v;
+}
+
 extern "C" __global__ void broadcast_to8(
     const float* in, float* out, int n,
     int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
@@ -3364,6 +3389,17 @@ class CudaRuntime:
         if n:
             if n > 2147483647:
                 raise CudaError("permute 元素个数超过 int32")
+            last = int(out_shape[-1]) if out_shape else 1
+            if last % 4 == 0 and int(src_stride[-1]) == 1 and n % 4 == 0:
+                shp_v4 = list(self._left_pad8(out_shape, 1))
+                shp_v4[-1] = last // 4
+                n4 = n // 4
+                grid, block = self._ewise_grid(n4)
+                self.launch("permute8_v4", grid, block, [
+                    self._ptr(buf), self._ptr(out), (n4, ctypes.c_int),
+                ] + [(int(t), ctypes.c_int) for t in shp_v4]
+                  + [(int(t), ctypes.c_int) for t in self._left_pad8(src_stride, 0)])
+                return out
             grid, block = self._ewise_grid(n)
             self.launch("permute8", grid, block, [
                 self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
