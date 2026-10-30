@@ -168,7 +168,8 @@ def ln(x, w, eps=1e-6):
     key = id(w)
     m = _LN_CACHE.get(key)
     if m is None:
-        if not hasattr(T.nn, "RMSNorm"):
+        # TG_NO_LN_FUSED=1：强制走组合式，用于和没有融合 RMSNorm 的 PyTorch 版本做公平对照
+        if not hasattr(T.nn, "RMSNorm") or os.environ.get("TG_NO_LN_FUSED"):
             return _rms_composed(x, w, eps)
         m = T.nn.RMSNorm(int(w.numel()), eps=eps)
         m.weight = w
