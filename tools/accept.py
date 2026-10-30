@@ -19,6 +19,7 @@ import json
 import os
 import platform
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -107,6 +108,56 @@ def train_steps(T, E, steps, mode="fp32", batch=0, cfg_over=None):
     return (time.perf_counter() - t0) / k * 1e3, lv
 
 
+def run_resume_check(steps=20):
+    """存/续训一致性：跑 N 步存档 → 从存档续训 N 步，看断点处 loss 是否跳变。"""
+    ex = None
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(REPO, "examples"), here, REPO):
+        f = os.path.join(cand, "exam2_chat10m_tgai.py")
+        if os.path.exists(f):
+            ex = f
+            break
+    if ex is None:
+        return "SKIP", "找不到 exam2_chat10m_tgai.py"
+    d = tempfile.mkdtemp(prefix="acc_resume_")
+    ck, c1, c2 = (os.path.join(d, n) for n in ("a.npz", "a1.csv", "a2.csv"))
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    env["PYTHONPATH"] = os.pathsep.join([os.path.join(REPO, "python"), REPO,
+                                         os.path.join(REPO, "examples")])
+    def run(extra):
+        r = subprocess.run([sys.executable, "-u", ex, "--device", "cuda",
+                            "--steps", str(steps)] + extra,
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", env=env, timeout=900)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    rc1, out1 = run(["--out", os.path.join(d, "m1"), "--log-csv", c1, "--save-resume", ck])
+    rc2, out2 = run(["--out", os.path.join(d, "m2"), "--log-csv", c2, "--resume", ck])
+    if rc1 or rc2:
+        return "FAIL", "存/续训进程异常 rc=%d/%d" % (rc1, rc2)
+    def losses(f):
+        vals = []
+        with open(f, encoding="utf-8") as fh:
+            for i, line in enumerate(fh):
+                if i == 0:
+                    continue
+                parts = line.strip().split(",")
+                if len(parts) > 1:
+                    try:
+                        vals.append(float(parts[1]))
+                    except ValueError:
+                        pass
+        return vals
+    a, b = losses(c1), losses(c2)
+    if len(a) < 2 or len(b) < 1:
+        return "FAIL", "日志为空（%d/%d 行）" % (len(a), len(b))
+    # 判据只看「向上跳」：存档发生在优化器更新之后，所以断点后第一个 loss
+    # 本来就会比存档前最后一个更低（还在下降），这不是异常；真丢权重才会暴涨。
+    rise = (b[0] - a[-1]) / max(abs(a[-1]), 1e-12) * 100
+    ok = rise <= 2.0
+    return ("PASS" if ok else "FAIL"), "断点处 loss %.6f → %.6f，上升 %.3f%%（判据 ≤2%%，下降属正常）" % (
+        a[-1], b[0], rise)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=600)
@@ -189,6 +240,13 @@ def main(argv=None):
                  "池峰值 %.2f GiB，host 峰值 %s" % (peak, _fmt(rss, " MiB", 0) if rss else "—（非 Linux）")))
     data["peak_gib"] = peak
     data["host_peak_mib"] = rss
+
+    # 5) 存/续训一致性
+    try:
+        _res, _msg = run_resume_check()
+    except Exception as _ex:                                     # noqa: BLE001
+        _res, _msg = "FAIL", "%s: %s" % (type(_ex).__name__, str(_ex)[:80])
+    rows.append(("存/续训", _res, _msg))
 
     # ---------- 输出 ----------
     print("")
