@@ -474,17 +474,17 @@ def main():
     if a.resume and os.path.exists(a.resume):
         _z2 = np.load(a.resume, allow_pickle=False)
         _back = 0
-        for _nm in ("m", "v"):
+        for _key in _z2.files:                      # 矩是 GpuBuf，没有 .data 可写，
+            if not (_key.startswith("m_") or _key.startswith("v_")):
+                continue                            # 所以直接用 rt.h2d 建新缓冲替换
+            _nm, _i = _key.split("_")
             _lst = getattr(opt, _nm, None)
-            if isinstance(_lst, (list, tuple)):
-                for _i, _t in enumerate(_lst):
-                    _key = "%s_%d" % (_nm, _i)
-                    if _key in _z2:
-                        try:
-                            _t.data[...] = np.asarray(_z2[_key], dtype=np.float32)
-                            _back += 1
-                        except Exception:
-                            pass
+            if isinstance(_lst, (list, tuple)) and int(_i) < len(_lst):
+                try:
+                    _lst[int(_i)] = T._cuda().h2d(np.ascontiguousarray(_z2[_key], dtype=np.float32))
+                    _back += 1
+                except Exception:
+                    pass
         if "opt_t" in _z2 and hasattr(opt, "t"):
             try:
                 opt.t = int(_z2["opt_t"])
