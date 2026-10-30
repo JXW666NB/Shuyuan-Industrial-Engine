@@ -57,6 +57,7 @@ class _CudaKernelNodeParams(ctypes.Structure):
 # cudaDataType_t
 CUDA_R_32F = 0
 CUDA_R_16F = 2
+CUDA_R_16BF = 14          # cudaDataType_t：bfloat16
 # cublasComputeType_t：CUBLAS_COMPUTE_16F=64, CUBLAS_COMPUTE_32F=68, 64F=70, 32I=72
 CUBLAS_COMPUTE_32F = 68
 # cublasGemmAlgo_t：CUBLAS_GEMM_DEFAULT=-1。实测（V100 + cublas64_12）
@@ -79,6 +80,22 @@ except (TypeError, ValueError):
 
 def fp16_env_requested():
     v = os.environ.get(_FP16_ENV, "")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+# ---- bf16 GEMM（TG_BF16=1 打开，默认关；在 _sgemm 里先于 fp16 分发）----
+# 门槛和 fp16 同一套：输出太小 cast 不划算，K 太长累加误差和耗时都变差。
+_BF16_ENV = "TG_BF16"
+_BF16_MIN_OUTPUT = 262144
+_BF16_MAX_K = 1280
+try:
+    _BF16_MAX_K = int(os.environ.get("TG_BF16_MAX_K", _BF16_MAX_K))
+    _BF16_MIN_OUTPUT = int(os.environ.get("TG_BF16_MIN_OUTPUT", _BF16_MIN_OUTPUT))
+except (TypeError, ValueError):
+    pass
+
+
+def bf16_env_requested():
+    v = os.environ.get(_BF16_ENV, "")
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 # 2×fp16 拆分 GEMM：三次 fp16 乘、fp32 累加，逼近 fp32 精度。默认关。
@@ -1459,6 +1476,24 @@ extern "C" __global__ void cast_f16_to_f32(const unsigned short* __restrict__ sr
                                            float* __restrict__ dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = tg_f16_bits_to_f32((unsigned int)src[i]);
+}
+
+/* bf16 就是 fp32 的高 16 位。舍入用 round-to-nearest-even，和主机侧
+ * (u + 0x7FFF + ((u >> 16) & 1)) >> 16 逐位一致。回 fp32 只是左移 16 位。 */
+extern "C" __global__ void cast_f32_to_bf16(const float* __restrict__ src,
+                                            unsigned short* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        unsigned int u = __float_as_uint(src[i]);
+        unsigned int r = (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;   /* RTNE */
+        dst[i] = (unsigned short)r;
+    }
+}
+
+extern "C" __global__ void cast_bf16_to_f32(const unsigned short* __restrict__ src,
+                                            float* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __uint_as_float((unsigned int)src[i] << 16);
 }
 """
 
@@ -4178,9 +4213,99 @@ class CudaRuntime:
         # C 被整块重写。和输入同址时，上面刚放进缓存的拆分已经过期。
         self._split_forget_ptr(C)
 
+    # ---- bf16 GEMM（TG_BF16=1 打开，默认关；结构照 fp16，不改 fp16 本身）----
+    def _bf16_state(self):
+        """惰性初始化。没开 TG_BF16 时只多一次属性查找，不碰设备。"""
+        st = getattr(self, "_bf16", None)
+        if st is None:
+            st = {
+                "on": bool(bf16_env_requested()),
+                "warned": False,
+                "cap_warned": False,
+            }
+            self._bf16 = st
+        return st
+
+    def _bf16_fail(self, ex):
+        """任何异常都关掉 bf16 并只警告一次，这一次以及以后走原路径（fp16 或 fp32）。"""
+        st = self._bf16_state()
+        st["on"] = False
+        if not st["warned"]:
+            st["warned"] = True
+            sys.stderr.write(
+                "[tgai] bf16 GEMM 不可用，已回退 fp32（只警告一次）：%s: %s\n"
+                % (type(ex).__name__, str(ex)[:300]))
+            sys.stderr.flush()
+
+    def _bf16_wanted(self, m, n, k):
+        st = self._bf16_state()
+        if not st["on"]:
+            return False
+        # 捕获期间 cast 要现分配缓冲，池未命中会直接让 CUDA Graph 失败。不启用。
+        if self._capturing:
+            if not st["cap_warned"]:
+                st["cap_warned"] = True
+                sys.stderr.write(
+                    "[tgai] CUDA Graph 捕获中不启用 bf16 GEMM，这一步走原路径。\n")
+                sys.stderr.flush()
+            return False
+        return int(m) * int(n) >= _BF16_MIN_OUTPUT and int(k) <= _BF16_MAX_K
+
+    def _cast_flat_ptr_bf16(self, src_ptr, count):
+        """src_ptr 起 count 个 fp32 按 RTNE 收成 bf16（np.uint16 缓冲）。"""
+        count = int(count)
+        out = self.empty((count,), dtype=np.uint16)
+        if count:
+            if count > 2147483647:
+                raise CudaError("bf16 cast 元素数超过 int32")
+            grid, block = self._ewise_grid(count)
+            self._activate()
+            self.launch("cast_f32_to_bf16", grid, block, [
+                (int(src_ptr), ctypes.c_uint64), self._ptr(out),
+                (count, ctypes.c_int),
+            ])
+        return out
+
+    def _sgemm_bf16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
+        """列主序调用和 _sgemm_f16 / _sgemm 完全一致。
+
+        A、B 先 cast 成 bf16，cublasGemmEx 用 CUDA_R_16BF 输入、
+        CUBLAS_COMPUTE_32F 累加、CUDA_R_32F 直接写回 C。lda/ldb/ldc 原样透传。
+        """
+        self._bind_gemm_ex()
+        na = int(lda) * (int(k) if int(transa) == CUDA_OP_N else int(m))
+        nb = int(ldb) * (int(n) if int(transb) == CUDA_OP_N else int(k))
+        nc = int(ldc) * int(n)
+        if na < 0 or nb < 0 or nc < 0 or max(na, nb, nc) > 2147483647:
+            raise CudaError("bf16 GEMM 元素数超过 int32")
+        a16 = self._cast_flat_ptr_bf16(A, na)
+        b16 = self._cast_flat_ptr_bf16(B, nb)
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._activate()
+        self._chk_blas(self.cublas.cublasGemmEx(
+            self.handle,
+            int(transa), int(transb),
+            int(m), int(n), int(k),
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(a16.ptr)), CUDA_R_16BF, int(lda),
+            ctypes.c_uint64(int(b16.ptr)), CUDA_R_16BF, int(ldb),
+            ctypes.byref(beta),
+            ctypes.c_uint64(int(C)), CUDA_R_32F, int(ldc),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "cublasGemmEx")
+
     def _sgemm(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
         if m == 0 or n == 0 or k == 0:
             return
+        # bf16 先于 fp16。没设 TG_BF16 时 _bf16_wanted 立刻返回，下面的 fp16/fp32 一字不改。
+        if self._bf16_wanted(m, n, k):
+            try:
+                self._sgemm_bf16(transa, transb, m, n, k, A, lda, B, ldb, C, ldc)
+                self._split_forget_ptr(C)
+                return
+            except Exception as ex:
+                # 回退：后面的 fp32 路径 beta=0 会把 C 整个重写。
+                self._bf16_fail(ex)
         # 只有输出够大时才值得转 fp16。实测（V100 / cublas64_12）：
         #   m*n = 65536,  k=4992 -> fp16 反而慢一倍（0.073 -> 0.142 ms，cast 占满）
         #   m*n >= 1.28M, k=256..1280 -> fp16 快 1.6~2.6x
