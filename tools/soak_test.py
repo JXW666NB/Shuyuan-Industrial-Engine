@@ -148,12 +148,26 @@ def main(argv=None):
     k = max(1, len(losses) // 5)
     l_head = float(np.mean(losses[:k]))
     l_tail = float(np.mean(losses[-k:]))
-    drift = (max(peaks) - min(peaks)) / max(np.mean(peaks), 1e-9) if peaks else 0.0
-    rss_drift = (max(rsss) - min(rsss)) / max(np.mean(rsss), 1e-9) if len(rsss) > 1 else 0.0
+
+    def _grow(vals, win=None):
+        """只量「增长」：末段均值相对首段均值的涨幅。收缩算 0，不算漂移。
+
+        之前的 (max-min)/mean 会把「内存下降」也判成漂移 —— 实测 A10 上
+        RSS 从 0.566 降到 0.529 却被判 FAIL，是度量写错了。
+        """
+        if len(vals) < 4:
+            return 0.0
+        kk = win or max(1, len(vals) // 4)
+        early = float(np.mean(vals[:kk]))
+        late = float(np.mean(vals[-kk:]))
+        return max(0.0, (late - early) / max(abs(early), 1e-9))
+
+    drift = _grow(peaks) if peaks else 0.0
+    rss_drift = _grow(rsss) if len(rsss) > 1 else 0.0
     print("跑了 %d 步 / %.1f 分钟；采样 %d 次" % (step, (time.time() - t0) / 60.0, len(rows)))
     print("loss 首段均值 %.4f → 末段均值 %.4f" % (l_head, l_tail))
-    print("显存峰值 最大 %.3f GiB；热身期后漂移 %.2f%%（判据 ≤3%%）" % (max(peaks) if peaks else 0, drift * 100))
-    print("host RSS 漂移 %.2f%%（判据 ≤5%%）" % (rss_drift * 100))
+    print("显存峰值 最大 %.3f GiB；热身期后「增长」%.2f%%（判据 ≤3%%，收缩不计）" % (max(peaks) if peaks else 0, drift * 100))
+    print("host RSS「增长」%.2f%%（判据 ≤5%%，收缩不计）" % (rss_drift * 100))
     print("NaN/异常 loss 次数：%d（判据 0）" % bad)
 
     ok = True
