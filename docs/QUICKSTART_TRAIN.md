@@ -142,3 +142,24 @@ import tgai_go.train as T      # 原来是 import torch as T
 > **CUDA Graph 捕获期间会自动走 fp32**（不会让图捕获失败）。
 
 `python -m tgai_go.train.doctor` 会顺带验证 bf16 路径（无硬件的机器会显示"跳过"）。
+---
+
+## 9. 一条命令验收（给接手的人）
+
+```bash
+python tools/accept.py            # 标准：600 步
+python tools/accept.py --quick    # 快速：120 步（改完代码先自检用）
+python tools/accept.py --json acc.json
+```
+
+它会真跑下面这些，最后打印一张 PASS/FAIL 表：
+
+| 项 | 判据 |
+| --- | --- |
+| 自检 `doctor` | 12/12 |
+| 形状矩阵（4 组 D/NH/FF/L/S） | 全部能训、loss 有限 |
+| fp32 N 步 | 报 ms/step 与末 loss |
+| bf16（有硬件才做） | loss 偏差 ≤2% 且不慢于 fp32 |
+| 显存/内存 | 池峰值 + host 峰值 |
+
+**验收结论 PASS** 才说明这台机器上引擎是好的。无 BF16 硬件的机器会把 bf16 标成 `SKIP` 而不是失败。

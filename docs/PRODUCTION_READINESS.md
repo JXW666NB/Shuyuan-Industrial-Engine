@@ -1117,3 +1117,31 @@ rank1 可能还没看到就已经被删掉 ⇒ **2 进程永久等待**（实测
 * 跨机不支持（rendezvous 用的是本机共享内存）；
 * 梯度交换目前走 host 共享内存（对 10M 模型约 40 MB/步，PCIe 上够用；
   大模型应改 `cudaMemcpyPeer` + 设备侧 reduce）。
+### 一条命令验收：`tools/accept.py`（2026-10-30）
+
+给"接手的人"一个不读文档也能判断环境好坏的入口：
+
+    python tools/accept.py           # 600 步标准验收
+    python tools/accept.py --quick   # 120 步快速自检
+
+| 项 | 判据 |
+| --- | --- |
+| 自检 doctor | 12/12 |
+| 形状矩阵 4 组 | 全部能训、loss 有限 |
+| fp32 N 步 | 报 ms/step 与末 loss |
+| bf16（有硬件才跑） | loss 偏差 ≤2% 且不慢于 fp32；无硬件标 SKIP |
+| 显存/内存 | 池峰值 + host 峰值 |
+
+**V100 实测**：
+
+```
+自检 doctor        PASS   自检通过：12/12 项 PASS（1.8s）
+形状矩阵 4 组      PASS   D256:55.2ms D128:13.9ms D512:33.0ms D192:19.2ms
+训练 120 步 fp32   PASS   53.5 ms/step，末 loss 0.091258
+bf16 精度          SKIP   本机无 bf16 硬件（算力 <8.0）
+显存/内存          PASS   池峰值 5.28 GiB
+验收结论：PASS（0 项 FAIL）
+```
+
+开发过程中修掉两个自己的 bug：子进程按 GBK 解码导致 doctor 误判 FAIL；
+以及**又差点信了 `torch.cuda.is_bf16_supported()`**（V100 上返回 True 但是模拟）—— 改成用算力判定。
