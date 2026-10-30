@@ -1418,3 +1418,36 @@ cd /mnt/workspace && MS_TOKEN=TGAI_9f3x nohup python3 ms_agent.py > agent.log 2>
 1. 先比对 md5：本地 `cuda.py` vs 远端，不一致 ⇒ 就是半截文件；
 2. 若 md5 一致仍崩，抓 `faulthandler`（`python3 -X faulthandler`）+ `CUDA_LAUNCH_BLOCKING=1` 定位到具体 launch；
 3. 仍无法定位就上 `cuda-gdb` 抓 GPU 侧栈。
+---
+
+## A10 补齐"一条命令验收" + 一个反直觉发现（2026-10-30，第 28 轮）
+
+```
+python tools/accept.py --quick      # A10
+
+项目                     结果     详情
+自检 doctor              PASS   自检通过：12/12 项 PASS（1.4s）
+形状矩阵 4 组             PASS   D256:48.1ms D128:11.1ms D512:28.4ms D192:13.2ms
+训练 120 步 fp32          PASS   48.8 ms/step，末 loss 0.091212
+bf16 120 步              PASS   49.5 ms/step（0.98x），loss 0.091251，偏差 0.04%
+显存/内存                 PASS   池峰值 5.28 GiB，host 峰值 923 MiB
+验收结论：PASS（0 项 FAIL）
+```
+
+⇒ `tools/accept.py` 在 **4090/V100/A10 三台机器**上都能一条命令给出 PASS/FAIL（A10 首次）。
+
+### ★ 反直觉发现：优化之后，bf16 在 A10 上不再更快
+
+| 时点 | fp32 | bf16 | bf16 收益 |
+| --- | --- | --- | --- |
+| 今天早些时候（三个 kernel 优化前） | 64.4 ms | 54.8 ms | **1.18×** |
+| 优化后（现在） | 48.8 ms | 49.5 ms | **0.98×（略慢）** |
+
+原因很清楚：bf16 只加速 **GEMM**，但每步要多发 **147 个 cast 内核**（495 vs 348 次启动）。
+以前非 GEMM 部分（softmax/emb/permute）吃掉了大半个步，GEMM 占比高，bf16 划算；
+把这些 kernel 修好之后，**GEMM 的占比下降、cast 的固定成本占比上升**，两者刚好抵消。
+
+**结论（要写进文档）**：bf16 是否值得开，取决于「这一步里 GEMM 占多少」，
+不能一句"bf16 更快"了事。对 10M 模型 + 优化后的引擎，A10 上 **建议不开**；
+模型更大（GEMM 占比更高）时再开。`doctor`/`accept.py` 的 bf16 项判据是"不慢于 fp32 5%"，
+所以这里判 PASS 是**正确**的 —— 它没说"必须更快"。
