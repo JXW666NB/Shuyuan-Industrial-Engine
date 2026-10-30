@@ -447,6 +447,13 @@ def main():
     print("device=%s  参数量=%.3fM（含词表 %.3fM）"
           % (a.device, n_par / 1e6, cfg["V"] * cfg["D"] / 1e6))
     opt = T.optim.AdamW(list(p.values()), lr=a.lr)
+    # 多卡数据并行：world=1 时下面两句都是空操作，单卡行为完全不变。
+    _DP = getattr(T, "DataParallel", None)
+    dp = _DP() if _DP is not None else None
+    if dp is not None:
+        dp.broadcast(p.values())               # 各卡从同一份权重起步
+        if dp.world > 1:
+            print("数据并行：world=%d rank=%d" % (dp.world, dp.rank))
 
     log = open(a.log_csv, "w", encoding="utf-8") if a.log_csv else None
     if log:
@@ -502,6 +509,8 @@ def main():
                         T.tensor(tgt), ignore_index=-100)
                 opt.zero_grad()
                 loss.backward()
+                if dp is not None:
+                    dp.all_reduce_grads(p.values())   # 梯度求平均（world=1 空操作）
                 opt.step()
                 if began:
                     if graph_rt.graph_end():

@@ -289,6 +289,12 @@ _FUTURE_BACKENDS = {
 }
 
 
+try:
+    from .dist import DataParallel       # 多卡数据并行（world=1 时全是空操作）
+except Exception:                       # noqa: BLE001
+    DataParallel = None
+
+
 def set_device(device):
     """切换后端：'cuda'（可带 :0）或 'cpu'。
 

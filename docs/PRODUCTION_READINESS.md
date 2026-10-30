@@ -1080,3 +1080,40 @@ L1 判据里"≥1 GB 语料不 OOM"之前只是**勉强通过**：老实现会�
    （agent 进程通常还活着；若已退出，`cd /mnt/workspace && MS_TOKEN=TGAI_9f3x nohup python3 ms_agent.py &`）
 2. 把新地址填进 `$env:MS_URL`
 3. 补跑：`examples/exam2_chat10m_tgai.py --steps 600 --log-csv /tmp/x.csv`（fp32 / TG_BF16=1 各一次）+ `tools/bench_bf16_ceiling.py --steps 600`
+---
+
+## ★ 多卡数据并行：地基完成，正确性已验证（2026-10-30）
+
+### 做了什么
+
+新增 `python/tgai_go/train/dist.py`（**不依赖 NCCL / MPI / torch.distributed**，自研）：
+
+* `DataParallel.broadcast(params)` —— rank0 的权重分发给所有 rank（保证各卡起点逐位一致）；
+* `DataParallel.all_reduce_grads(params)` —— 梯度在本机**共享内存**里做全归约并求平均；
+* `world=1` 时以上全是**快速空操作**（单卡行为零变化）；
+* 训练脚本通过 `T.DataParallel` 接入（torch 孪生那边 `T` 上没有这个属性，自动降级，孪生代码仍只差 import）。
+
+新增 `tools/launch_dp.py` —— 每个 rank 一个进程、各绑一张卡（`CUDA_VISIBLE_DEVICES`），
+并设置 `TGAI_DP_WORLD/RANK/JOB`。
+
+### 验证（今天能做的部分，全部实测）
+
+| 检查 | 结果 |
+| --- | --- |
+| **2 进程（CPU）broadcast + 全归约正确性** | `tools/test_dp.py` → **PASS**（两个 rank 都拿到 rank0 的权重；梯度等于各 rank 算术平均） |
+| **world=1 是否零影响**（V100，600 步） | **53.3 ms/step、loss 0.088585** —— 与基线（53.0 / 0.0885x）一致 |
+| 启动器冒烟 | `launch_dp.py --world 1` → PASS，环境变量正确注入 |
+| 孪生一致性 | `make_twins.py --check` **一致** |
+
+### 过程中修掉的一个死锁（值得记）
+
+第一版 barrier 是「各 rank 落一个文件、到齐即通过」，但 **rank0 通过后立刻删掉自己的标记**，
+rank1 可能还没看到就已经被删掉 ⇒ **2 进程永久等待**（实测超时 120 秒）。
+改法：barrier 加**自增世代号**、标记文件**不删除**，`close()` 时统一清理。
+
+### 还没做的（缺硬件）
+
+* **2 卡加速比 ≥1.7×** 没有验证 —— 手上只有 A10×1 和 V100×1；
+* 跨机不支持（rendezvous 用的是本机共享内存）；
+* 梯度交换目前走 host 共享内存（对 10M 模型约 40 MB/步，PCIe 上够用；
+  大模型应改 `cudaMemcpyPeer` + 设备侧 reduce）。
