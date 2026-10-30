@@ -163,3 +163,36 @@ PyTorch 的 40.6 ms 来自「连 attention bmm / softmax / silu 都 fp16」（�
 - 两个考试：`pelican.TG`（6/6）、`chat10m.TG`+`.pt`（10.06M，loss 0.0885，引擎三问正确）
 - 分词表、逐 step 日志、loss/PPL 曲线、两个推理程序
 - 文档：本文 + `speed_optimization_brief.md`（四轮优化全过程）+ `fused_layer_plan.md`（融合设计与 fp16 实测）
+
+---
+
+## ★ 2026-10-30 傍晚：CUDA Graph 落地，引擎首次真正反超
+
+由 Grok 4.7 实现、父 agent 独立复验（同一台 4090、同一会话、600 步）：
+
+| 配置 | ms/step | 说明 |
+|---|---|---|
+| 改前（无 graph） | 21.7 | 每步 484 次 kernel 启动，CPU 在关键路径上 |
+| `TG_CUDA_GRAPH=0`（新代码） | 21.5 | 开关关掉无退化 |
+| **`TG_CUDA_GRAPH=1`** | **18.9** | **−12.9%**，每步 0 次 Python 侧 kernel 启动 |
+
+数值：首步 loss **逐位相同（5.925684）**，末 loss 0.088546（基线 0.088542，差 0.005%）。
+捕获到 961 个图节点（348 次 cuLaunchKernel + 219 次 cuBLAS）；
+AdamW 的 74 个节点每步用 `cuGraphExecKernelNodeSetParams` 更新 `bc1/bc2`。
+
+### 与 PyTorch 的最终对照（4090，同代码、同语料、600 步）
+
+| 对照方式 | TGAI GO | PyTorch | 结论 |
+|---|---|---|---|
+| **同能力（两边都组合式 RMSNorm）** | **20.8 ms** | 26.4 ms | **TGAI 快 1.27×** |
+| 各自最优（默认） | **18.9 ms** | 27.1 ms | **TGAI 快 1.43×** |
+
+> **意义**：此前"快 1.25×"被质疑是"torch 2.2.2 没有融合 RMSNorm"的版本红利。
+> 把两边 RMSNorm 能力拉平后再比，**仍然快 1.27×** ——
+> 这次不是版本红利，是**引擎本身真的更快了**（CUDA Graph + 前四轮优化之和）。
+
+### 代价与限制（必须一并说）
+
+- CUDA Graph 只在**固定 shape + 固定 batch**下成立；换形状要重新捕获（当前实现会回退）。
+- 只在 4090 上验证；**V100 未验证**（产线机，未部署这套改动）。
+- 训练脚本需按 `TG_CUDA_GRAPH=1` 显式开启，**默认关闭**。
