@@ -74,6 +74,17 @@ def fp16_env_requested():
     v = os.environ.get(_FP16_ENV, "")
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
+# 2×fp16 拆分 GEMM：三次 fp16 乘、fp32 累加，逼近 fp32 精度。默认关。
+# 只认 TG_FP16_SPLIT=1/true/yes/on。门槛在 _sgemm 的列主序 m,n,k 上判断。
+_FP16_SPLIT_ENV = "TG_FP16_SPLIT"
+_FP16_SPLIT_MIN_K = 1024
+_FP16_SPLIT_MIN_MN = 262144
+
+
+def fp16_split_env_requested():
+    v = os.environ.get(_FP16_SPLIT_ENV, "")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
 # cuda.h
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
@@ -2550,6 +2561,8 @@ class CudaRuntime:
         size, owner, stamp = rec
         if token is not None and owner != token:
             return
+        # 块真的还回去才丢拆分缓存。过期析构（token 对不上）不能清掉新主人的缓存。
+        self._split_forget_ptr(ptr)
         del self._pool_live[ptr]
         self._pool_live_bytes -= int(size)
         if self._pool_live_bytes < 0:
@@ -2820,6 +2833,7 @@ class CudaRuntime:
 
     def _memset32(self, buf, word):
         """按 32 位字填充。走默认流的异步 memset，不把前面的 kernel 同步回来。"""
+        self._split_forget_ptr(buf)
         n = int(buf.n)
         if n <= 0:
             return
@@ -3410,6 +3424,7 @@ class CudaRuntime:
                 "cat_place 槽越界 off=%d len=%d dst=%d" % (off, s_span, d_span))
         if s_n == 0:
             return
+        self._split_forget_ptr(dst)
         grid, block = self._ewise_grid(s_n)
         self.launch("cat_place", grid, block, [
             self._ptr(src), self._ptr(dst),
@@ -3822,6 +3837,7 @@ class CudaRuntime:
         scalar = float(scalar)
         n = int(a.n)
         if n and scalar != 1.0:
+            self._split_forget_ptr(a)
             if self._vec4_ok(n, a, a):
                 grid, block = self._vec4_grid(n >> 2)
                 self.launch("ewise_scale_v4", grid, block, [
@@ -3997,6 +4013,164 @@ class CudaRuntime:
             self._sgemm_f16(CUDA_OP_N, CUDA_OP_N, N, M, K, B.ptr, N, A.ptr, K, C.ptr, N)
         return C
 
+    def _split16_state(self):
+        """惰性读 TG_FP16_SPLIT。没打开时不建缓存，fp32 热路径只多一次属性查找。"""
+        st = getattr(self, "_split16", None)
+        if st is None:
+            st = {
+                "on": bool(fp16_split_env_requested()),
+                "warned": False,
+                "cap_warned": False,
+                "hits": 0,
+                "misses": 0,
+            }
+            self._split16 = st
+            if st["on"] and not hasattr(self, "_split_cache"):
+                self._split_cache = {}
+        return st
+
+    def _split_forget_ptr(self, ptr):
+        """丢掉这个地址上的 hi/lo。空缓存立刻返回，默认 fp32 路径几乎无开销。"""
+        cache = getattr(self, "_split_cache", None)
+        if not cache:
+            return
+        if ptr is None:
+            return
+        if hasattr(ptr, "ptr"):
+            ptr = ptr.ptr
+        ptr = int(ptr or 0)
+        if ptr:
+            cache.pop(ptr, None)
+
+    def _split16_fail(self, ex):
+        """异常后永久回退 fp32，并清掉可能半截的拆分缓存。只警告一次。"""
+        st = self._split16_state()
+        st["on"] = False
+        cache = getattr(self, "_split_cache", None)
+        if cache is not None:
+            cache.clear()
+        if not st["warned"]:
+            st["warned"] = True
+            sys.stderr.write(
+                "[tgai] fp16 split GEMM 不可用，已回退 fp32（只警告一次）：%s: %s\n"
+                % (type(ex).__name__, str(ex)[:300]))
+            sys.stderr.flush()
+
+    def _split16_wanted(self, m, n, k):
+        st = self._split16_state()
+        if not st["on"]:
+            return False
+        if self._capturing:
+            if not st["cap_warned"]:
+                st["cap_warned"] = True
+                sys.stderr.write(
+                    "[tgai] CUDA Graph 捕获中不启用 fp16 split GEMM，这一步走 fp32。\n")
+                sys.stderr.flush()
+            return False
+        m, n, k = int(m), int(n), int(k)
+        return k >= _FP16_SPLIT_MIN_K or m * n >= _FP16_SPLIT_MIN_MN
+
+    def _d2d_bytes(self, dst, src, nbytes):
+        """设备到设备拷贝。有非默认流时走异步，否则同步，都排在当前计算流上。"""
+        nbytes = int(nbytes)
+        if nbytes <= 0:
+            return
+        self._activate()
+        self._mark_submitted(dst)
+        self._mark_submitted(src)
+        if self._stream_ready:
+            self._bind_dto_async()
+            self._chk(self.cu.cuMemcpyDtoDAsync(
+                ctypes.c_uint64(int(dst)),
+                ctypes.c_uint64(int(src)),
+                ctypes.c_size_t(nbytes),
+                self._stream), "cuMemcpyDtoDAsync(split16)")
+        else:
+            self._chk(self.cu.cuMemcpyDtoD(
+                ctypes.c_uint64(int(dst)),
+                ctypes.c_uint64(int(src)),
+                ctypes.c_size_t(nbytes)), "cuMemcpyDtoD(split16)")
+
+    def _split16_pair(self, src_ptr, count):
+        """把一段 fp32 拆成 hi/lo 两个 fp16 缓冲。
+
+        x_hi = fp16(x)，x_lo = fp16(x - fp32(x_hi))。
+        缓存键是（指针，池 token，元素个数）：token 在块被释放复用时变化，
+        原地写会把条目删掉，所以权重在一步里可复用、优化器更新后会重拆。
+        """
+        count = int(count)
+        src_ptr = int(src_ptr)
+        st = self._split16_state()
+        cache = getattr(self, "_split_cache", None)
+        if cache is None:
+            cache = {}
+            self._split_cache = cache
+        token = self._pool_token_of(src_ptr) if count > 0 else None
+        hit = cache.get(src_ptr)
+        if (hit is not None and token is not None
+                and hit[0] == token and hit[1] == count):
+            st["hits"] += 1
+            return hit[2], hit[3]
+        if hit is not None:
+            cache.pop(src_ptr, None)
+        st["misses"] += 1
+        if count <= 0:
+            return (self.empty((0,), dtype=np.float16),
+                    self.empty((0,), dtype=np.float16))
+        if count > 2147483647:
+            raise CudaError("fp16 split 元素数超过 int32")
+        hi16 = self._cast_flat_ptr(src_ptr, count, True)
+        hi32 = self._cast_flat_ptr(hi16.ptr, count, False)
+        lo32 = self.empty((count,), dtype=np.float32)
+        self._d2d_bytes(lo32.ptr, src_ptr, count * 4)
+        grid, block = self._ewise_grid(count)
+        self.launch("ewise_sub_scale", grid, block, [
+            self._ptr(lo32), self._ptr(hi32),
+            (1.0, ctypes.c_float), (count, ctypes.c_int),
+        ])
+        lo16 = self._cast_flat_ptr(lo32.ptr, count, True)
+        if token is not None and os.environ.get("TG_FP16_SPLIT_CACHE", "1") != "0":
+            cache[src_ptr] = (token, count, hi16, lo16)
+        return hi16, lo16
+
+    def _gemm_ex_f16(self, transa, transb, m, n, k, A, lda, B, ldb, beta, C, ldc, alpha):
+        """A、B 已是 fp16，C 是 fp32。compute type 固定 32F，和 _sgemm_f16 同一条 GemmEx。"""
+        self._activate()
+        self._chk_blas(self.cublas.cublasGemmEx(
+            self.handle,
+            int(transa), int(transb),
+            int(m), int(n), int(k),
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(A.ptr)), CUDA_R_16F, int(lda),
+            ctypes.c_uint64(int(B.ptr)), CUDA_R_16F, int(ldb),
+            ctypes.byref(beta),
+            ctypes.c_uint64(int(C)), CUDA_R_32F, int(ldc),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "cublasGemmEx")
+
+    def sgemm_split16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
+        """列主序调用和 _sgemm 完全一致。三次 fp16 GEMM 逼近 fp32，输出仍是 fp32 的 C。
+
+        A@B ≈ Ahi@Bhi + Ahi@Blo + Alo@Bhi。hi@hi 用 beta=0 写 C，后两次 beta=1 累加。
+        不修改 A、B。丢掉的 lo@lo 量级约 2^-22。
+        """
+        self._bind_gemm_ex()
+        m, n, k = int(m), int(n), int(k)
+        lda, ldb, ldc = int(lda), int(ldb), int(ldc)
+        na = lda * (k if int(transa) == CUDA_OP_N else m)
+        nb = ldb * (n if int(transb) == CUDA_OP_N else k)
+        if na < 0 or nb < 0 or na > 2147483647 or nb > 2147483647:
+            raise CudaError("fp16 split GEMM 元素数非法: A=%s B=%s" % (na, nb))
+        ahi, alo = self._split16_pair(A, na)
+        bhi, blo = self._split16_pair(B, nb)
+        alpha = ctypes.c_float(1.0)
+        beta0 = ctypes.c_float(0.0)
+        beta1 = ctypes.c_float(1.0)
+        self._gemm_ex_f16(transa, transb, m, n, k, ahi, lda, bhi, ldb, beta0, C, ldc, alpha)
+        self._gemm_ex_f16(transa, transb, m, n, k, ahi, lda, blo, ldb, beta1, C, ldc, alpha)
+        self._gemm_ex_f16(transa, transb, m, n, k, alo, lda, bhi, ldb, beta1, C, ldc, alpha)
+        # C 被整块重写。和输入同址时，上面刚放进缓存的拆分已经过期。
+        self._split_forget_ptr(C)
+
     def _sgemm(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
         if m == 0 or n == 0 or k == 0:
             return
@@ -4005,14 +4179,24 @@ class CudaRuntime:
         #   m*n >= 1.28M, k=256..1280 -> fp16 快 1.6~2.6x
         # 所以拿 m*n 当门槛；小输出（各层 dW 那种 [256,256] @ k=4992）留 fp32。
         # ★ 只对「K 不长」的 GEMM 走 fp16：dW 类形状（K=4992 的长累加、数值对消严重）
-            #   实测会让参数梯度的相对误差从 3e-4 恶化到 2e-2（loss 600 步偏 10%）。
-            if int(m) * int(n) >= _FP16_MIN_OUTPUT and int(k) <= 1280 and self._fp16_state()["on"]:
-                try:
-                    self._sgemm_f16(transa, transb, m, n, k, A, lda, B, ldb, C, ldc)
-                    return
-                except Exception as ex:
-                    # 回退：fp32 路径 beta=0 会把 C 整个重写，前面 fp16 的半成品不作数。
-                    self._fp16_fail(ex)
+        #   实测会让参数梯度的相对误差从 3e-4 恶化到 2e-2（loss 600 步偏 10%）。
+        # 这段必须在函数体上，不能缩进到上面的 m==0 return 里面（那样永远走不到）。
+        if (int(m) * int(n) >= _FP16_MIN_OUTPUT and int(k) <= _FP16_MAX_K
+                and self._fp16_state()["on"]):
+            try:
+                self._sgemm_f16(transa, transb, m, n, k, A, lda, B, ldb, C, ldc)
+                self._split_forget_ptr(C)
+                return
+            except Exception as ex:
+                # 回退：fp32 路径 beta=0 会把 C 整个重写，前面 fp16 的半成品不作数。
+                self._fp16_fail(ex)
+        # 2×fp16 拆分。长 K 或大输出才值得；捕获期间分配/多段 GEMM 会让图失败，直接走 fp32。
+        if self._split16_wanted(m, n, k):
+            try:
+                self.sgemm_split16(transa, transb, m, n, k, A, lda, B, ldb, C, ldc)
+                return
+            except Exception as ex:
+                self._split16_fail(ex)
         alpha = ctypes.c_float(1.0)
         beta = ctypes.c_float(0.0)
         self._capture_keep(alpha, beta)
@@ -4027,6 +4211,7 @@ class CudaRuntime:
             ctypes.byref(beta),
             int(C), int(ldc),
         ), "cublasSgemm_v2")
+        self._split_forget_ptr(C)
 
     def sgemm_compose(self, A, B, chunks, kind):
         M, K = int(A.shape[0]), int(A.shape[1])
@@ -4442,6 +4627,7 @@ class CudaRuntime:
             dl = out
             dl.known_scalar = None
         if n > 0 and v > 0:
+            self._split_forget_ptr(dl)
             self.launch("ce_bwd", (n, 1, 1), (256, 1, 1), [
                 self._ptr(logits), self._ptr(targets), self._ptr(dl),
                 (n, ctypes.c_int), (v, ctypes.c_int),
@@ -4518,6 +4704,7 @@ class CudaRuntime:
         if a.n != b.n:
             raise CudaError("silu_mul 长度不同: %s vs %s" % (a.n, b.n))
         if a.n:
+            self._split_forget_ptr(a)
             grid, block = self._ewise_grid(a.n)
             self.launch("silu_mul_fwd", grid, block, [
                 self._ptr(a), self._ptr(b), (int(a.n), ctypes.c_int),
@@ -4527,6 +4714,7 @@ class CudaRuntime:
     def silu_fwd_inplace(self, a):
         """原地 a[i] = silu(a[i])。b 恒为 1 时用这个，省掉一份全 1。"""
         if a.n:
+            self._split_forget_ptr(a)
             grid, block = self._ewise_grid(a.n)
             self.launch("silu_fwd_inplace", grid, block, [
                 self._ptr(a), (int(a.n), ctypes.c_int),
@@ -4576,6 +4764,7 @@ class CudaRuntime:
         """原地交错式 RoPE（一个 kernel）。调用方要先 clone 再传进来。"""
         n, npair = self._pairs(x, cos, sin, "fused_rope_fwd")
         if npair:
+            self._split_forget_ptr(x)
             if self._vec4_ok(n, x, cos, sin):
                 # float4 一次两对：n%4==0 就等价于 npair 是偶数。
                 grid, block = self._vec4_grid(n >> 2)
@@ -4616,6 +4805,7 @@ class CudaRuntime:
             raise CudaError("add_ 长度不同: %s vs %s" % (x.n, y.n))
         n = int(x.n)
         if n:
+            self._split_forget_ptr(x)
             if n > 2147483647:
                 raise CudaError("add_ 元素个数超过 int32")
             if self._vec4_ok(n, x, y):
@@ -4638,6 +4828,7 @@ class CudaRuntime:
         lse = None
         if rows <= 0 or k <= 0:
             return s, lse
+        self._split_forget_ptr(s)
         if want_lse:
             lse = self.empty((rows,), dtype=np.float32)
         lse_ptr = (0, ctypes.c_uint64) if lse is None else self._ptr(lse)
@@ -4699,6 +4890,9 @@ class CudaRuntime:
 
     def adamw(self, p, g, m, v, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
         """原地更新参数和两份动量。标量必须已经按 numpy 的 float32 规则收好。"""
+        self._split_forget_ptr(p)
+        self._split_forget_ptr(m)
+        self._split_forget_ptr(v)
         n = int(p.n)
         if int(g.n) != n or int(m.n) != n or int(v.n) != n:
             raise CudaError(
@@ -4734,6 +4928,7 @@ class CudaRuntime:
 
     def sub_scale_(self, p, o, scale):
         """原地 p = p - scale * o。"""
+        self._split_forget_ptr(p)
         n = int(p.n)
         if int(o.n) != n:
             raise CudaError("sub_scale 长度不一致: p=%d o=%d" % (n, o.n))
@@ -4750,6 +4945,9 @@ class CudaRuntime:
 
     def muon_momentum(self, p, g, buf, u, mom, wd_lr, do_wd, nesterov):
         """原地写 p（weight decay）和 buf，u 是正交化的输入。"""
+        self._split_forget_ptr(p)
+        self._split_forget_ptr(buf)
+        self._split_forget_ptr(u)
         n = int(p.n)
         if int(g.n) != n or int(buf.n) != n or int(u.n) != n:
             raise CudaError(
@@ -4874,6 +5072,7 @@ class CudaRuntime:
         """往已有 [N,D] 上 atomicAdd。调用方保证 out 已经清零，专家按顺序发射。"""
         d = int(out.shape[1]) if len(out.shape) == 2 else int(y.shape[1])
         if m and d:
+            self._split_forget_ptr(out)
             self.launch("moe_scatter_rows", (int(m), 1, 1), (self._moe_row_block(d), 1, 1), [
                 self._ptr(y), self._ptr(tok), self._ptr(out),
                 (int(begin), ctypes.c_int), (int(m), ctypes.c_int), (int(d), ctypes.c_int),
