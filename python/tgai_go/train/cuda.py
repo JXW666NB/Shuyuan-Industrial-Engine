@@ -2763,14 +2763,45 @@ class CudaRuntime:
             self.empty_cache()
             raw = ctypes.c_uint64()
             rc = self.cu.cuMemAlloc(ctypes.byref(raw), ctypes.c_size_t(bucket))
-        self._chk(rc, "cuMemAlloc")
+        if rc != 0:
+            self._raise_alloc_failed(int(bucket), int(rc))
         if not raw.value:
             raise CudaError("cuMemAlloc 返回空指针")
+
         ptr = int(raw.value)
         self._pool_misses += 1
         self._pool_miss_hist[bucket] = self._pool_miss_hist.get(bucket, 0) + 1
         self._pool_checkout(ptr, bucket)
         return ptr
+
+    def _raise_alloc_failed(self, want_bytes, rc):
+        """显存不足时说清楚：要多少、现在用了多少、池里囤了多少、怎么办。
+
+        以前只有一行 `cuMemAlloc 失败 rc=2 out of memory`，用户完全不知道
+        是自己 batch 太大、还是别的进程占卡、还是池缓存挤占。
+        """
+        gib = float(want_bytes) / (1 << 30)
+        live = float(getattr(self, "_pool_live_bytes", 0)) / (1 << 30)
+        cached = float(getattr(self, "_pool_cached_bytes", 0)) / (1 << 30)
+        msg = ("显存不足：本次申请 %.2f GiB；当前活张量 %.2f GiB、池缓存 %.2f GiB"
+               % (gib, live, cached))
+        info = getattr(self.cu, "cuMemGetInfo_v2", None) or getattr(self.cu, "cuMemGetInfo", None)
+        if info is not None:
+            try:
+                free_b, total_b = ctypes.c_size_t(), ctypes.c_size_t()
+                if info(ctypes.byref(free_b), ctypes.byref(total_b)) == 0:
+                    msg += "；设备总共 %.2f GiB、当前可用 %.2f GiB" % (
+                        total_b.value / float(1 << 30), free_b.value / float(1 << 30))
+            except Exception:
+                pass
+        msg += ("（rc=%d）\n"
+                "  怎么办：\n"
+                "   1) 调小 --batch —— 显存只与 batch 有关，与语料大小无关；\n"
+                "   2) 调小 CFG 里的 MAXLEN(S) 或层数 L；\n"
+                "   3) 关掉 TG_CUDA_GRAPH（图捕获会额外占一份显存）；\n"
+                "   4) 用 nvidia-smi 确认没有别的进程占卡；\n"
+                "   5) 若是池缓存挤占，调大池上限或调用 empty_cache()。" % int(rc))
+        raise CudaError(msg)
 
     def empty(self, shape, dtype=np.float32):
         shape = tuple(shape)

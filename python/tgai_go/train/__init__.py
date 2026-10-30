@@ -280,19 +280,41 @@ def get_device():
     return _DEVICE
 
 
+_FUTURE_BACKENDS = {
+    "vulkan": "Vulkan 后端目前只跑通了引擎推理侧的矩阵乘（docs/PRODUCTION_READINESS.md 2.2），训练运行时未实现",
+    "rocm": "ROCm/HIP 后端尚未开始（docs/PRODUCTION_READINESS.md 2.3）",
+    "hip": "ROCm/HIP 后端尚未开始（docs/PRODUCTION_READINESS.md 2.3）",
+    "musa": "MUSA（摩尔线程）后端尚未开始",
+    "metal": "Metal 后端不存在；macOS 上请用 cpu",
+}
+
+
 def set_device(device):
-    """'cpu' 或 'cuda'。cuda 会立刻初始化驱动 / cuBLAS / NVRTC，失败则保持 cpu。"""
+    """切换后端：'cuda'（可带 :0）或 'cpu'。
+
+    「一行切换」的承诺要靠这里：不可用的后端必须给出**明确原因**，
+    不能神秘失败。cuda 会立刻初始化驱动 / cuBLAS / NVRTC，失败则抛出。
+    """
     global _DEVICE
     if not isinstance(device, str):
         raise TypeError("set_device 需要字符串，收到 %r" % (device,))
-    name = device.lower()
+    name = device.strip().lower()
+    if name.startswith("cuda:"):
+        name = "cuda"                      # 与 torch 习惯一致，卡号当前不生效（单卡）
     if name == "cpu":
         _DEVICE = "cpu"
         return
-    if name != "cuda":
-        raise ValueError("set_device 只接受 'cpu' 或 'cuda'，收到 %r" % (device,))
-    _cuda()
-    _DEVICE = "cuda"
+    if name == "cuda":
+        _cuda()
+        _DEVICE = "cuda"
+        return
+    if name in _FUTURE_BACKENDS:
+        raise NotImplementedError(
+            "set_device(%r) 暂不可用：%s。\n当前可用后端：'cuda'、'cpu'。"
+            % (device, _FUTURE_BACKENDS[name]))
+    raise ValueError(
+        "set_device 只接受 'cuda' 或 'cpu'，收到 %r。\n已知但未实现的后端：%s"
+        % (device, "、".join(sorted(_FUTURE_BACKENDS))))
 
 
 def _cuda():
