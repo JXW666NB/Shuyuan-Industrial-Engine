@@ -495,6 +495,10 @@ def main():
                               % graph_rt.graph_stats().get("reason"), flush=True)
                         graph_on = False
                 xb, yb = next_batch()
+                if dp is not None and getattr(dp, "world", 1) > 1:
+                    # 数据并行：每个 rank 只拿自己那一份（真的分工，不是重复算同一批）
+                    xb = xb[dp.rank::dp.world]
+                    yb = yb[dp.rank::dp.world]
                 logits = forward(p, xb, cfg)
                 tgt = yb.reshape(-1)
                 # 捕获时不要把目标再包成 CUDA 张量：那会立刻 D2H，捕获直接作废。

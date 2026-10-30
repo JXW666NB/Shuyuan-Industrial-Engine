@@ -1145,3 +1145,33 @@ bf16 精度          SKIP   本机无 bf16 硬件（算力 <8.0）
 
 开发过程中修掉两个自己的 bug：子进程按 GBK 解码导致 doctor 误判 FAIL；
 以及**又差点信了 `torch.cuda.is_bf16_supported()`**（V100 上返回 True 但是模拟）—— 改成用算力判定。
+### 多卡整合测试：单卡上跑 2 个 rank，参数逐位一致（2026-10-30）
+
+没有双卡也能验证"数据并行数学上正确"。`tools/test_dp_train.py` 在同一张卡上起 2 个进程：
+
+* 各 rank 拿**不同数据分片**（`x[rank::world]`）；
+* 每步梯度经共享内存全归约求平均；
+* 20 步后对比**全部参数拼接后的 SHA256**。
+
+**V100 实测（两个 rank 共用 device 0）**：
+
+```
+rank 0: params 10062088，末 loss 2.144399，checksum 545491b5369af44e
+rank 1: params 10062088，末 loss 2.102826，checksum 545491b5369af44e
+rank 参数 SHA256 是否一致：是
+RESULT: PASS（数据并行数学上正确）
+```
+
+两个 rank 的 loss 不同是**正常的**（各自算自己那片数据），但**参数完全一致** ——
+说明 broadcast + 全归约 + 更新这三步在数学上是对的。
+
+### 过程中修掉的两个真 bug
+
+1. **`p.grad` 在 CUDA 上是 Tensor 不是 ndarray**：`np.asarray(Tensor)` 会得到 object 数组，
+   直接报 `setting an array element with a sequence`。改成用 `to_numpy()` 读、用 `tensor(val)` 写回
+   （因为 CUDA 优化器明确要求 grad 是 CUDA 张量，传 ndarray 会报
+   "CUDA AdamW 需要 CUDA Tensor 梯度"）。
+2. 路径判定：V100 是**扁平布局**（`tgai_go/` 与脚本同目录），不是仓库布局（`python/` + `examples/`）。
+   改成"按 marker 找目录"，两种布局都支持。
+
+⇒ **2 卡加速比仍未验证**（缺硬件），但"接上双卡会不会算错"这个最大风险已经排除。

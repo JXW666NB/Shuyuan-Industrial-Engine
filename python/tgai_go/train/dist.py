@@ -30,6 +30,36 @@ except Exception:                                    # noqa: BLE001
     _HAS_SHM = False
 
 
+def _grad_to_numpy(g):
+    """把梯度转成 host 上的 float32 ndarray。
+
+    我们的 CUDA 梯度是 Tensor（不是 ndarray），直接 np.asarray 会得到 object 数组。
+    用它的 to_numpy()（D2H 拷贝）拿真实数值。
+    """
+    try:
+        if hasattr(g, "to_numpy"):
+            return np.ascontiguousarray(np.asarray(g.to_numpy(), dtype=np.float32))
+        return np.ascontiguousarray(np.asarray(g, dtype=np.float32))
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def _set_grad(p, val, orig):
+    """把归约后的梯度写回参数。
+
+    CUDA 优化器要求 grad 是**CUDA 张量**（传 ndarray 会报
+    "CUDA AdamW 需要 CUDA Tensor 梯度"），所以要按原来的类型重建一个。
+    """
+    try:
+        if hasattr(orig, "to_numpy"):
+            from . import tensor as _tensor
+            p.grad = _tensor(val)
+            return
+    except Exception:                                    # noqa: BLE001
+        pass
+    p.grad = val
+
+
 def _env_int(name, default):
     try:
         return int(os.environ.get(name, default))
@@ -140,14 +170,16 @@ class DataParallel:
             g = getattr(p, "grad", None)
             if g is None:
                 continue
-            arr = g if isinstance(g, np.ndarray) else np.asarray(g, dtype=np.float32)
-            grads.append((p, arr))
+            arr = _grad_to_numpy(g)
+            if arr is None:
+                continue
+            grads.append((p, arr, g))
         if not grads:
             return
-        total = sum(arr.size for _p, arr in grads)
+        total = sum(item[1].size for item in grads)
         self._ensure_slot(max(total * 4, 8))
         off = 0
-        for _p, arr in grads:                       # 各 rank 写自己那一段
+        for _p, arr, _orig in grads:                # 各 rank 写自己那一段
             b = np.ascontiguousarray(arr, dtype=np.float32).tobytes()
             self._slot.buf[self.rank * total * 4 + off:self.rank * total * 4 + off + len(b)] = b
             off += len(b)
@@ -160,9 +192,10 @@ class DataParallel:
         else:
             acc *= float(scale)
         off = 0
-        for p, arr in grads:
+        for p, arr, orig in grads:
             n = arr.size
-            p.grad = acc[off:off + n].astype(arr.dtype, copy=True).reshape(arr.shape)
+            val = acc[off:off + n].astype(arr.dtype, copy=True).reshape(arr.shape)
+            _set_grad(p, val, orig)
             off += n
 
     def close(self):
