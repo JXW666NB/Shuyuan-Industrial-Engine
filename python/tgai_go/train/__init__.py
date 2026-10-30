@@ -2355,9 +2355,44 @@ class _Functional:
 functional = _Functional()
 
 
+def _attn_scores(q, k, scale):
+    """scores = (q @ k^T) * scale，[BH,S,DH] → [BH,S,S]。
+
+    用 cuBLAS 的 op=T 直接算转置乘：省掉 k 的一次真拷贝（每层每步一次，全步 64 次）。
+    反向也不拷贝：dq = dS @ k（NN），dk = dS^T @ q（TN）。
+    """
+    rt = _cuda()
+    bh, s, dh = (int(x) for x in q.shape)
+    buf = rt.sgemm_nt_strided_batched(q._gpu, k._gpu, bh, s, s, dh)
+    if scale != 1.0:
+        buf = rt.scale(buf, float(scale))
+    need = bool(q.requires_grad or k.requires_grad)
+    out = Tensor._from_gpu(buf, requires_grad=need, _parents=(q, k))
+
+    def bw(g, grads):
+        dq = rt.sgemm_strided_batched(g, k._gpu, bh, s, s, dh)   # [S,S] @ [S,DH] -> [S,DH]
+        dk = rt.sgemm_tn_strided_batched(g, q._gpu, bh, s, dh, s)
+        if scale != 1.0:
+            dq = rt.scale(dq, float(scale))
+            dk = rt.scale(dk, float(scale))
+        if q.requires_grad:
+            _acc(grads, q, dq)
+        if k.requires_grad:
+            _acc(grads, k, dk)
+
+    if need:
+        out._backward = bw
+    return out
+
+
 def _sdpa_materialized(q, k, v, causal, scale):
     """物化 scores/P 的 SDPA。默认路径，也是 lowmem 不合格时的回退。"""
-    scores = (q @ k.swap_last2()) * scale                  # [BH,S,S]
+    # ★ 转置乘走 cuBLAS 的 op=T，省掉 k 的一次真拷贝（旧写法 q @ k.swap_last2()）
+    if (getattr(q, "device", "cpu") == "cuda" and q.ndim == 3
+            and tuple(q.shape) == tuple(k.shape)):
+        scores = _attn_scores(q, k, scale)
+    else:
+        scores = (q @ k.swap_last2()) * scale
     if causal:
         S = scores.shape[-1]
         mask = np.triu(np.full((S, S), -1e30, dtype=np.float32), k=1)

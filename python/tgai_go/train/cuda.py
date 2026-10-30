@@ -3458,6 +3458,69 @@ class CudaRuntime:
         ), "cublasSgemmStridedBatched")
         return C
 
+    def _bmm_op(self, op_a, op_b, Aptr, lda, stride_a, Bptr, ldb, stride_b,
+                C, batch, M, N, K):
+        """批量 GEMM 的公共实现（行优先语义，内部转成列优先调 cuBLAS）。
+
+        调用方保证：(M,N,K) 与 (lda,ldb) 已按"行优先 A[M,K] × B[K,N]"准备好，
+        op_* 指定各自是否转置。返回的 C 是行优先 [batch, M, N]。
+        """
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        cb = self.cublas
+        cb.cublasSgemmStridedBatched.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_int,
+        ]
+        cb.cublasSgemmStridedBatched.restype = ctypes.c_int
+        self._mark_submitted(Aptr)
+        self._mark_submitted(Bptr)
+        self._mark_submitted(C.ptr)
+        self._activate()
+        # 行优先 C[M,N] 按列优先看就是 C^T[N,M]：m=N, n=M，两个操作数交换。
+        self._chk_blas(cb.cublasSgemmStridedBatched(
+            self.handle, op_a, op_b,
+            int(N), int(M), int(K),
+            ctypes.byref(alpha),
+            ctypes.c_void_p(int(Bptr)), int(ldb), int(stride_b),
+            ctypes.c_void_p(int(Aptr)), int(lda), int(stride_a),
+            ctypes.byref(beta),
+            ctypes.c_void_p(int(C.ptr)), int(N), int(M * N),
+            int(batch),
+        ), "cublasSgemmStridedBatched")
+        return C
+
+    def sgemm_nt_strided_batched(self, A, B, batch, M, N, K):
+        """行优先 C[b][M,N] = A[b][M,K] @ B[b][N,K]^T（attention 的 q @ k^T）。
+
+        省掉 k 的转置拷贝：cuBLAS 直接对 B 用 op=T。
+        """
+        C = self.empty((batch, M, N), dtype=np.float32)
+        if batch == 0 or M == 0 or N == 0:
+            return C
+        if K == 0:
+            return self.zeros((batch, M, N), dtype=np.float32)
+        # 列优先视角：C^T = B @ A^T ⇒ 第一操作数取 B 并转置、第二操作数取 A 不转置
+        return self._bmm_op(CUDA_OP_T, CUDA_OP_N, A.ptr, K, int(M * K),
+                            B.ptr, K, int(N * K), C, batch, M, N, K)
+
+    def sgemm_tn_strided_batched(self, A, B, batch, M, N, K):
+        """行优先 C[b][M,N] = A[b][K,M]^T @ B[b][K,N]（attention 反向的 dk = dS^T @ q）。"""
+        C = self.empty((batch, M, N), dtype=np.float32)
+        if batch == 0 or M == 0 or N == 0:
+            return C
+        if K == 0:
+            return self.zeros((batch, M, N), dtype=np.float32)
+        return self._bmm_op(CUDA_OP_N, CUDA_OP_T, A.ptr, M, int(K * M),
+                            B.ptr, N, int(K * N), C, batch, M, N, K)
+
+
     def softmax_lastdim(self, x):
         if len(x.shape) < 1:
             raise CudaError("softmax 需要至少 1 维，收到 %s" % (x.shape,))
