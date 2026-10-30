@@ -3543,6 +3543,21 @@ class MoE(Module):
 
 
 # ─────────────────────────── optim ───────────────────────────
+def _bf16_step_boundary():
+    """优化器每步开始：通知后端让 bf16 影子缓存失效（权重马上要变）。
+
+    只有支持 bf16 的影子缓存的后端才有这个方法；没有就是空操作，
+    对 fp32 路径零影响（一次函数调用 + 一次 getattr）。
+    """
+    try:
+        rt = _cuda()
+    except Exception:
+        return
+    f = getattr(rt, "_bf16_epoch_bump", None)
+    if f is not None:
+        f()
+
+
 class _Optim:
     def __init__(self, params, lr=1e-3):
         self.params = list(params)
@@ -3578,6 +3593,7 @@ class AdamW(_Optim):
                 self.v.append(np.zeros_like(p.data))
 
     def step(self):
+        _bf16_step_boundary()
         self.t += 1
         bc1 = 1.0 - self.b1 ** self.t
         bc2 = 1.0 - self.b2 ** self.t
@@ -3744,6 +3760,7 @@ class Muon(_Optim):
         rt.sub_scale_(p._gpu, o, _f32(self.lr * scale))
 
     def step(self):
+        _bf16_step_boundary()
         self.t += 1
         for i, p in enumerate(self.params):
             if p.grad is None:

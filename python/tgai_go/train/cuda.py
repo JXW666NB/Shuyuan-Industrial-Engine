@@ -4251,9 +4251,33 @@ class CudaRuntime:
             return False
         return int(m) * int(n) >= _BF16_MIN_OUTPUT and int(k) <= _BF16_MAX_K
 
+    def _bf16_epoch_bump(self):
+        """权重即将变化（优化器 step 开始）：让 bf16 影子缓存整体失效。
+
+        为什么放在 step 的开头就够：训练循环是
+            forward(W) → zero_grad → backward(W) → step(W→W')
+        step 开头时 backward 已经用完了这一轮的影子，而下一轮 forward 还没开始，
+        所以此刻失效是唯一正确的位置（放在 zero_grad 会晚半步，实测导致数值错）。
+        """
+        self._bf16_shadow = {}
+        self._bf16_shadow_bytes = 0
+
     def _cast_flat_ptr_bf16(self, src_ptr, count):
-        """src_ptr 起 count 个 fp32 按 RTNE 收成 bf16（np.uint16 缓冲）。"""
+        """src_ptr 起 count 个 fp32 按 RTNE 收成 bf16（np.uint16 缓冲）。
+
+        ≥64K 元素的块做影子缓存（上限 256 MiB）：一个权重在一次前向里用一次、
+        反向算 grad_x 时又用一次，缓存能把权重的 cast 次数减半。
+        缓存在优化器 step 开头整体清空（见 _bf16_epoch_bump）。
+        """
         count = int(count)
+        cache = self.__dict__.get("_bf16_shadow")
+        if cache is None:
+            cache = self._bf16_shadow = {}
+            self._bf16_shadow_bytes = 0
+        if count >= 65536:
+            hit = cache.get((int(src_ptr), count))
+            if hit is not None:
+                return hit
         out = self.empty((count,), dtype=np.uint16)
         if count:
             if count > 2147483647:
@@ -4264,6 +4288,9 @@ class CudaRuntime:
                 (int(src_ptr), ctypes.c_uint64), self._ptr(out),
                 (count, ctypes.c_int),
             ])
+        if count >= 65536 and self._bf16_shadow_bytes + count * 2 <= (256 << 20):
+            self._bf16_shadow[(int(src_ptr), count)] = out
+            self._bf16_shadow_bytes += count * 2
         return out
 
     def _sgemm_bf16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
