@@ -78,6 +78,9 @@ def fp16_env_requested():
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
 
+HINT_MATMUL = "（怎么办：矩阵乘要求 A.shape[-1] == B.shape[0]；若在算 attention 的 q@k^T，用 bmm_nt 而不是先转置）"
+HINT_BCAST = "（怎么办：用 .reshape 显式对齐维度，或检查是不是漏了 keepdim=True / 多套了一层 batch 维）"
+
 _CE_AND_HELPERS = r"""
 /* transplanted from training/kernels/tgai_ce.cu — keep the math identical. */
 
@@ -3119,7 +3122,7 @@ class CudaRuntime:
             elif y == 1:
                 out.append(x)
             else:
-                raise CudaError("形状不能广播: %s vs %s" % (sa, sb))
+                raise CudaError("形状不能广播: %s vs %s" % (sa, sb) + HINT_BCAST)
         return tuple(out), pa, pb
 
     def _pad4(self, shape):
@@ -3481,7 +3484,7 @@ class CudaRuntime:
         M, K = int(A.shape[-2]), int(A.shape[-1])
         K2, N = int(B.shape[-2]), int(B.shape[-1])
         if K != K2:
-            raise CudaError("matmul K 不匹配: %s @ %s" % (A.shape, B.shape))
+            raise CudaError("matmul K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL)
         a_lead = tuple(int(s) for s in A.shape[:-2])
         b_lead = tuple(int(s) for s in B.shape[:-2])
         if not a_lead and not b_lead:
@@ -3542,7 +3545,7 @@ class CudaRuntime:
         if batch != batch2:
             raise CudaError("bmm batch 不同: %s @ %s" % (A.shape, B.shape))
         if K != K2:
-            raise CudaError("bmm K 不匹配: %s @ %s" % (A.shape, B.shape))
+            raise CudaError("bmm K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL)
         if batch == 0 or M == 0 or N == 0:
             return self.empty((batch, M, N), dtype=np.float32)
         if K == 0:
@@ -4082,7 +4085,7 @@ class CudaRuntime:
         M, K = int(A.shape[0]), int(A.shape[1])
         K2, N = int(B.shape[0]), int(B.shape[1])
         if K != K2:
-            raise CudaError("sgemm K 不匹配: %s @ %s" % (A.shape, B.shape))
+            raise CudaError("sgemm K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL)
         if M == 0 or N == 0 or K == 0:
             return self.full((M, N), 0.0)
         if self._numpy_exact_gemm(M, N, K):
@@ -4102,7 +4105,7 @@ class CudaRuntime:
         M, K = int(A.shape[0]), int(A.shape[1])
         N, K2 = int(B.shape[0]), int(B.shape[1])
         if K != K2:
-            raise CudaError("gemm_nt K 不匹配: %s @ %s^T" % (A.shape, B.shape))
+            raise CudaError("gemm_nt K 不匹配: %s @ %s^T" % (A.shape, B.shape) + HINT_MATMUL)
         if M == 0 or N == 0 or K == 0:
             return self.full((M, N), 0.0)
         if self._numpy_exact_gemm(M, N, K):

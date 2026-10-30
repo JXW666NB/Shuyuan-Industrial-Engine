@@ -335,6 +335,11 @@ def _cuda():
     return _CUDA_INST
 
 
+HINT_MATMUL = "（怎么办：矩阵乘要求 A.shape[-1] == B.shape[0]；若在算 attention 的 q@k^T，用 bmm_nt 而不是先转置）"
+HINT_BCAST = "（怎么办：用 .reshape 显式对齐维度，或检查是不是漏了 keepdim=True / 多套了一层 batch 维）"
+HINT_CE = "（怎么办：目标必须在 [0, V)；要忽略的位置用 ignore_index（默认 -100）而不是别的数）"
+
+
 class DType:
     """对应 torch.dtype。浮点运算仍一律存成 float32，见模块说明。"""
 
@@ -512,7 +517,7 @@ def _broadcast_shape(sa, sb):
         elif y == 1:
             out.append(x)
         else:
-            raise ValueError("形状不能广播: %s vs %s" % (sa, sb))
+            raise ValueError("形状不能广播: %s vs %s" % (sa, sb) + HINT_BCAST)
     return tuple(out)
 
 
@@ -879,7 +884,7 @@ class Tensor:
             M, K = int(self.shape[0]), int(self.shape[1])
             N, K2 = int(src.shape[0]), int(src.shape[1])
             if K != K2:
-                raise ValueError("matmul K 不匹配: %s @ %s^T" % (self.shape, src.shape))
+                raise ValueError("matmul K 不匹配: %s @ %s^T" % (self.shape, src.shape) + HINT_MATMUL)
             if not rt._numpy_exact_gemm(M, N, K):
                 buf = rt.gemm_nt(self._gpu, src._gpu)
                 rg = self.requires_grad or src.requires_grad
@@ -2561,7 +2566,7 @@ def _cross_entropy_cuda(logits, target, ignore_index):
     if np.any(tgt == ignore_index):
         return _cross_entropy_cuda_ignore(logits, tgt, ignore_index)
     if np.any((tgt < 0) | (tgt >= v)):
-        raise ValueError("cross_entropy 目标越界，合法范围是 [0, %d)" % v)
+        raise ValueError("cross_entropy 目标越界，合法范围是 [0, %d)" % v + HINT_CE)
     rt = _cuda()
     tgt_buf = rt.h2d(tgt, dtype=np.int32, cache_slot="ce_tgt")
     loss_buf = rt.ce_fwd(logits._gpu, tgt_buf, n, v)
