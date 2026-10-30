@@ -199,7 +199,16 @@ _ROPE_CACHE = {}
 
 
 def rope(x, cos, sin, dh):
-    """交错式 RoPE（置换矩阵）。必须是 x @ P.T，用 x @ P 是半切配对，与引擎不一致。"""
+    """交错式 RoPE（置换矩阵）。必须是 x @ P.T，用 x @ P 是半切配对，与引擎不一致。
+
+    后端有融合内核（TGAI CUDA：fwd/bwd 各 1 个 kernel）时走融合；torch 上没有
+    `fused_rope` 这个属性，自动落回下面的组合式 —— 双子文件保持只差 SHIM 段。
+    """
+    if hasattr(T, "fused_rope"):
+        try:
+            return T.fused_rope(x, cos, sin)
+        except Exception:
+            pass
     if dh not in _ROPE_CACHE:
         P = np.zeros((dh, dh), np.float32)
         for j in range(dh):
@@ -209,6 +218,17 @@ def rope(x, cos, sin, dh):
                 P[j - 1, j] = 1.0
         _ROPE_CACHE[dh] = T.tensor(P)
     return x * cos + (x @ _ROPE_CACHE[dh]) * sin
+
+
+def resadd(x, y):
+    """残差加：后端有原地内核就用（省一次分配），否则 x + y。两者逐位相同。"""
+    f = getattr(T, "fused_add_", None)
+    if f is not None:
+        try:
+            return f(x, y)
+        except Exception:
+            pass
+    return x + y
 
 
 def make_model(cfg, rng):
@@ -256,11 +276,11 @@ def forward(p, ids, cfg):
         vv = (hf @ p[b + "attn.v_proj.weight"].T).reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
         o = F.scaled_dot_product_attention(rope(q, cos, sin, DH), rope(kk, cos, sin, DH), vv, is_causal=True)
         o = o.reshape(B, NH, S, DH).permute(0, 2, 1, 3).reshape(B * S, D)
-        x = x + (o @ p[b + "attn.out_proj.weight"].T).reshape(B, S, D)
+        x = resadd(x, (o @ p[b + "attn.out_proj.weight"].T).reshape(B, S, D))
 
         hf = ln(x, p[b + "ln2.weight"]).reshape(B * S, D)
         y = glu(hf @ p[b + "moe.experts.0.w1.weight"].T, hf @ p[b + "moe.experts.0.w2.weight"].T)
-        x = x + (y @ p[b + "moe.experts.0.w3.weight"].T).reshape(B, S, D)
+        x = resadd(x, (y @ p[b + "moe.experts.0.w3.weight"].T).reshape(B, S, D))
 
     z = ln(x, p["final_norm.weight"]).reshape(B * S, D)
     return (z @ p["token_embedding.weight"].T).reshape(B, S, V)

@@ -2720,6 +2720,194 @@ def silu_mul(a, b):
     return out
 
 
+# ---- M6：自研融合内核（交错式 RoPE / 原地残差加 / causal softmax）----
+# 三个内核都是在 cuda.py 的 NVRTC 源码里追加的（_FUSED_KERNELS），这里只做 Python 侧接线。
+# 设计要求：**默认安全** —— 任何时候内核不可用/抛异常，都退回原来的组合实现，只警告一次。
+_FUSED_WARNED = {}
+_ROPE_P_CACHE = {}
+
+
+def _fused_kernels_on():
+    """总开关：TG_NO_FUSED=1 时强制走组合实现（给 A/B 对拍和线上排障用）。"""
+    try:
+        import os
+        return os.environ.get("TG_NO_FUSED", "").strip().lower() not in (
+            "1", "true", "on", "yes")
+    except Exception:
+        return True
+
+
+def _fused_warn_once(op, exc):
+    if _FUSED_WARNED.get(op):
+        return
+    _FUSED_WARNED[op] = True
+    try:
+        import warnings
+        warnings.warn("tgai_go.train.%s 融合内核不可用，已回退到组合实现（后续静默）：%s"
+                      % (op, exc), RuntimeWarning, stacklevel=3)
+    except Exception:
+        pass
+
+
+def _rope_perm(dh):
+    """交错式 RoPE 的置换矩阵：缓存一份，反向/回退都要用。"""
+    P = _ROPE_P_CACHE.get(dh)
+    if P is not None:
+        return P
+    arr = np.zeros((dh, dh), np.float32)
+    for j in range(dh):
+        if j % 2 == 0:
+            arr[j + 1, j] = -1.0
+        elif j - 1 >= 0:
+            arr[j - 1, j] = 1.0
+    P = Tensor(arr)
+    _ROPE_P_CACHE[dh] = P
+    return P
+
+
+def _rope_composed(x, cos, sin):
+    """参考实现（与 examples 里的 rope() 逐位一致）：x*cos + (x@P)*sin。"""
+    dh = int(x.shape[-1]) if x.ndim else 0
+    if dh < 2 or dh % 2:
+        raise ValueError("RoPE 需要最后一维为 >=2 的偶数，收到 %s" % (x.shape,))
+    return x * cos + (x @ _rope_perm(dh)) * sin
+
+
+def _rope_rotate_np(g, cos, sin):
+    """numpy 版 RoPE 反向（只给「前向成功但反向内核异常」这种极端情况兜底用）。
+
+    与内核 fused_rope_bwd 同一套下标：dx[2k] = g[2k]*cos[2k] + g[2k+1]*sin[2k+1]、
+    dx[2k+1] = g[2k+1]*cos[2k+1] - g[2k]*sin[2k]。
+    """
+    out = np.array(g, copy=True)
+    out[..., 0::2] = g[..., 0::2] * cos[..., 0::2] + g[..., 1::2] * sin[..., 1::2]
+    out[..., 1::2] = g[..., 1::2] * cos[..., 1::2] - g[..., 0::2] * sin[..., 0::2]
+    return out
+
+
+def fused_rope(x, cos, sin):
+    """交错式 RoPE：out[2k]=x[2k]*cos-x[2k+1]*sin，out[2k+1]=x[2k]*sin+x[2k+1]*cos。
+
+    CUDA 上 fwd/bwd 各 1 个 kernel（原地旋转 clone 出来的那份）；组合实现是
+    1 个 matmul + 3 个 elementwise。cos/sin 是常量（不需要梯度）才走融合。
+    任何异常 → 回退组合实现，只警告一次，绝不抛给调用方。
+    """
+    if not _fused_kernels_on():
+        return _rope_composed(x, cos, sin)
+    if (getattr(x, "device", "cpu") != "cuda"
+            or getattr(cos, "device", "cpu") != "cuda"
+            or getattr(sin, "device", "cpu") != "cuda"):
+        return _rope_composed(x, cos, sin)
+    if cos.requires_grad or sin.requires_grad:
+        # cos/sin 可训练时反向要多算两份梯度，融合内核不覆盖 ⇒ 直接走组合实现。
+        return _rope_composed(x, cos, sin)
+    if not x.requires_grad:
+        # 不需要梯度就不必 clone：内核本来就是原地，直接在自己的缓冲上转。
+        try:
+            rt = _cuda()
+            y = rt.fused_rope_(x._gpu, cos._gpu, sin._gpu)
+            return Tensor._from_gpu(y, requires_grad=False)
+        except Exception as exc:
+            _fused_warn_once("fused_rope", exc)
+            return _rope_composed(x, cos, sin)
+    try:
+        rt = _cuda()
+        y = rt.fused_rope_(rt.clone(x._gpu), cos._gpu, sin._gpu)
+        # 前向内核拿到了就先把反向符号也解析出来，避免反向时才炸。
+        rt._fn("fused_rope_bwd")
+    except Exception as exc:
+        _fused_warn_once("fused_rope", exc)
+        return _rope_composed(x, cos, sin)
+    out = Tensor._from_gpu(y, requires_grad=True, _parents=(x,))
+
+    def bw(g, grads):
+        if not x.requires_grad:
+            return
+        try:
+            _acc(grads, x, rt.fused_rope_bwd(g, cos._gpu, sin._gpu))
+        except Exception as exc:
+            _fused_warn_once("fused_rope_bwd", exc)
+            gg = rt.d2h(g)
+            cc = rt.d2h(cos._gpu)
+            ss = rt.d2h(sin._gpu)
+            _acc(grads, x, rt.h2d(_rope_rotate_np(gg, cc, ss)))
+
+    out._backward = bw
+    return out
+
+
+def fused_add_(x, y):
+    """x += y。CUDA 且 x 不需要梯度时走原地内核（省一次分配）；否则退回 x + y。
+
+    ★ x.requires_grad 时**不能**原地改 x 的缓冲：训练图里更早的算子（如 RMSNorm
+    反向）在 backward 时还要读 x 的前向值，原地改会把梯度算错。这时退化成
+    `x + y`（同一条 ewise_add，结果逐位相同，只是多一次分配）。
+    """
+    if (not _fused_kernels_on()
+            or getattr(x, "device", "cpu") != "cuda"
+            or getattr(y, "device", "cpu") != "cuda"
+            or x.requires_grad
+            or tuple(x.shape) != tuple(y.shape)):
+        return x + y
+    try:
+        rt = _cuda()
+        return Tensor._from_gpu(rt.add_(x._gpu, y._gpu), requires_grad=False)
+    except Exception as exc:
+        _fused_warn_once("fused_add_", exc)
+        return x + y
+
+
+def attn_mask_softmax(scores, causal=True, need_lse=False):
+    """causal mask + softmax（原地），可选返回每行 logsumexp。
+
+    只做 fused 前向 + 反向，不改变 autograd 图；CUDA 不可用时回退到组合实现。
+    """
+    if (not _fused_kernels_on() or getattr(scores, "device", "cpu") != "cuda"
+            or not scores.requires_grad or int(scores.ndim) != 2
+            or not causal):
+        return _softmax_composed(scores, causal)
+    try:
+        rt = _cuda()
+        p_buf, lse = rt.attn_mask_softmax_(rt.clone(scores._gpu), causal=True,
+                                           want_lse=bool(need_lse))
+        rt._fn("attn_mask_softmax_bwd")
+    except Exception as exc:
+        _fused_warn_once("attn_mask_softmax", exc)
+        return _softmax_composed(scores, causal)
+    out = Tensor._from_gpu(p_buf, requires_grad=True, _parents=(scores,))
+
+    def bw(g, grads):
+        if not scores.requires_grad:
+            return
+        try:
+            _acc(grads, scores, rt.attn_mask_softmax_bwd(g, p_buf))
+        except Exception as exc:
+            _fused_warn_once("attn_mask_softmax_bwd", exc)
+            gg = rt.d2h(g)
+            pp = rt.d2h(p_buf)
+            dot = (gg * pp).sum(axis=-1, keepdims=True)
+            _acc(grads, scores, rt.h2d((pp * (gg - dot)).astype(np.float32)))
+
+    out._backward = bw
+    if need_lse:
+        return out, (None if lse is None else Tensor._from_gpu(lse))
+    return out
+
+
+def _softmax_composed(scores, causal=True):
+    x = scores
+    if causal:
+        k = int(x.shape[-1])
+        n = int(x.numel())
+        rows = n // k if k else 0
+        mask = np.zeros((rows, k), np.float32)
+        for r in range(rows):
+            mask[r, r % k + 1:] = -np.inf
+        x = x + Tensor(mask).reshape(tuple(x.shape))
+    e = x.exp()
+    return e * (e.sum(axis=-1, keepdims=True) ** -1.0)
+
+
 class RMSNorm(Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()

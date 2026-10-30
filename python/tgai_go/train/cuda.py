@@ -1418,10 +1418,110 @@ extern "C" __global__ void cast_f16_to_f32(const unsigned short* __restrict__ sr
 """
 
 
+# M6（自研融合内核）：交错式 RoPE / 原地残差加 / causal-mask + softmax。
+# 全部显式用 __fmul_rn / __fadd_rn / __fsub_rn，禁止编译器缩成 FMA：
+# Python 侧的 `x*cos + (x@P)*sin` 是两次独立取整，这里也要两次，才能做到逐位可比。
+_FUSED_KERNELS = r"""
+/* ---- 交错式（GPT-2 interleaved）RoPE，原地 ----
+ * 参考实现：y = x*cos + (x@P)*sin，P 是置换矩阵：
+ *   (x@P)[2k]   = -x[2k+1]
+ *   (x@P)[2k+1] =  x[2k]
+ * 展开后：
+ *   y[2k]   = x[2k]*cos[2k]   - x[2k+1]*sin[2k]
+ *   y[2k+1] = x[2k]*sin[2k+1] + x[2k+1]*cos[2k+1]
+ * 一个线程处理一对（2k, 2k+1），读改写同一个缓冲。
+ * ops 为 2*npair 个元素；npair 必须与 cos/sin 的元素数一致（主机侧已校验）。
+ */
+extern "C" __global__ void fused_rope_ip(float* x, const float* cs, const float* sn,
+                                         int npair) {
+    int p = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (p >= npair) return;
+    int i0 = p << 1;
+    int i1 = i0 + 1;
+    float x0 = x[i0];
+    float x1 = x[i1];
+    float c0 = cs[i0];
+    float s0 = sn[i0];
+    float c1 = cs[i1];
+    float s1 = sn[i1];
+    x[i0] = __fsub_rn(__fmul_rn(x0, c0), __fmul_rn(x1, s0));
+    x[i1] = __fadd_rn(__fmul_rn(x0, s1), __fmul_rn(x1, c1));
+}
+
+/* RoPE 反向：对 g 用 -sin 做同一次旋转（P 正交，旋转矩阵的逆即转置）。
+ *   dx[2k]   = g[2k]*cos[2k]   + g[2k+1]*sin[2k+1]
+ *   dx[2k+1] = g[2k+1]*cos[2k+1] - g[2k]*sin[2k]
+ * 前向不改输入（调用方传的是 clone），所以反向不需要保存 x。
+ */
+extern "C" __global__ void fused_rope_bwd(const float* g, const float* cs, const float* sn,
+                                          float* dx, int npair) {
+    int p = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (p >= npair) return;
+    int i0 = p << 1;
+    int i1 = i0 + 1;
+    float g0 = g[i0];
+    float g1 = g[i1];
+    float c0 = cs[i0];
+    float s0 = sn[i0];
+    float c1 = cs[i1];
+    float s1 = sn[i1];
+    dx[i0] = __fadd_rn(__fmul_rn(g0, c0), __fmul_rn(g1, s1));
+    dx[i1] = __fsub_rn(__fmul_rn(g1, c1), __fmul_rn(g0, s0));
+}
+
+/* 原地残差加 x += y。与 ewise_add 用同一条 __fadd_rn，结果逐位相同，
+ * 只是不再分配输出缓冲。 */
+extern "C" __global__ void fused_add_ip(float* x, const float* y, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) x[i] = __fadd_rn(x[i], y[i]);
+}
+
+/* causal mask + softmax（原地），行主序 [rows, k]，一行一个线程。
+ * causal 时第 r 行的 query 下标是 r % k（布局 [BH, S, S]），只对 j <= pos 做归约，
+ * j > pos 的位置直接写 0 —— 等价于先 scores + mask 再 softmax，但省掉 mask 的构造与加法。
+ * want_lse 非 0 时额外写出每行 logsumexp（m + log(sum)），供反向/诊断使用。
+ */
+extern "C" __global__ void attn_mask_softmax(float* s, int rows, int k, int causal,
+                                             int want_lse, float* lse) {
+    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (r >= rows || k <= 0) return;
+    float* row = s + (long long)r * k;
+    int pos = causal ? (r % k) : (k - 1);
+    if (pos > k - 1) pos = k - 1;
+    float m = -3.402823466e+38F;
+    for (int j = 0; j <= pos; ++j) m = fmaxf(m, row[j]);
+    float sum = 0.f;
+    for (int j = 0; j <= pos; ++j) {
+        float e = expf(row[j] - m);
+        row[j] = e;
+        sum += e;
+    }
+    for (int j = pos + 1; j < k; ++j) row[j] = 0.f;
+    float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
+    for (int j = 0; j <= pos; ++j) row[j] *= inv;
+    if (want_lse && lse) lse[r] = (sum > 0.f) ? (m + logf(sum)) : m;
+}
+
+/* softmax 反向：dS = P * (dP - sum(dP*P, axis=-1, keepdim))。
+ * 被 mask 掉的列 P 恒为 0，所以 dS 自动是 0，不需要再乘一次掩码。 */
+extern "C" __global__ void attn_mask_softmax_bwd(const float* dp, const float* p, float* ds,
+                                                 int rows, int k) {
+    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (r >= rows || k <= 0) return;
+    const float* drow = dp + (long long)r * k;
+    const float* prow = p + (long long)r * k;
+    float* orow = ds + (long long)r * k;
+    float dot = 0.f;
+    for (int j = 0; j < k; ++j) dot = __fadd_rn(dot, __fmul_rn(drow[j], prow[j]));
+    for (int j = 0; j < k; ++j) orow[j] = __fmul_rn(prow[j], __fsub_rn(drow[j], dot));
+}
+"""
+
+
 def _device_source():
     return (_CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS + "\n"
             + _M5_KERNELS + "\n" + _MOE_KERNELS + "\n" + _CAT_KERNELS + "\n"
-            + _FP16_KERNELS)
+            + _FP16_KERNELS + "\n" + _FUSED_KERNELS)
 
 
 class CudaError(RuntimeError):
@@ -3918,6 +4018,92 @@ class CudaRuntime:
                 self._ptr(da), self._ptr(db), (n, ctypes.c_int),
             ])
         return da, db
+
+    # ---- M6：自研融合内核的封装 ----
+    def _pairs(self, x, cos, sin, what):
+        """校验 fused_rope 的三个输入，返回 (元素数, 对数)。"""
+        n = int(x.n)
+        if int(cos.n) != n or int(sin.n) != n:
+            raise CudaError("%s 长度不同: x=%d cos=%d sin=%d"
+                            % (what, n, cos.n, sin.n))
+        if n % 2:
+            raise CudaError("%s 要求元素个数为偶数（交错配对），收到 %d" % (what, n))
+        npair = n // 2
+        if npair > 2147483647:
+            raise CudaError("%s 元素个数超过 int32" % what)
+        return n, npair
+
+    def fused_rope_(self, x, cos, sin):
+        """原地交错式 RoPE（一个 kernel）。调用方要先 clone 再传进来。"""
+        _n, npair = self._pairs(x, cos, sin, "fused_rope_fwd")
+        if npair:
+            grid, block = self._ewise_grid(npair)
+            self.launch("fused_rope_ip", grid, block, [
+                self._ptr(x), self._ptr(cos), self._ptr(sin),
+                (npair, ctypes.c_int),
+            ])
+        return x
+
+    def fused_rope_bwd(self, g, cos, sin):
+        """RoPE 反向，dx 是新缓冲（前向不改输入，反向不需要 x）。"""
+        _n, npair = self._pairs(g, cos, sin, "fused_rope_bwd")
+        dx = self.empty(g.shape, dtype=np.float32)
+        if npair:
+            grid, block = self._ewise_grid(npair)
+            self.launch("fused_rope_bwd", grid, block, [
+                self._ptr(g), self._ptr(cos), self._ptr(sin), self._ptr(dx),
+                (npair, ctypes.c_int),
+            ])
+        return dx
+
+    def add_(self, x, y):
+        """原地 x += y。逐位等同 ewise_add/cuMemcpy 语义，只是不分配新缓冲。"""
+        if int(x.n) != int(y.n):
+            raise CudaError("add_ 长度不同: %s vs %s" % (x.n, y.n))
+        n = int(x.n)
+        if n:
+            if n > 2147483647:
+                raise CudaError("add_ 元素个数超过 int32")
+            grid, block = self._ewise_grid(n)
+            self.launch("fused_add_ip", grid, block, [
+                self._ptr(x), self._ptr(y), (n, ctypes.c_int),
+            ])
+        return x
+
+    def attn_mask_softmax_(self, s, causal=True, want_lse=False):
+        """原地 causal-mask + softmax。s 是 [rows, k] 行主序；返回 (s, lse|None)。"""
+        if len(s.shape) != 2:
+            raise CudaError("attn_mask_softmax 需要 2D，收到 %s" % (s.shape,))
+        rows, k = int(s.shape[0]), int(s.shape[1])
+        lse = None
+        if rows <= 0 or k <= 0:
+            return s, lse
+        if want_lse:
+            lse = self.empty((rows,), dtype=np.float32)
+        lse_ptr = (0, ctypes.c_uint64) if lse is None else self._ptr(lse)
+        grid, block = self._ewise_grid(rows)
+        self.launch("attn_mask_softmax", grid, block, [
+            self._ptr(s), (rows, ctypes.c_int), (k, ctypes.c_int),
+            (1 if causal else 0, ctypes.c_int),
+            (1 if want_lse else 0, ctypes.c_int), lse_ptr,
+        ])
+        return s, lse
+
+    def attn_mask_softmax_bwd(self, dp, p):
+        """dS = P * (dP - sum(dP*P))，就地写到新缓冲。"""
+        if len(dp.shape) != 2 or tuple(dp.shape) != tuple(p.shape):
+            raise CudaError("attn_mask_softmax_bwd 形状不一致: %s vs %s"
+                            % (dp.shape, p.shape))
+        rows, k = int(dp.shape[0]), int(dp.shape[1])
+        ds = self.empty(dp.shape, dtype=np.float32)
+        if rows <= 0 or k <= 0:
+            return ds
+        grid, block = self._ewise_grid(rows)
+        self.launch("attn_mask_softmax_bwd", grid, block, [
+            self._ptr(dp), self._ptr(p), self._ptr(ds),
+            (rows, ctypes.c_int), (k, ctypes.c_int),
+        ])
+        return ds
 
     def emb_fwd(self, table, ids, seq, d, vocab, out_shape):
         out = self.empty(out_shape, dtype=np.float32)
