@@ -46,10 +46,29 @@ FALLBACK = [
 CFG = dict(D=256, NH=8, L=8, FF=1280, MAXLEN=64)
 
 
-def load_corpus(max_chars=60000):
-    """读 SFT 语料（九标记格式），只保留短回答；读不到就用内置样例。"""
-    chunks, total = [], 0
-    for fp in CORPUS_FILES:
+def load_corpus(max_chars=None):
+    """读 SFT 语料（九标记格式），只保留短回答。
+
+    与旧版的三个区别（都是 L2 可用性修正，旧版全是静默行为）：
+      1. 设了 TG_CORPUS 就**只读它**（替换默认语料）。旧版是追加，
+         相当于把 batch 悄悄翻倍，用户看不出任何异常；
+      2. 指定了语料却一条都没解析出来 → **直接抛错**。旧版会静默回退到
+         内置 5 条样例，用户可能训几天才发现训的是示例数据；
+      3. 截断必须**显式打印**用掉多少 / 总共多少。上限用 TG_MAX_CHARS 控制，
+         默认 200 万字符，设为 0 表示不限。
+    """
+    env = os.environ.get("TG_CORPUS", "").strip()
+    files = [env] if env else [f for f in CORPUS_FILES]
+    if max_chars is None:
+        try:
+            max_chars = int(os.environ.get("TG_MAX_CHARS", "2000000"))
+        except ValueError:
+            max_chars = 2000000
+    if max_chars <= 0:
+        max_chars = None
+
+    chunks, used, seen, lines = [], 0, 0, 0
+    for fp in files:
         if not fp or not os.path.exists(fp):
             continue
         with open(fp, encoding="utf-8", errors="replace") as f:
@@ -57,23 +76,36 @@ def load_corpus(max_chars=60000):
                 line = line.strip()
                 if not line:
                     continue
+                lines += 1
                 try:
                     t = json.loads(line).get("text", "")
                 except Exception:
                     continue
+                seen += len(t)
                 if "<TGAI>" not in t:
                     continue
                 ans = t.split("<TGAI>")[1].replace("<回答>", "").strip()
                 if not ans or len(ans) > 40:
                     continue
-                chunks.append(t + "\n")
-                total += len(t) + 1
-                if total >= max_chars:
+                if max_chars is not None and used + len(t) + 1 > max_chars:
                     break
-        if total >= max_chars:
+                chunks.append(t + "\n")
+                used += len(t) + 1
+        if max_chars is not None and used >= max_chars:
             break
+
     if chunks:
+        if max_chars is not None and seen > used:
+            print("⚠️ 语料截断：扫过 %d 行 / %d 字符，按 TG_MAX_CHARS=%d 只用了 %d 字符（%d 条对话）。"
+                  % (lines, seen, max_chars, used, len(chunks)))
+            print("   要全量请设 TG_MAX_CHARS=0（注意内存：当前数据管线会把语料整体物化）")
         return "".join(chunks), "files"
+    if env:
+        raise RuntimeError(
+            "TG_CORPUS=%s 里没有解析到任何合法记录。\n"
+            "  要求：每行一个 JSON 对象，含 \"text\" 字段，且 \"text\" 内有 <TGAI><回答> 标记，"
+            "回答长度 ≤40 字符。\n"
+            "  已扫 %d 行，请先检查文件格式（不要让它静默训内置样例）。" % (env, lines))
     return "\n".join("<用户>\n%s\n<TGAI><回答>\n%s" % (u, a) for u, a in FALLBACK), "builtin"
 
 
@@ -314,6 +346,17 @@ def main():
     ap.add_argument("--log-csv", default="")
     a = ap.parse_args()
     T.set_default_device(a.device)
+    # 默认关。打开时：预热 3 步 → 捕获 1 步（前向+反向+优化器）→ 之后只重放。
+    # 任何失败都永久回退，不改这一步已经跑完的数学结果。
+    graph_on = os.environ.get("TG_CUDA_GRAPH", "").strip() == "1" and a.device == "cuda"
+    graph_rt = None
+    if graph_on:
+        graph_rt = T._cuda()
+        if not graph_rt.graph_arm():
+            print("CUDA Graph 无法切流，回退：%s" % graph_rt.graph_stats().get("reason"),
+                  flush=True)
+            graph_on = False
+            graph_rt = None
 
     text, src = load_corpus()
     toks, stoi = build_vocab(text)
@@ -336,15 +379,83 @@ def main():
     t0 = time.time()
     first = None
     v = float("nan")
+    captured_loss = None
     for step in range(a.steps):
-        logits = forward(p, x, cfg)
-        loss = F.cross_entropy(logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
-                               T.tensor(y.reshape(-1)), ignore_index=-100)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        v = float(np.asarray(loss.to_numpy() if hasattr(loss, "to_numpy")
-                             else loss.detach().cpu().numpy()).reshape(-1)[0])
+        did = False
+        if graph_on and captured_loss is not None:
+            t_save = opt.t
+            opt.t = t_save + 1
+            # 与 AdamW.step 同一套 float32 舍入。bc1/bc2 每步变，图里不能烤死。
+            bc1 = float(np.float32(1.0 - (opt.b1 ** opt.t)))
+            bc2 = float(np.float32(1.0 - (opt.b2 ** opt.t)))
+            k_before = graph_rt.graph_stats()["kernel_launches"]
+            if graph_rt.graph_launch(bc1, bc2):
+                v = float(np.asarray(captured_loss.to_numpy()).reshape(-1)[0])
+                did = True
+                if step == 4:
+                    st = graph_rt.graph_stats()
+                    print("CUDA Graph replay step %d  kernel_delta=%d graph_launches=%d"
+                          % (step, st["kernel_launches"] - k_before, st["graph_launches"]),
+                          flush=True)
+            else:
+                opt.t = t_save
+                print("CUDA Graph 重放失败，回退：%s" % graph_rt.graph_stats().get("reason"),
+                      flush=True)
+                graph_on = False
+                captured_loss = None
+        if not did:
+            began = False
+            try:
+                if graph_on and captured_loss is None and step == 3:
+                    began = bool(graph_rt.graph_begin())
+                    if not began:
+                        print("CUDA Graph 开始失败，回退：%s"
+                              % graph_rt.graph_stats().get("reason"), flush=True)
+                        graph_on = False
+                logits = forward(p, x, cfg)
+                tgt = y.reshape(-1)
+                # 捕获时不要把目标再包成 CUDA 张量：那会立刻 D2H，捕获直接作废。
+                # 数值和 T.tensor 再 to_numpy 回来一样（下标都在 float32 精确整数范围内）。
+                if began:
+                    loss = F.cross_entropy(
+                        logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
+                        tgt, ignore_index=-100)
+                else:
+                    loss = F.cross_entropy(
+                        logits.reshape(cfg["S"] * x.shape[0], cfg["V"]),
+                        T.tensor(tgt), ignore_index=-100)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                if began:
+                    if graph_rt.graph_end():
+                        captured_loss = loss
+                        st = graph_rt.graph_stats()
+                        print("CUDA Graph captured nodes=%d adamw=%d capture_kernels=%d "
+                              "capture_blas=%d mode=%s"
+                              % (st["graph_nodes"], st["adamw_nodes"], st["capture_kernels"],
+                                 st["capture_blas"], st["mode"]), flush=True)
+                        if st["adamw_nodes"] < 1:
+                            print("CUDA Graph 没有 adamw 节点，回退", flush=True)
+                            graph_rt.graph_abort("no adamw nodes")
+                            graph_on = False
+                            captured_loss = None
+                        elif not graph_rt.graph_launch():
+                            # 捕获只记录不执行。这一步的 bc 已经在图里，必须马上重放一次。
+                            print("CUDA Graph 捕获后首次重放失败：%s"
+                                  % graph_rt.graph_stats().get("reason"), flush=True)
+                            raise SystemExit(2)
+                    else:
+                        print("CUDA Graph 结束失败，回退：%s"
+                              % graph_rt.graph_stats().get("reason"), flush=True)
+                        graph_on = False
+            except Exception as ex:
+                if began:
+                    graph_rt.graph_abort(ex)
+                    print("CUDA Graph 捕获中途失败：%s" % ex, flush=True)
+                raise
+            v = float(np.asarray(loss.to_numpy() if hasattr(loss, "to_numpy")
+                                 else loss.detach().cpu().numpy()).reshape(-1)[0])
         if first is None:
             first = v
         if log:

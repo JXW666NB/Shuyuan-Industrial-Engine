@@ -2602,22 +2602,35 @@ class CudaRuntime:
             return
         self._activate()
         self._pool_trimming = True
+        synced = False
         try:
             freed = False
             for size in sorted(list(self._pool_free.keys()), reverse=True):
                 chain = self._pool_free.get(size) or []
                 keep = []
-                for ptr, ev in chain:
+                for item in chain:
+                    # 释放记录有两种形态：旧的是 (ptr, event)，launch 快路径改成裸指针。
+                    # 以前这里只认元组，一旦语料大到触发裁剪就会 TypeError 崩掉（已实测）。
+                    if isinstance(item, tuple):
+                        ptr, ev = item
+                    else:
+                        ptr, ev = int(item), None
                     over = self._pool_live_bytes + self._pool_cached_bytes > limit
-                    done = int(self.cu.cuEventQuery(ev)) == 0
+                    done = True if ev is None else (int(self.cu.cuEventQuery(ev)) == 0)
                     if over and done and len(keep) >= 2:
-                        self.cu.cuEventDestroy(ev)
+                        if ev is not None:
+                            self.cu.cuEventDestroy(ev)
+                        elif not synced:
+                            # 裸指针没有事件可查：释放前整上下文同步一次，
+                            # 保证 GPU 真的不再用这块内存（裁剪是低频路径，同步可接受）。
+                            self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize")
+                            synced = True
                         self.cu.cuMemFree(ctypes.c_uint64(int(ptr)))
                         self._pool_cached_bytes -= int(size)
                         self._pool_trims += 1
                         freed = True
                     else:
-                        keep.append((ptr, ev))
+                        keep.append(item)
                 if keep:
                     self._pool_free[size] = keep
                 else:

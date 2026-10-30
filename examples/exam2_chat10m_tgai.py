@@ -46,10 +46,29 @@ FALLBACK = [
 CFG = dict(D=256, NH=8, L=8, FF=1280, MAXLEN=64)
 
 
-def load_corpus(max_chars=60000):
-    """读 SFT 语料（九标记格式），只保留短回答；读不到就用内置样例。"""
-    chunks, total = [], 0
-    for fp in CORPUS_FILES:
+def load_corpus(max_chars=None):
+    """读 SFT 语料（九标记格式），只保留短回答。
+
+    与旧版的三个区别（都是 L2 可用性修正，旧版全是静默行为）：
+      1. 设了 TG_CORPUS 就**只读它**（替换默认语料）。旧版是追加，
+         相当于把 batch 悄悄翻倍，用户看不出任何异常；
+      2. 指定了语料却一条都没解析出来 → **直接抛错**。旧版会静默回退到
+         内置 5 条样例，用户可能训几天才发现训的是示例数据；
+      3. 截断必须**显式打印**用掉多少 / 总共多少。上限用 TG_MAX_CHARS 控制，
+         默认 200 万字符，设为 0 表示不限。
+    """
+    env = os.environ.get("TG_CORPUS", "").strip()
+    files = [env] if env else [f for f in CORPUS_FILES]
+    if max_chars is None:
+        try:
+            max_chars = int(os.environ.get("TG_MAX_CHARS", "2000000"))
+        except ValueError:
+            max_chars = 2000000
+    if max_chars <= 0:
+        max_chars = None
+
+    chunks, used, seen, lines = [], 0, 0, 0
+    for fp in files:
         if not fp or not os.path.exists(fp):
             continue
         with open(fp, encoding="utf-8", errors="replace") as f:
@@ -57,23 +76,36 @@ def load_corpus(max_chars=60000):
                 line = line.strip()
                 if not line:
                     continue
+                lines += 1
                 try:
                     t = json.loads(line).get("text", "")
                 except Exception:
                     continue
+                seen += len(t)
                 if "<TGAI>" not in t:
                     continue
                 ans = t.split("<TGAI>")[1].replace("<回答>", "").strip()
                 if not ans or len(ans) > 40:
                     continue
-                chunks.append(t + "\n")
-                total += len(t) + 1
-                if total >= max_chars:
+                if max_chars is not None and used + len(t) + 1 > max_chars:
                     break
-        if total >= max_chars:
+                chunks.append(t + "\n")
+                used += len(t) + 1
+        if max_chars is not None and used >= max_chars:
             break
+
     if chunks:
+        if max_chars is not None and seen > used:
+            print("⚠️ 语料截断：扫过 %d 行 / %d 字符，按 TG_MAX_CHARS=%d 只用了 %d 字符（%d 条对话）。"
+                  % (lines, seen, max_chars, used, len(chunks)))
+            print("   要全量请设 TG_MAX_CHARS=0（注意内存：当前数据管线会把语料整体物化）")
         return "".join(chunks), "files"
+    if env:
+        raise RuntimeError(
+            "TG_CORPUS=%s 里没有解析到任何合法记录。\n"
+            "  要求：每行一个 JSON 对象，含 \"text\" 字段，且 \"text\" 内有 <TGAI><回答> 标记，"
+            "回答长度 ≤40 字符。\n"
+            "  已扫 %d 行，请先检查文件格式（不要让它静默训内置样例）。" % (env, lines))
     return "\n".join("<用户>\n%s\n<TGAI><回答>\n%s" % (u, a) for u, a in FALLBACK), "builtin"
 
 
