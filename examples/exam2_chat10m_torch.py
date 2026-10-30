@@ -352,6 +352,8 @@ def main():
     # 0 = 整语料当一批（老行为，只适合小语料）。语料一大必须给一个有限值，
     # 否则显存随对话数线性爆炸（2M 字符就能把 49 GB 的 4090 撑爆，已实测）。
     ap.add_argument("--batch", type=int, default=0)
+    ap.add_argument("--resume", default="", help="从 .npz 存档继续训（配合上次运行产生的存档）")
+    ap.add_argument("--save-resume", default="", help="训练结束后把权重存成 .npz（可被 --resume 续训）")
     a = ap.parse_args()
     T.set_default_device(a.device)
     # 默认关。打开时：预热 3 步 → 捕获 1 步（前向+反向+优化器）→ 之后只重放。
@@ -443,6 +445,30 @@ def main():
     n_par = sum(int(np.prod(tuple(t.shape))) for t in p.values())
     print("device=%s  参数量=%.3fM（含词表 %.3fM）"
           % (a.device, n_par / 1e6, cfg["V"] * cfg["D"] / 1e6))
+    _step0 = 0
+    if a.resume and os.path.exists(a.resume):
+        _z = np.load(a.resume, allow_pickle=False)
+        for _k in list(p.keys()):
+            if ("w_" + _k) in _z:
+                _arr = np.ascontiguousarray(_z["w_" + _k], dtype=np.float32)
+                # 必须【原地覆盖】原张量的数据：T.tensor() 新建的张量默认不参与求导，
+                # 直接替换 p[_k] 会让 backward 报"不参与求导"（实测踩过）。
+                _done = False
+                try:
+                    p[_k].data[...] = _arr
+                    _done = True
+                except Exception:
+                    pass
+                if not _done:
+                    _t = T.tensor(_arr)
+                    try:
+                        _t.requires_grad = True
+                    except Exception:
+                        pass
+                    p[_k] = _t
+        _step0 = int(_z["step"]) if "step" in _z else 0
+        print("续训：从 %s 恢复（step %d）" % (a.resume, _step0))
+
     opt = T.optim.AdamW(list(p.values()), lr=a.lr)
     # 多卡数据并行：world=1 时下面两句都是空操作，单卡行为完全不变。
     _DP = getattr(T, "DataParallel", None)
@@ -572,6 +598,12 @@ def main():
     raw = {k: np.asarray(val.to_numpy() if hasattr(val, "to_numpy")
                          else val.detach().cpu().numpy(), np.float32) for k, val in p.items()}
     out_path = a.out
+    if a.save_resume:
+        _arrs = {"step": np.array(_step0 + int(a.steps))}
+        for _k, _v in p.items():
+            _arrs["w_" + _k] = np.ascontiguousarray(_v.to_numpy(), dtype=np.float32)
+        np.savez(a.save_resume, **_arrs)
+        print("已存续训存档：%s（step %d）" % (a.save_resume, _step0 + int(a.steps)))
     save_artifacts(out_path, raw, toks, cfg)
     print("已保存:", out_path, os.path.getsize(out_path), "字节")
     with open(out_path + ".meta.json", "w", encoding="utf-8") as f:
