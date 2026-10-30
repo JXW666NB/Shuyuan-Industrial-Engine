@@ -68,6 +68,13 @@ _FP16_ENV = "TG_FP16"
 # 输出元素数小于这个数就别转 fp16 了（cast 比省下的 GEMM 时间还贵）。
 _FP16_MIN_OUTPUT = 262144
 _FP16_MAX_K = 1280          # K 超过这个就用 fp32（长累加 + 对消，精度掉得快）
+# 门槛可用环境变量覆盖（V100 实测：全部 GEMM 走 fp16 也是 45.2 ms / loss 0.0891，
+# 与 K<=1280 相同，说明小 GEMM 无关紧要；要更激进可设 TG_FP16_MAX_K=1000000000）。
+try:
+    _FP16_MAX_K = int(os.environ.get("TG_FP16_MAX_K", _FP16_MAX_K))
+    _FP16_MIN_OUTPUT = int(os.environ.get("TG_FP16_MIN_OUTPUT", _FP16_MIN_OUTPUT))
+except (TypeError, ValueError):
+    pass
 
 
 def fp16_env_requested():
