@@ -572,3 +572,35 @@ python -m tgai_go.train.doctor --trace  # 失败时打印完整堆栈
 
 按标准：**L0+L1+L2 全过 ⇒ 达到"上线判定"门槛**；
 但 L3 未过，因此标签仍是 **"可用（自用/小团队）"**，不能对外称"生产级"。
+---
+
+## ★ L3 起步：长稳测试器（2026-10-30）
+
+L3 的第一条判据是「连续训练 ≥24 h 无崩溃、显存/内存漂移 ≤3%/5%」。
+光靠人盯不现实，所以先做一个**可复现的度量工具**：`tools/soak_test.py`。
+
+### 它测什么
+
+每 N 步采样一次，写 CSV：
+
+| 列 | 含义 |
+| --- | --- |
+| `elapsed_s` / `step` / `loss` | 时间、步数、当步损失 |
+| `peak_gib` | 池分配器峰值（≈ reserved） |
+| `live_gib` / `cached_gib` | 活张量 / 池缓存 |
+| `free_gib` | 设备剩余显存（cuMemGetInfo） |
+| `rss_gib` | 进程 host 内存 |
+
+### 判据（与标准一致，工具会自己判定并给退出码）
+
+* 全程无 NaN/Inf（否则 FAIL）；
+* 显存峰值漂移 ≤ **3%**（热身 20 步后计算）；
+* host RSS 漂移 ≤ **5%**；
+* loss 不发散（末 20% 均值 ≤ 首 20% 均值 × 1.2）。
+
+用法：
+
+    python tools/soak_test.py --minutes 1440 --batch 64 --csv soak24h.csv   # 真正的 24 小时
+    python tools/soak_test.py --minutes 15 --batch 64                       # 快速预热
+
+退出码 0 = PASS，1 = FAIL（并打印是哪条判据不过）。
