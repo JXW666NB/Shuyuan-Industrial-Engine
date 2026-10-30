@@ -1667,6 +1667,22 @@ def _vec4_enabled():
     return v not in ("1", "true", "yes", "on")
 
 
+# ---- M8：每次 kernel 调用的固定开销 -------------------------------------------
+# 改动只落在「主机侧怎么把参数交给 cuLaunchKernel」和「池分配怎么拿块」：
+#   1) 参数模板按 (kernel 名, 各参 ctypes 类型) 缓存，每次调用只写 .value；
+#   2) 池命中的分配路径不再调任何 CUDA API（原来每次先 cuCtxSetCurrent）；
+#   3) 归还空闲块时不再为从没被查询过的 event 付一次 cuEventRecord。
+# TG_LAUNCH_FAST=0 全退回改动前的通用路径（默认开）；任何一次模板异常也自动永久退回。
+LAUNCH_FAST_ENV = "TG_LAUNCH_FAST"
+_NULL_STREAM = ctypes.c_void_p(0)
+_F32 = np.dtype(np.float32)
+
+
+def _launch_fast_enabled():
+    v = os.environ.get(LAUNCH_FAST_ENV, "").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 class CudaError(RuntimeError):
     pass
 
@@ -1962,6 +1978,12 @@ class CudaRuntime:
         self._fns = {}
         self._dirs = []
         self._h2d_cache = {}
+        # M8：参数模板缓存 key=(kernel 名, 各参 ctypes 类型) -> (holders, ptrs)。
+        # _lfast 为 None 表示还没读过开关；False 表示已关闭或曾因异常退回。
+        self._ltmpl = {}
+        self._lfast = None
+        # nbytes -> 池桶大小（同一个尺寸每步反复申请，省掉一次取整计算）
+        self._bucket = {}
         # 低显存 attention 是第二份 NVRTC 模块。默认路径不编译它。
         self._attn_mod = None
         self._attn_fns = {}
@@ -2477,6 +2499,21 @@ class CudaRuntime:
             return
         if self._pool_cached_bytes + int(size) > self._pool_cap:
             self._pool_trim_to(self._pool_cap)
+        if self._lfast is None:
+            self._lfast = _launch_fast_enabled()
+        if self._lfast:
+            # 快路径：默认流上「复用排在使用之后」由流顺序保证（见 free() 注释），
+            # 原来每条 release 都记一个从来没被查询过的 event（cuEventRecord 是一次
+            # CUDA API 调用），这里只把裸指针放回链上 —— 三个读取方都支持裸指针节点。
+            chain = self._pool_free.get(size)
+            if chain is None:
+                self._pool_free[size] = [ptr]
+            else:
+                chain.append(ptr)
+            self._pool_cached_bytes += int(size)
+            self._pool_note()
+            self._pool_shed_ready()
+            return
         ev = self._pool_ev_acquire()
         if self.ctx is not None:
             self.cu.cuCtxSetCurrent(self.ctx)
@@ -2501,6 +2538,7 @@ class CudaRuntime:
         limit = (12 * 1024 + 204) * 1024 * 1024
         if self._pool_live_bytes + self._pool_cached_bytes <= limit:
             return
+        self._activate()
         self._pool_trimming = True
         try:
             freed = False
@@ -2605,34 +2643,39 @@ class CudaRuntime:
         self._pool_trim_to(_POOL_IDLE_KEEP, sync=False)
 
     def _alloc(self, nbytes):
-        self._activate()
         nbytes = int(nbytes)
         if nbytes <= 0:
             raise CudaError("cuMemAlloc 拒绝 0 字节")
-        bucket = _pool_bucket(nbytes)
-        if bucket < nbytes:
-            raise CudaError("内部分桶 %d 小于请求 %d" % (bucket, nbytes))
+        bucket = self._bucket.get(nbytes)
+        if bucket is None:
+            bucket = _pool_bucket(nbytes)
+            if bucket < nbytes:
+                raise CudaError("内部分桶 %d 小于请求 %d" % (bucket, nbytes))
+            self._bucket[nbytes] = bucket
         ptr = self._pool_take(bucket)
-        got = bucket
         if not ptr and not getattr(self, "_alloc_retry", False):
             # 空闲块还没跑完就再分配，占用会冲过 13 GiB。等默认流结束再回收一次。
             limit = (12 * 1024 + 204) * 1024 * 1024
             if self._pool_live_bytes + self._pool_cached_bytes + bucket > limit and self._pool_cached_bytes:
                 self._alloc_retry = True
                 try:
+                    self._activate()
                     self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(alloc-cap)")
                     self._pool_shed_ready()
                     ptr = self._pool_take(bucket)
                 finally:
                     self._alloc_retry = False
+        got = bucket
         if ptr:
             if ptr in self._pool_live:
                 self._pool_free.setdefault(got, []).append(ptr)
                 self._pool_cached_bytes += int(got)
-                raise CudaError("空闲链上的块仍被活张量占用: 0x%x" % ptr)
+                raise CudaError("空闲链上的块仍被活张量占用: 0x%x" % int(ptr))
             self._pool_hits += 1
             self._pool_checkout(ptr, got)
             return ptr
+        # 只有真正要向驱动要内存时才需要设上下文；池命中那条路一个 CUDA API 都不调。
+        self._activate()
         raw = ctypes.c_uint64()
         rc = self.cu.cuMemAlloc(ctypes.byref(raw), ctypes.c_size_t(bucket))
         if rc != 0 and self._pool_free:
@@ -2651,7 +2694,8 @@ class CudaRuntime:
 
     def empty(self, shape, dtype=np.float32):
         shape = tuple(shape)
-        dt = np.dtype(dtype)
+        # _alloc 的池命中路径不再设上下文，这里少一次 np.dtype() 归一化
+        dt = _F32 if dtype is np.float32 else np.dtype(dtype)
         n = 1
         for s in shape:
             n *= int(s)
@@ -2716,6 +2760,7 @@ class CudaRuntime:
     def clone(self, buf):
         out = self.empty(buf.shape, dtype=buf.dtype)
         if buf.n:
+            self._activate()
             self._mark_submitted(buf.ptr)
             self._mark_submitted(out.ptr)
             self._chk(self.cu.cuMemcpyDtoD(
@@ -2767,6 +2812,30 @@ class CudaRuntime:
     def launch(self, name, grid, block, args, shared=0, module=None):
         self._activate()
         fn = self._fn(name) if module is None else self._fn_module(module, name)
+        if self._lfast is None:
+            self._lfast = _launch_fast_enabled()
+        if self._lfast:
+            # 快路径：参数模板按 (kernel 名, 参数类型序列) 缓存，每次只改数值。
+            try:
+                key = (name, tuple(t[1] for t in args))
+                tmpl = self._ltmpl.get(key)
+                if tmpl is None:
+                    tmpl = self._make_tmpl(args)
+                    self._ltmpl[key] = tmpl
+                holders, ptrs = tmpl
+                for i, item in enumerate(args):
+                    holders[i].value = item[0]
+            except Exception:
+                # 模板化出问题（类型不对、参数个数变了……）就永久退回老路径，
+                # 这里还没提交任何 kernel，重做一遍不会重复发射。
+                self._lfast = False
+            else:
+                rc = self.cu.cuLaunchKernel(
+                    fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
+                    shared, _NULL_STREAM, ptrs, None)
+                if rc != 0:
+                    self._chk(rc, "cuLaunchKernel(%s)" % name)
+                return holders
         holders = []
         ptrs = (ctypes.c_void_p * len(args))()
         for i, (val, typ) in enumerate(args):
@@ -2777,9 +2846,22 @@ class CudaRuntime:
             fn,
             int(grid[0]), int(grid[1]), int(grid[2]),
             int(block[0]), int(block[1]), int(block[2]),
-            int(shared), ctypes.c_void_p(0), ptrs, None)
-        self._chk(rc, "cuLaunchKernel(%s)" % name)
+            int(shared), _NULL_STREAM, ptrs, None)
+        if rc != 0:
+            self._chk(rc, "cuLaunchKernel(%s)" % name)
         return holders
+
+    @staticmethod
+    def _make_tmpl(args):
+        """建一次参数模板：(holders, ptrs)。holders 是持久的 ctypes 对象，
+        调用时只写 .value；ptrs 指向这同一个对象的地址，不用每次 byref/cast。"""
+        holders = []
+        ptrs = (ctypes.c_void_p * len(args))()
+        for i, (val, typ) in enumerate(args):
+            obj = val if isinstance(val, ctypes._SimpleCData) else typ(val)
+            holders.append(obj)
+            ptrs[i] = ctypes.cast(ctypes.byref(obj), ctypes.c_void_p)
+        return holders, ptrs
 
     def _ewise_grid(self, n):
         block = 256
@@ -4175,6 +4257,7 @@ class CudaRuntime:
         n = int(buf.n)
         if n <= 0:
             zero = np.zeros((), dtype=np.float32)
+            self._activate()
             self._mark_submitted(out.ptr)
             self._chk(self.cu.cuMemcpyHtoD(
                 ctypes.c_uint64(out.ptr),
