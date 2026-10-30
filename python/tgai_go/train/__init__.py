@@ -502,6 +502,29 @@ def _unbroadcast(grad, shape):
     return grad.reshape(shape)
 
 
+def _norm_shape(shape, total):
+    """把 reshape 里的 -1 解析成具体维度（与 torch 语义一致）。
+
+    PyTorch 用户天天写 `x.reshape(-1, D)`；以前这里直接把 -1 传给运行时，
+    会报 "reshape 不支持负数维度"。最多允许一个 -1。
+    """
+    shape = tuple(int(x) for x in shape)
+    neg = [i for i, v in enumerate(shape) if v == -1]
+    if not neg:
+        return shape
+    if len(neg) > 1:
+        raise ValueError("reshape 最多只能有一个 -1，收到 %s" % (shape,))
+    known = 1
+    for v in shape:
+        if v != -1:
+            known *= v
+    if known <= 0 or total % known:
+        raise ValueError("reshape 无法把 %d 个元素拆成 %s" % (total, shape))
+    out = list(shape)
+    out[neg[0]] = total // known
+    return tuple(out)
+
+
 class Tensor:
     """最小可用的张量：数据 + 梯度 + 反向闭包。"""
 
@@ -1176,6 +1199,7 @@ class Tensor:
     def reshape(self, *shape):
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
+        shape = _norm_shape(shape, int(np.prod(self.shape)))
         if self.device == "cuda":
             return self._reshape_cuda(shape)
         new = self.data.reshape(shape)

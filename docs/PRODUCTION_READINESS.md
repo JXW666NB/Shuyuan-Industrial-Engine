@@ -385,3 +385,49 @@ CudaError: cuMemAlloc 失败 rc=2 out of memory
 > 峰值 host RAM 估计 15–20 GB（估算值，非实测）。
 > 即 **host 内存约为语料的 10–20 倍**；要支持 10 GB 级语料必须改成流式/分片加载。
 > 这条不影响 L1（1 GB 已过），但应在 L3 之前解决。
+
+---
+
+## ★ L2 进展（2026-10-30，同日晚）
+
+### 一条自检命令（已完成）
+
+```bash
+python -m tgai_go.train.doctor          # 10 项检查，全部真跑 GPU
+python -m tgai_go.train.doctor --trace  # 失败时打印完整堆栈
+```
+
+| 项 | 检查内容 | 4090 | V100 |
+|---|---|---|---|
+| gemm | 行优先 GEMM vs numpy | 3.77e-07 | 3.77e-07 |
+| gemm_nt | 批量转置 GEMM | 1.69e-07 | 1.69e-07 |
+| elementwise | mul/add 逐位一致（含 4 对齐/非对齐） | PASS | PASS |
+| rmsnorm | 前向 vs 公式 | 1.38e-07 | 1.38e-07 |
+| silu_mul | 融合 GLU vs 组合式 | 2.18e-07 | 2.18e-07 |
+| cross_entropy | 带 ignore_index 的 loss | 1.01e-06 | 1.01e-06 |
+| attention | causal SDPA vs numpy | 8.09e-08 | 5.54e-08 |
+| optimizer | AdamW 一步 vs 手算 | 4.69e-09 | 4.69e-09 |
+| train_step | 两参数小模型跑两步 | loss 降 | loss 降 |
+| **结果** | | **10/10 PASS** | **10/10 PASS** |
+
+### 自检立刻抓到的真缺陷（已修）
+
+**`reshape(-1, D)` 不支持负数维度** —— PyTorch 用户最常写的形式。
+以前直接把 `-1` 传给运行时，报 `reshape 不支持负数维度`。
+已在 `Tensor.reshape` 里解析 `-1`（最多一个，且必须整除），与 torch 语义一致。
+验证：修复后 4090 600 步 loss 0.088686、22.1 ms，与改动前同量级。
+
+> 另外两条 FAIL 是我自检测试自己写错的（逐元素相对误差遇近零元素会爆；CUDA 上给 param 塞 ndarray 梯度），已改成范数型相对误差 + CUDA 张量梯度。
+
+### 一页 A4 文档（已完成）
+
+`docs/QUICKSTART_TRAIN.md`：环境要求 → 自检 → 语料格式与两个坑 → 开训参数 → 5 个降级开关 → 换形状的实测范围 → 从 PyTorch 迁移只改 import → 排错顺序。
+
+### L2 剩余
+
+| 判据 | 状态 |
+|---|---|
+| 一条自检命令 | ✅ 完成（10 项，双机验证） |
+| 一页 A4 文档 | ✅ 完成 |
+| 报错说清算子/形状/修法 | 🟡 自检已覆盖，**训练路径的算子报错仍是裸 CudaError** |
+| 后端一行切换 | 🟡 `T.set_default_device("cuda")` 已有，但只有 CUDA 一个后端可用 |
