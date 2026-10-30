@@ -1552,3 +1552,29 @@ class AdamW(_Optim):
 **L1 的 checkpoint 判据至此真正通过**（此前是"无跳变但末 loss 差 13.5%"）。
 实现要点：`--save-resume X.npz` 存权重 + step + Adam 的 m/v + t；`--resume X.npz` 全部还原。
 权重用**原地覆盖**（保 requires_grad），矩用 **`rt.h2d` 建新 GpuBuf 替换**。
+---
+
+## 今日改动后的完整回归（V100，第 34 轮）
+
+今天 `cuda.py` 改了 4 次（softmax / emb 阈值 / permute float4 / 续训相关的 h2d 用法），
+用 `accept.py` 做一次**端到端回归**（不只是 doctor）：
+
+```
+自检 doctor        PASS   12/12 项 PASS（1.7s）
+形状矩阵 4 组      PASS   D256:42.3ms D128:10.3ms D512:27.1ms D192:12.6ms
+训练 120 步 fp32   PASS   41.4 ms/step，末 loss 0.091217
+bf16 精度          SKIP   本机无 bf16 硬件（算力 <8.0）
+验收结论：PASS（0 项 FAIL）
+```
+
+**四组形状全部变快**（对比今天中午同一脚本的结果）：
+
+| 形状 | 中午 | 现在 | 改善 |
+| --- | --- | --- | --- |
+| D256 NH8 FF1280 L8 S64 | 55.2 ms | **42.3 ms** | −23% |
+| D128 NH4 FF512 L4 S64 | 13.9 ms | **10.3 ms** | −26% |
+| D512 NH8 FF2048 L2 S64 | 33.0 ms | **27.1 ms** | −18% |
+| D192 NH6 FF768 L3 S96 | 19.2 ms | **12.6 ms** | −34% |
+
+⇒ 三个 kernel 优化的收益**跨形状普遍成立**，不是只对某一个配置有效；
+且**没有任何一项退化**（0 FAIL）。
