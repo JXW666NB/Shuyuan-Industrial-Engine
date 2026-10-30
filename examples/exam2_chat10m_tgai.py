@@ -470,9 +470,30 @@ def main():
                         pass
                     p[_k] = _t
         _step0 = int(_z["step"]) if "step" in _z else 0
+        _step0 = int(_z["step"]) if "step" in _z else 0
         print("续训：从 %s 恢复（step %d）" % (a.resume, _step0))
 
     opt = T.optim.AdamW(list(p.values()), lr=a.lr)
+    if a.resume and os.path.exists(a.resume):
+        _z2 = np.load(a.resume, allow_pickle=False)
+        _back = 0
+        for _nm in ("m", "v"):
+            _lst = getattr(opt, _nm, None)
+            if isinstance(_lst, (list, tuple)):
+                for _i, _t in enumerate(_lst):
+                    _key = "%s_%d" % (_nm, _i)
+                    if _key in _z2:
+                        try:
+                            _t.data[...] = np.asarray(_z2[_key], dtype=np.float32)
+                            _back += 1
+                        except Exception:
+                            pass
+        if "opt_t" in _z2 and hasattr(opt, "t"):
+            try:
+                opt.t = int(_z2["opt_t"])
+            except Exception:
+                pass
+        print("续训：优化器状态恢复 %d 个张量%s" % (_back, "" if _back else "（存档里没有，动量从零开始）"))
     # 多卡数据并行：world=1 时下面两句都是空操作，单卡行为完全不变。
     _DP = getattr(T, "DataParallel", None)
     dp = _DP() if _DP is not None else None
@@ -603,6 +624,21 @@ def main():
     out_path = a.out + (".TG" if a.out.endswith("chat10m") else "")
     if a.save_resume:
         _arrs = {"step": np.array(_step0 + int(a.steps))}
+        _opt_saved = 0
+        for _nm in ("m", "v"):                       # AdamW 的一阶/二阶矩
+            _lst = getattr(opt, _nm, None)
+            if isinstance(_lst, (list, tuple)):
+                for _i, _t in enumerate(_lst):
+                    try:
+                        _arrs["%s_%d" % (_nm, _i)] = np.ascontiguousarray(
+                            _t.to_numpy() if hasattr(_t, "to_numpy") else np.asarray(_t),
+                            dtype=np.float32)
+                        _opt_saved += 1
+                    except Exception:
+                        pass
+        if hasattr(opt, "t"):
+            _arrs["opt_t"] = np.array(int(opt.t))
+        print("存档含优化器状态 %d 个张量%s" % (_opt_saved, "" if _opt_saved else "（未取到，续训会重置动量）"))
         for _k, _v in p.items():
             _arrs["w_" + _k] = np.ascontiguousarray(_v.to_numpy(), dtype=np.float32)
         np.savez(a.save_resume, **_arrs)
