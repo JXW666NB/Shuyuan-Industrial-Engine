@@ -317,16 +317,22 @@ def set_device(device):
         % (device, "、".join(sorted(_FUTURE_BACKENDS))))
 
 
+_CUDA_INST = None
+_CUDA_TOKEN = -1
+
+
 def _cuda():
-    """加载 train/cuda.py。导入会临时占用包属性名 cuda，这里把公开名字空间放回去。"""
-    import importlib
-    import sys
-    pkg = sys.modules[__name__]
-    saved = pkg.__dict__.get("cuda")
-    mod = importlib.import_module(__name__ + ".cuda")
-    if saved is not None and saved is not mod:
-        pkg.__dict__["cuda"] = saved
-    return mod.runtime()
+    """取当前后端实例（P0 抽象后统一走 backend 工厂，默认 CUDA）。
+
+    热路径上只做一次整数比较：backend 的缓存令牌变了（register/reset）才重建。
+    """
+    global _CUDA_INST, _CUDA_TOKEN
+    from . import backend as _backend
+    tok = _backend.cache_token()
+    if _CUDA_INST is None or tok != _CUDA_TOKEN:
+        _CUDA_INST = _backend.get(check=False)
+        _CUDA_TOKEN = tok
+    return _CUDA_INST
 
 
 class DType:

@@ -79,6 +79,15 @@ def main(argv=None):
         name = info.get("name") or getattr(rt, "name", None) or "CUDA"
         return str(name)[:50]
 
+    @check("backend", "后端接口不全：新后端请对照 backend.required_methods() 逐组实现")
+    def _():
+        from tgai_go.train import backend
+        rt = _cuda()
+        total = len(backend.required_methods())
+        lack = backend.missing(rt)
+        assert not lack, "缺少 %d 个接口: %s" % (len(lack), ", ".join(lack[:8]))
+        return "%s，接口 %d/%d" % (backend.active_name(), total - len(lack), total)
+
     T.set_default_device("cuda")
 
     # ---------- 1. GEMM ----------
