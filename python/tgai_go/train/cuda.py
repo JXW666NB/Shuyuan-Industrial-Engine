@@ -5055,7 +5055,12 @@ class CudaRuntime:
         # 短序列保持原来的 atomic。长序列按 id % 256 把一行交给一个 block，
         # 块内按 token 顺序加，不再 atomic。分段归约（plan2/rows4）在 8192 上
         # 比这条慢：单线程扫 3 万词表的开销盖过了写梯度本身。
-        if seq < 1024 or d < 128 or vocab < 2:
+        # 2026-10-30 实测（语料 78 条 / seq=4992 / vocab=360）：
+        #   独占版让每个 block 扫全部 seq 再按 id % blocks 过滤，99.7% 的迭代空转。
+        #   A10：我们 kernel 的 GPU 合计 20.07 → 15.77 ms；V100：整步 53.3 → 46.0 ms。
+        # 所以把阈值抬到 8192：常规序列一律走原子版；
+        # 独占版只留给"超长序列 + 小词表"（原来那条注释针对的 8192 场景）。
+        if seq < 8192 or d < 128 or vocab < 2:
             self.launch("emb_gather_bwd", (seq, 1, 1), (256, 1, 1), [
                 self._ptr(grad), self._ptr(ids), self._ptr(dw),
                 (seq, ctypes.c_int), (d, ctypes.c_int),
