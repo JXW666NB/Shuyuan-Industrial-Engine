@@ -1518,10 +1518,153 @@ extern "C" __global__ void attn_mask_softmax_bwd(const float* dp, const float* p
 """
 
 
+# M7（逐元素 float4 向量化）：小张量比 PyTorch 慢在「每线程 1 个 float + 启动开销」。
+# 主机侧只在 `n % 4 == 0 且所有指针 16B 对齐` 时才走这里的 *_v4 变体，否则原样走上面的
+# 标量内核 —— 非对齐场景的行为一个字节都不变。每个元素仍是独立的 __fmul_rn/__fadd_rn/
+# __fsub_rn，运算顺序和标量版逐条对应，所以结果逐位相同（不留给编译器决定要不要缩 FMA）。
+# 逐元素运算对每个元素独立，所以 4 个 lane 之间没有依赖，向量化不改变任何取整顺序。
+_VEC4_KERNELS = r"""
+/* ---- 逐元素 float4 变体（M7）----
+ * 全部 grid-stride：主机侧 grid 仍按 _vec4_grid(n/4) 算（256 线程/块），
+ * 与 _ewise_grid 的算法同源，n/4 超过一次网格能覆盖的量时靠循环补。
+ * 参数刻意不加 __restrict__：scale_inplace / fused_add_ip 允许输入输出同址。
+ */
+extern "C" __global__ void ewise_mul_v4(const float4* a, const float4* b, float4* c, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        float4 y = b[i];
+        c[i] = make_float4(__fmul_rn(x.x, y.x), __fmul_rn(x.y, y.y),
+                           __fmul_rn(x.z, y.z), __fmul_rn(x.w, y.w));
+    }
+}
+
+extern "C" __global__ void ewise_add_v4(const float4* a, const float4* b, float4* c, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        float4 y = b[i];
+        c[i] = make_float4(__fadd_rn(x.x, y.x), __fadd_rn(x.y, y.y),
+                           __fadd_rn(x.z, y.z), __fadd_rn(x.w, y.w));
+    }
+}
+
+extern "C" __global__ void ewise_scale_v4(const float4* a, float s, float4* c, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        c[i] = make_float4(__fmul_rn(x.x, s), __fmul_rn(x.y, s),
+                           __fmul_rn(x.z, s), __fmul_rn(x.w, s));
+    }
+}
+
+extern "C" __global__ void ewise_exp_v4(const float4* a, float4* c, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        c[i] = make_float4(expf(x.x), expf(x.y), expf(x.z), expf(x.w));
+    }
+}
+
+/* 原地残差加 x += y 的向量版。与 ewise_add_v4 用同一条 __fadd_rn，逐位相同。 */
+extern "C" __global__ void fused_add_ip_v4(float4* x, const float4* y, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 u = x[i];
+        float4 v = y[i];
+        x[i] = make_float4(__fadd_rn(u.x, v.x), __fadd_rn(u.y, v.y),
+                           __fadd_rn(u.z, v.z), __fadd_rn(u.w, v.w));
+    }
+}
+
+/* 广播加的向量版。主机侧保证：n%4==0、c3%4==0，且 a3/b3 只取 0 或 1；
+ * 取 1 时对应的 (a0,a1,a2)/(b0,b1,b2) 都是 4 的倍数，因此 a+ia、b+ib 是 16B 对齐的
+ * 连续 4 个元素。取 0 时该源在末维是广播，4 个 lane 读同一个标量。 */
+extern "C" __global__ void bcast_add4_v4(
+    const float* a, const float* b, float4* c, int n4,
+    int c0, int c1, int c2, int c3,
+    int a0, int a1, int a2, int a3,
+    int b0, int b1, int b2, int b3) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int k = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; k < n4; k += stride) {
+        int t = k << 2;
+        int i3 = t % c3; t /= c3;
+        int i2 = t % c2; t /= c2;
+        int i1 = t % c1; t /= c1;
+        int i0 = t;
+        int ia = i0 * a0 + i1 * a1 + i2 * a2 + i3 * a3;
+        int ib = i0 * b0 + i1 * b1 + i2 * b2 + i3 * b3;
+        float4 va, vb;
+        if (a3) {
+            va = *reinterpret_cast<const float4*>(a + ia);
+        } else {
+            const float s = a[ia];
+            va = make_float4(s, s, s, s);
+        }
+        if (b3) {
+            vb = *reinterpret_cast<const float4*>(b + ib);
+        } else {
+            const float s = b[ib];
+            vb = make_float4(s, s, s, s);
+        }
+        c[k] = make_float4(__fadd_rn(va.x, vb.x), __fadd_rn(va.y, vb.y),
+                           __fadd_rn(va.z, vb.z), __fadd_rn(va.w, vb.w));
+    }
+}
+
+/* 交错式 RoPE 前向的向量版：一个 float4 = 两对 (2k,2k+1)，公式与标量版逐条对应。
+ * x[4k+0]*cos[4k+0] - x[4k+1]*sin[4k+0]
+ * x[4k+0]*sin[4k+1] + x[4k+1]*cos[4k+1]
+ * x[4k+2]*cos[4k+2] - x[4k+3]*sin[4k+2]
+ * x[4k+2]*sin[4k+3] + x[4k+3]*cos[4k+3]  */
+extern "C" __global__ void fused_rope_ip_v4(float4* x, const float4* cs, const float4* sn,
+                                            int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 v = x[i];
+        float4 cf = cs[i];
+        float4 sf = sn[i];
+        x[i] = make_float4(
+            __fsub_rn(__fmul_rn(v.x, cf.x), __fmul_rn(v.y, sf.x)),
+            __fadd_rn(__fmul_rn(v.x, sf.y), __fmul_rn(v.y, cf.y)),
+            __fsub_rn(__fmul_rn(v.z, cf.z), __fmul_rn(v.w, sf.z)),
+            __fadd_rn(__fmul_rn(v.z, sf.w), __fmul_rn(v.w, cf.w)));
+    }
+}
+
+/* RoPE 反向的向量版：
+ * dx[2k]   = g[2k]*cos[2k]   + g[2k+1]*sin[2k+1]
+ * dx[2k+1] = g[2k+1]*cos[2k+1] - g[2k]*sin[2k]  */
+extern "C" __global__ void fused_rope_bwd_v4(const float4* g, const float4* cs,
+                                              const float4* sn, float4* dx, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 v = g[i];
+        float4 cf = cs[i];
+        float4 sf = sn[i];
+        dx[i] = make_float4(
+            __fadd_rn(__fmul_rn(v.x, cf.x), __fmul_rn(v.y, sf.y)),
+            __fsub_rn(__fmul_rn(v.y, cf.y), __fmul_rn(v.x, sf.x)),
+            __fadd_rn(__fmul_rn(v.z, cf.z), __fmul_rn(v.w, sf.w)),
+            __fsub_rn(__fmul_rn(v.w, cf.w), __fmul_rn(v.z, sf.z)));
+    }
+}
+"""
+
+
 def _device_source():
     return (_CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS + "\n"
             + _M5_KERNELS + "\n" + _MOE_KERNELS + "\n" + _CAT_KERNELS + "\n"
-            + _FP16_KERNELS + "\n" + _FUSED_KERNELS)
+            + _FP16_KERNELS + "\n" + _FUSED_KERNELS + "\n" + _VEC4_KERNELS)
+
+
+# 逐元素 float4 路径的总开关。TG_NO_VEC4=1 时全部退回标量内核（A/B 对拍和线上排障用）。
+VEC4_ENV = "TG_NO_VEC4"
+
+
+def _vec4_enabled():
+    v = os.environ.get(VEC4_ENV, "").strip().lower()
+    return v not in ("1", "true", "yes", "on")
 
 
 class CudaError(RuntimeError):
@@ -2645,6 +2788,46 @@ class CudaRuntime:
             grid = 1
         return (grid, 1, 1), (block, 1, 1)
 
+    # ---- M7：逐元素 float4 向量化 -------------------------------------------
+    def _vec4_grid(self, n4):
+        """n4 = 元素数/4（float4 个数）。和 _ewise_grid 同一套算grid/block的方式。"""
+        block = 256
+        grid = (int(n4) + block - 1) // block
+        if grid < 1:
+            grid = 1
+        return (grid, 1, 1), (block, 1, 1)
+
+    @staticmethod
+    def _vec4_ok(n, *bufs):
+        """能不能走 float4：n%4==0、每个指针 16B 对齐、且没被 TG_NO_VEC4 关掉。
+
+        对齐只在这里判断（主机侧），内核里不再判断。不满足就退回原标量内核，
+        非对齐场景的执行路径和向量化之前完全一样。
+        """
+        if (int(n) & 3) or not _vec4_enabled():
+            return False
+        for buf in bufs:
+            if int(buf.ptr) & 15:
+                return False
+        return True
+
+    @staticmethod
+    def _bcast4_vec_ok(n, c, sa, sb):
+        """广播加走 float4 的额外条件：末维 4 对齐，且每个源的末维步长只取 0 或 1。
+
+        末维步长 1 时更外层步长必须是 4 的倍数，这样 a+ia / b+ib 才是 16B 对齐的
+        连续 4 个 float —— 否则内核里的 float4 读会落到非对齐地址，只能退回标量。
+        """
+        if (int(n) & 3) or (c[3] & 3):
+            return False
+        for st in (sa, sb):
+            if st[3] == 1:
+                if (st[0] | st[1] | st[2]) & 3:
+                    return False
+            elif st[3] != 0:
+                return False
+        return True
+
     def _mark_submitted(self, ptr):
         return
 
@@ -2669,12 +2852,20 @@ class CudaRuntime:
     def add(self, a, b):
         if tuple(a.shape) == tuple(b.shape):
             out = self.empty(a.shape, dtype=np.float32)
-            if a.n:
-                grid, block = self._ewise_grid(a.n)
-                self.launch("ewise_add", grid, block, [
-                    self._ptr(a), self._ptr(b), self._ptr(out),
-                    (int(a.n), ctypes.c_int),
-                ])
+            n = int(a.n)
+            if n:
+                if self._vec4_ok(n, a, b, out):
+                    grid, block = self._vec4_grid(n >> 2)
+                    self.launch("ewise_add_v4", grid, block, [
+                        self._ptr(a), self._ptr(b), self._ptr(out),
+                        (n >> 2, ctypes.c_int),
+                    ])
+                else:
+                    grid, block = self._ewise_grid(n)
+                    self.launch("ewise_add", grid, block, [
+                        self._ptr(a), self._ptr(b), self._ptr(out),
+                        (n, ctypes.c_int),
+                    ])
             return out
         return self.add_broadcast(a, b)
 
@@ -2724,6 +2915,19 @@ class CudaRuntime:
         c = self._pad4(out_shape)
         sa = self._strides4(self._pad4(pa))
         sb = self._strides4(self._pad4(pb))
+        if self._bcast4_vec_ok(n, c, sa, sb) and self._vec4_ok(n, a, b, out):
+            grid, block = self._vec4_grid(n >> 2)
+            self.launch("bcast_add4_v4", grid, block, [
+                self._ptr(a), self._ptr(b), self._ptr(out),
+                (n >> 2, ctypes.c_int),
+                (c[0], ctypes.c_int), (c[1], ctypes.c_int),
+                (c[2], ctypes.c_int), (c[3], ctypes.c_int),
+                (sa[0], ctypes.c_int), (sa[1], ctypes.c_int),
+                (sa[2], ctypes.c_int), (sa[3], ctypes.c_int),
+                (sb[0], ctypes.c_int), (sb[1], ctypes.c_int),
+                (sb[2], ctypes.c_int), (sb[3], ctypes.c_int),
+            ])
+            return out
         grid, block = self._ewise_grid(n)
         self.launch("bcast_add4", grid, block, [
             self._ptr(a), self._ptr(b), self._ptr(out),
@@ -3248,11 +3452,18 @@ class CudaRuntime:
 
     def exp(self, a):
         out = self.empty(a.shape, dtype=np.float32)
-        if a.n:
-            grid, block = self._ewise_grid(a.n)
-            self.launch("ewise_exp", grid, block, [
-                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
-            ])
+        n = int(a.n)
+        if n:
+            if self._vec4_ok(n, a, out):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("ewise_exp_v4", grid, block, [
+                    self._ptr(a), self._ptr(out), (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("ewise_exp", grid, block, [
+                    self._ptr(a), self._ptr(out), (n, ctypes.c_int),
+                ])
         return out
 
     def log(self, a):
@@ -3288,24 +3499,41 @@ class CudaRuntime:
 
     def scale(self, a, scalar):
         out = self.empty(a.shape, dtype=np.float32)
-        if a.n:
-            grid, block = self._ewise_grid(a.n)
-            self.launch("ewise_scale", grid, block, [
-                self._ptr(a), (float(scalar), ctypes.c_float), self._ptr(out),
-                (int(a.n), ctypes.c_int),
-            ])
+        n = int(a.n)
+        if n:
+            s = float(scalar)
+            if self._vec4_ok(n, a, out):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("ewise_scale_v4", grid, block, [
+                    self._ptr(a), (s, ctypes.c_float), self._ptr(out),
+                    (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("ewise_scale", grid, block, [
+                    self._ptr(a), (s, ctypes.c_float), self._ptr(out),
+                    (n, ctypes.c_int),
+                ])
         return out
 
     def scale_inplace(self, a, scalar):
         """c[i] = a[i] * s 写回 a。每个线程只碰自己的下标，可以和输入同址。"""
         scalar = float(scalar)
-        if a.n and scalar != 1.0:
-            grid, block = self._ewise_grid(a.n)
-            self.launch("ewise_scale", grid, block, [
-                self._ptr(a), (scalar, ctypes.c_float), self._ptr(a),
-                (int(a.n), ctypes.c_int),
-            ])
-        if a.n == 1 and a.known_scalar is not None:
+        n = int(a.n)
+        if n and scalar != 1.0:
+            if self._vec4_ok(n, a, a):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("ewise_scale_v4", grid, block, [
+                    self._ptr(a), (scalar, ctypes.c_float), self._ptr(a),
+                    (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("ewise_scale", grid, block, [
+                    self._ptr(a), (scalar, ctypes.c_float), self._ptr(a),
+                    (n, ctypes.c_int),
+                ])
+        if n == 1 and a.known_scalar is not None:
             a.known_scalar = float(a.known_scalar) * scalar
         return a
 
@@ -3925,12 +4153,20 @@ class CudaRuntime:
         if a.shape != b.shape or a.n != b.n:
             raise CudaError("ewise_mul 形状不同: %s vs %s" % (a.shape, b.shape))
         out = self.empty(a.shape, dtype=np.float32)
-        if a.n:
-            grid, block = self._ewise_grid(a.n)
-            self.launch("ewise_mul", grid, block, [
-                self._ptr(a), self._ptr(b), self._ptr(out),
-                (int(a.n), ctypes.c_int),
-            ])
+        n = int(a.n)
+        if n:
+            if self._vec4_ok(n, a, b, out):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("ewise_mul_v4", grid, block, [
+                    self._ptr(a), self._ptr(b), self._ptr(out),
+                    (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("ewise_mul", grid, block, [
+                    self._ptr(a), self._ptr(b), self._ptr(out),
+                    (n, ctypes.c_int),
+                ])
         return out
 
     def sum_all(self, buf):
@@ -4035,25 +4271,40 @@ class CudaRuntime:
 
     def fused_rope_(self, x, cos, sin):
         """原地交错式 RoPE（一个 kernel）。调用方要先 clone 再传进来。"""
-        _n, npair = self._pairs(x, cos, sin, "fused_rope_fwd")
+        n, npair = self._pairs(x, cos, sin, "fused_rope_fwd")
         if npair:
-            grid, block = self._ewise_grid(npair)
-            self.launch("fused_rope_ip", grid, block, [
-                self._ptr(x), self._ptr(cos), self._ptr(sin),
-                (npair, ctypes.c_int),
-            ])
+            if self._vec4_ok(n, x, cos, sin):
+                # float4 一次两对：n%4==0 就等价于 npair 是偶数。
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("fused_rope_ip_v4", grid, block, [
+                    self._ptr(x), self._ptr(cos), self._ptr(sin),
+                    (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(npair)
+                self.launch("fused_rope_ip", grid, block, [
+                    self._ptr(x), self._ptr(cos), self._ptr(sin),
+                    (npair, ctypes.c_int),
+                ])
         return x
 
     def fused_rope_bwd(self, g, cos, sin):
         """RoPE 反向，dx 是新缓冲（前向不改输入，反向不需要 x）。"""
-        _n, npair = self._pairs(g, cos, sin, "fused_rope_bwd")
+        n, npair = self._pairs(g, cos, sin, "fused_rope_bwd")
         dx = self.empty(g.shape, dtype=np.float32)
         if npair:
-            grid, block = self._ewise_grid(npair)
-            self.launch("fused_rope_bwd", grid, block, [
-                self._ptr(g), self._ptr(cos), self._ptr(sin), self._ptr(dx),
-                (npair, ctypes.c_int),
-            ])
+            if self._vec4_ok(n, g, cos, sin, dx):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("fused_rope_bwd_v4", grid, block, [
+                    self._ptr(g), self._ptr(cos), self._ptr(sin), self._ptr(dx),
+                    (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(npair)
+                self.launch("fused_rope_bwd", grid, block, [
+                    self._ptr(g), self._ptr(cos), self._ptr(sin), self._ptr(dx),
+                    (npair, ctypes.c_int),
+                ])
         return dx
 
     def add_(self, x, y):
@@ -4064,10 +4315,16 @@ class CudaRuntime:
         if n:
             if n > 2147483647:
                 raise CudaError("add_ 元素个数超过 int32")
-            grid, block = self._ewise_grid(n)
-            self.launch("fused_add_ip", grid, block, [
-                self._ptr(x), self._ptr(y), (n, ctypes.c_int),
-            ])
+            if self._vec4_ok(n, x, y):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("fused_add_ip_v4", grid, block, [
+                    self._ptr(x), self._ptr(y), (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("fused_add_ip", grid, block, [
+                    self._ptr(x), self._ptr(y), (n, ctypes.c_int),
+                ])
         return x
 
     def attn_mask_softmax_(self, s, causal=True, want_lse=False):
